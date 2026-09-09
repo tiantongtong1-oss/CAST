@@ -112,9 +112,9 @@ def run_training():
 
     ###source data
     if args.data1 == 'rafdb':
-        train_dataset = RafDataSet('../datasets/raf-basic/', phase='train', transform=data_transforms['train'], strong_transform = data_transforms['augment'],
+        train_dataset = RafDataSet('/workspace/ttt/code/test-upload-clean/datesets/raf-basic', phase='train', transform=data_transforms['train'], strong_transform = data_transforms['augment'],
                                    basic_aug=False)
-        val_dataset = RafDataSet('../datasets/raf-basic/', phase='test', transform=data_transforms['test'], strong_transform = None)
+        val_dataset = RafDataSet('/workspace/ttt/code/test-upload-clean/datesets/raf-basic', phase='test', transform=data_transforms['test'], strong_transform = None)
         class_num = 7
         class_name = ['surprise', 'fear', 'disgust', 'happy', 'sad', 'angry', 'neutral']
         source_train = train_dataset
@@ -125,9 +125,9 @@ def run_training():
         raise ValueError('Please input right source data')
 
     if args.data2 == 'fer':
-        train_dataset = FER('../datasets/fer2013/', phase='train', transform=data_transforms['train'], strong_transform = data_transforms['augment'],
+        train_dataset = FER('/workspace/ttt/code/test-upload-clean/datesets/fer2013', phase='train', transform=data_transforms['train'], strong_transform = data_transforms['augment'],
                             basic_aug=False)
-        val_dataset = FER('../datasets/fer2013/', phase='test', transform=data_transforms['test'], strong_transform = None)
+        val_dataset = FER('/workspace/ttt/code/test-upload-clean/datesets/fer2013', phase='test', transform=data_transforms['test'], strong_transform = None)
         class_num = 7
         class_name = ['surprise', 'fear', 'disgust', 'happy', 'sad', 'angry', 'neutral']
         target_train = train_dataset
