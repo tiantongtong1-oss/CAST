@@ -22,7 +22,7 @@ class RafDataSet(data.Dataset):
 
         NAME_COLUMN = 0
         LABEL_COLUMN = 1
-        df = pd.read_csv(os.path.join(self.raf_path, 'EmoLabel/list_patition_label.txt'), sep=' ', header=None)
+        df = pd.read_csv(os.path.join(self.raf_path, '/workspace/ttt/code/test-upload-clean/datesets/raf-basic/EmoLabel/list_patition_label.txt'), sep=' ', header=None)
         if phase == 'train':
             dataset = df[df[NAME_COLUMN].str.startswith('train')]
         else:
@@ -90,20 +90,76 @@ class FER(data.Dataset):
         self.basic_aug = basic_aug
         self.aug_func = [util.flip_image, util.add_gaussian_noise, util.crop, util.rotation]
         self.file_paths, self.label = [], []
+
         if self.phase == 'train':
-            files = glob.glob(os.path.join(path, 'train/*/*.jpg'))
+            files = glob.glob(
+                os.path.join(
+                    path,
+                    'train',
+                    '*',
+                    '*.jpg'
+                )
+            )
             seed = np.random.seed(2000)
             np.random.shuffle(files)
         else:
             files = glob.glob(os.path.join(path, 'test/*/*.jpg'))
+            print("FER test images:", len(files))
+
+        print("FER %s path: %s" % (
+                    self.phase,os.path.abspath(path) ) )
+
+        print(
+                "FER %s found images: %d" % (
+                    self.phase,len(files)) )
+
+            # FER2013 -> CAST label mapping
+        fer_to_cast = {
+            0: 5,  # angry
+            1: 2,  # disgust
+            2: 1,  # fear
+            3: 3,  # happy
+            4: 4,  # sad
+            5: 0,  # surprise
+            6: 6,  # neutral
+            }
+
         for file in files:
             self.file_paths.append(file)
-            self.label.append(int(file.split('/')[-2]))
+
+            original_label = int(
+                os.path.basename(os.path.dirname(file))
+            )
+            mapped_label = fer_to_cast[original_label]
+
+            self.label.append(mapped_label)
+
+
         distribute = np.array(self.label)
-        self.label_dis = [ np.sum(distribute == 0),  np.sum(distribute == 1),  np.sum(distribute == 2),  np.sum(distribute == 3),  \
-                      np.sum(distribute == 4),  np.sum(distribute == 5),  np.sum(distribute == 6)]
-        print('The dataset distribute: %d, %d, %d, %d, %d, %d, %d' % (self.label_dis[0], self.label_dis[1], self.label_dis[2],self.label_dis[3],\
-                                                                          self.label_dis[4],self.label_dis[5],self.label_dis[6]))
+
+        self.label_dis = [
+            np.sum(distribute == 0),
+            np.sum(distribute == 1),
+            np.sum(distribute == 2),
+            np.sum(distribute == 3),
+            np.sum(distribute == 4),
+            np.sum(distribute == 5),
+            np.sum(distribute == 6)
+        ]
+
+        print(
+            'The dataset distribute: %d, %d, %d, %d, %d, %d, %d'
+            % (
+                self.label_dis[0],
+                self.label_dis[1],
+                self.label_dis[2],
+                self.label_dis[3],
+                self.label_dis[4],
+                self.label_dis[5],
+                self.label_dis[6]
+            )
+        )
+
 
     def __len__(self):
         return len(self.file_paths)
@@ -114,7 +170,10 @@ class FER(data.Dataset):
     def __getitem__(self, idx):
         path = self.file_paths[idx]
         image = cv2.imread(path)
+        if image is None:
+            raise FileNotFoundError("Failed to read image: %s" % path)
         image = image[:, :, ::-1]  # BGR to RGB
+        img = image
         label = self.label[idx]
         if self.phase == 'train':
             if self.basic_aug and random.uniform(0, 1) > 0.5:
@@ -130,4 +189,26 @@ class FER(data.Dataset):
 
         else:
             return img, label
-                      
+if __name__ == '__main__':
+    train_dataset = FER(
+        '/workspace/ttt/code/data/fer2013/',
+        phase='train',
+        transform=None,
+        strong_transform=None,
+        basic_aug=False
+    )
+
+    test_dataset = FER(
+        '/workspace/ttt/code/data/fer2013/',
+        phase='test',
+        transform=None,
+        strong_transform=None,
+        basic_aug=False
+    )
+
+    print('train size:', len(train_dataset))
+    print('test size:', len(test_dataset))
+
+    print('train distribution:', train_dataset.label_dis)
+    print('test distribution:', test_dataset.label_dis)
+
