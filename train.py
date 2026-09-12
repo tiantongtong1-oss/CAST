@@ -219,10 +219,17 @@ def parse_args():
     parser.add_argument("--data2", type=str, default="fer", help="target data")
     parser.add_argument("--idx", type=int, default=3, help="cross-validation index")
     parser.add_argument("-c", "--checkpoint", type=str, default=None, help="load model")
+    parser.add_argument(
+        "--source_checkpoint",
+        type=str,
+        default=None,
+        help="load a finished model and skip source pre-training",
+    )
     parser.add_argument("--backbone", type=str, default="resnet18", help="resnet18, resnet50 or mobilenet_v2")
     parser.add_argument("--lr", type=float, default=0.001, help="source learning rate")
     parser.add_argument("--workers", default=10, type=int)
     parser.add_argument("--epochs", type=int, default=30, help="target adaptation epochs")
+    parser.add_argument("--source_epochs", type=int, default=30)
     parser.add_argument("--w1", type=float, default=4.0, help="classification loss weight")
     parser.add_argument("--w2", type=float, default=0.3, help="source affinity loss weight")
     parser.add_argument("--w3", type=float, default=0.1, help="classifier weight loss weight")
@@ -242,6 +249,8 @@ def parse_args():
     parser.add_argument("--balance_power", type=float, default=0.20)
     parser.add_argument("--align_min_weight", type=float, default=0.70)
     parser.add_argument("--min_align_samples", type=int, default=32)
+    parser.add_argument("--output_dir", type=str, default="./models")
+    parser.add_argument("--run_name", type=str, default=None)
     return parser.parse_args()
 
 
@@ -299,11 +308,22 @@ def make_loader(dataset, batch_size, workers, shuffle, drop_last, seed_offset):
 def run_training():
     args = parse_args()
 
+    if args.checkpoint and args.source_checkpoint:
+        raise ValueError("Use only one of --checkpoint and --source_checkpoint")
     if args.pseudo_min_threshold >= args.pseudo_max_threshold:
         raise ValueError("pseudo_min_threshold must be smaller than pseudo_max_threshold")
+    if args.source_epochs < 0 or args.epochs < 0:
+        raise ValueError("source_epochs and epochs must be non-negative")
 
-    model_path = os.path.join("./models", args.data1 + "_" + args.data2)
-    os.makedirs(model_path, exist_ok=True)
+    model_path = os.path.join(args.output_dir, args.data1 + "_" + args.data2)
+    if args.run_name:
+        if os.path.basename(args.run_name) != args.run_name:
+            raise ValueError("run_name must be a directory name")
+        model_path = os.path.join(model_path, args.run_name)
+        os.makedirs(model_path, exist_ok=False)
+    else:
+        os.makedirs(model_path, exist_ok=True)
+    print("Run directory:", model_path)
 
     print("---------------------------------------------------------------------------------------")
     print("Training %s with source data %s and target data %s, idx %s:" % (
@@ -369,9 +389,10 @@ def run_training():
 
     model = Networks.Model(backbone=args.backbone, num_classes=class_num)
 
-    if args.checkpoint:
-        print("Loading pretrained weights...", args.checkpoint)
-        checkpoint = torch.load(args.checkpoint)
+    initial_checkpoint = args.source_checkpoint or args.checkpoint
+    if initial_checkpoint:
+        print("Loading checkpoint:", initial_checkpoint)
+        checkpoint = torch.load(initial_checkpoint)
         model.load_state_dict(checkpoint["model"], strict=True)
 
     model = model.cuda()
@@ -383,7 +404,7 @@ def run_training():
     # Source pre-training
     # ------------------------------------------------------------------
     best_acc = 0.0
-    for i in range(pre_epochs):
+    for i in range(args.source_epochs if not args.source_checkpoint else 0):
         train_loss1 = 0.0
         train_loss2 = 0.0
         train_loss3 = 0.0
@@ -439,23 +460,38 @@ def run_training():
             args,
         )
 
-    # Reload the best source checkpoint, not the final source epoch.
-    source_best_acc = best_acc
-    source_checkpoint_path = os.path.join(
-        model_path,
-        "%s_%s_%s_%s.pth" % (args.backbone, args.data1, args.data2, source_best_acc),
-    )
-    print("Loading best source checkpoint:", source_checkpoint_path)
-    checkpoint = torch.load(source_checkpoint_path)
-    model.load_state_dict(checkpoint["model"])
-    optimizer.load_state_dict(checkpoint["optimizer"])
-    print("Best source checkpoint loaded, acc:", source_best_acc)
+    # Reload the best source checkpoint, or use the supplied finished model
+    # directly. The latter avoids another 30 source epochs changing the start.
+    if args.source_checkpoint:
+        source_best_acc = test(
+            model,
+            optimizer,
+            val_loader_target,
+            criterion,
+            target_val_num,
+            0.0,
+            model_path,
+            -1,
+            args,
+        )
+        print("Source initialization target accuracy:", source_best_acc)
+    else:
+        source_best_acc = best_acc
+        source_checkpoint_path = os.path.join(
+            model_path,
+            "%s_%s_%s_%s.pth" % (args.backbone, args.data1, args.data2, source_best_acc),
+        )
+        print("Loading best source checkpoint:", source_checkpoint_path)
+        checkpoint = torch.load(source_checkpoint_path)
+        model.load_state_dict(checkpoint["model"])
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        print("Best source checkpoint loaded, acc:", source_best_acc)
 
     source_fixed_path = os.path.join(
         model_path,
         "%s_%s_%s_source_best.pth" % (args.backbone, args.data1, args.data2),
     )
-    torch.save(checkpoint, source_fixed_path)
+    torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict()}, source_fixed_path)
     print("Source checkpoint saved:", source_fixed_path)
 
     teacher = copy.deepcopy(model).cuda()
@@ -488,7 +524,8 @@ def run_training():
         )
     )
 
-    best_acc = 0.0
+    # Preserve the initialization as the best candidate when adaptation regresses.
+    best_acc = source_best_acc
     source_train_iter = iter(train_loader_source)
 
     # ------------------------------------------------------------------
