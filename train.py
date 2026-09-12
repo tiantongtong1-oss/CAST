@@ -1,930 +1,746 @@
-import warnings
-warnings.filterwarnings("ignore")
-import numpy as np
-import torch.utils.data as data
-from torchvision import transforms
-import os, torch
 import argparse
-import Networks
-from dataset import RafDataSet, FER
-import torch.nn.functional as F
-import math
-from thop import profile
-import image_utils as util
-import random
-from einops import rearrange, repeat
-from torchvision.utils import save_image
-from randaugment import  RandAugmentMC
-from sklearn.cluster import KMeans
-
 import copy
+import os
+import random
+import warnings
 
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torchvision import transforms
 
-global epoch
-seed = 1314 
-np.random.seed(seed)
+import Networks
+import image_utils as util
+from dataset import RafDataSet, FER
+from randaugment import RandAugmentMC
 
-torch.manual_seed(seed)
-torch.cuda.manual_seed(seed)
-torch.cuda.manual_seed_all(seed)  # if you are using multi-GPU.
-np.random.seed(seed)  # Numpy module.
-random.seed(seed)  # Python random module.
-torch.manual_seed(seed)
+warnings.filterwarnings("ignore")
+
+SEED = 1314
+np.random.seed(SEED)
+random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
 torch.backends.cudnn.benchmark = False
 torch.backends.cudnn.deterministic = True
 
 
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
-def _init_fn(worker_id):
-    np.random.seed(int(seed))
+
+def classifier_weight_loss(model):
+    fc_weight = model.fc.weight
+    fc_weight_norm = torch.norm(fc_weight, dim=1).unsqueeze(1).clamp_min(1e-12)
+    fc_weight_ = fc_weight.mm(fc_weight.t())
+    fc_weight_norm_ = fc_weight_norm.mm(fc_weight_norm.t()).clamp_min(1e-12)
+    identity = torch.eye(fc_weight.shape[0], device=fc_weight.device)
+    return torch.mean(((fc_weight_ / fc_weight_norm_ - identity) + 1.0) / 2.0)
+
 
 @torch.no_grad()
-def update_ema(student, teacher, decay=0.999):
+def update_ema(student, teacher, decay):
+    for teacher_param, student_param in zip(teacher.parameters(), student.parameters()):
+        teacher_param.data.mul_(decay).add_(student_param.data, alpha=1.0 - decay)
 
- # EMA update for trainable parameters
-    for teacher_param, student_param in zip(
-                teacher.parameters(),
-                student.parameters()
-        ):
-            teacher_param.data.mul_(decay).add_(
-                student_param.data,
-                alpha=1.0 - decay
-            )
-
-        # Important for BatchNorm running_mean / running_var
-    for teacher_buffer, student_buffer in zip(
-                teacher.buffers(),
-                student.buffers()
-        ):
+    # Keep BatchNorm statistics smooth as well. Integer buffers such as
+    # num_batches_tracked are copied exactly.
+    for teacher_buffer, student_buffer in zip(teacher.buffers(), student.buffers()):
         if teacher_buffer.dtype.is_floating_point:
-                teacher_buffer.data.mul_(decay).add_(
-                    student_buffer.data,
-                    alpha=1.0 - decay
-                )
+            teacher_buffer.data.mul_(decay).add_(student_buffer.data, alpha=1.0 - decay)
         else:
-                teacher_buffer.data.copy_(
-                    student_buffer.data
-                )
-# ============================================================
-# Calculate one set of CATM thresholds using the whole target set
-# ============================================================
+            teacher_buffer.data.copy_(student_buffer.data)
 
 
-def annotate_target(pred, class_num, i, total_epochs, phi):
+def adjust_probabilities(prob, prior, balance_power):
+    """Mild distribution alignment to prevent one-class pseudo-label collapse."""
+    if balance_power <= 0:
+        return prob
 
-    pred = pred.detach().cpu()
-    pred = F.softmax(pred, dim=1)
+    prior = prior.to(prob.device).clamp_min(1e-6)
+    uniform = torch.full_like(prior, 1.0 / float(prior.numel()))
+    correction = (uniform / prior).pow(balance_power).clamp(0.5, 2.0)
+    adjusted = prob * correction.unsqueeze(0)
+    return adjusted / adjusted.sum(dim=1, keepdim=True).clamp_min(1e-12)
 
-    pred_values, pred_targets = torch.max(
-        pred,
-        dim=1
+
+@torch.no_grad()
+def estimate_target_statistics(
+    teacher,
+    loader,
+    class_num,
+    epoch,
+    total_epochs,
+    min_threshold,
+    max_threshold,
+    threshold_quantile,
+    balance_power,
+    phi,
+):
+    """
+    Estimate one class-wise threshold vector for the whole target epoch.
+
+    The previous implementation created threshold_loader_target but still
+    recomputed CATM thresholds inside every mini-batch. Here we use the full
+    target set and two teacher views, so thresholds are much less noisy.
+    """
+    teacher.eval()
+    cached_prob_1 = []
+    cached_prob_2 = []
+    prior_sum = torch.zeros(class_num, dtype=torch.float64)
+    sample_count = 0
+
+    for imgs_w1, imgs_w2, _, _ in loader:
+        out_w1, _ = teacher(imgs_w1.cuda(non_blocking=True), None, None, "test", "target")
+        out_w2, _ = teacher(imgs_w2.cuda(non_blocking=True), None, None, "test", "target")
+
+        prob_1 = F.softmax(out_w1, dim=1).cpu()
+        prob_2 = F.softmax(out_w2, dim=1).cpu()
+        avg_prob = 0.5 * (prob_1 + prob_2)
+
+        cached_prob_1.append(prob_1)
+        cached_prob_2.append(prob_2)
+        prior_sum += avg_prob.double().sum(dim=0)
+        sample_count += avg_prob.shape[0]
+
+    prior = (prior_sum / max(sample_count, 1)).float()
+    prior = prior / prior.sum().clamp_min(1e-12)
+
+    class_confidence = [[] for _ in range(class_num)]
+    agreement_num = 0
+    agreement_total = 0
+
+    for prob_1, prob_2 in zip(cached_prob_1, cached_prob_2):
+        prob_1 = adjust_probabilities(prob_1, prior, balance_power)
+        prob_2 = adjust_probabilities(prob_2, prior, balance_power)
+        avg_prob = 0.5 * (prob_1 + prob_2)
+
+        pred_1 = prob_1.argmax(dim=1)
+        pred_2 = prob_2.argmax(dim=1)
+        targets = avg_prob.argmax(dim=1)
+
+        target_conf_1 = prob_1.gather(1, targets.unsqueeze(1)).squeeze(1)
+        target_conf_2 = prob_2.gather(1, targets.unsqueeze(1)).squeeze(1)
+        stable_conf = torch.minimum(target_conf_1, target_conf_2)
+        agreement = pred_1.eq(pred_2)
+
+        agreement_num += int(agreement.sum().item())
+        agreement_total += int(agreement.numel())
+
+        for c in range(class_num):
+            values = stable_conf[(targets == c) & agreement]
+            if values.numel() > 0:
+                class_confidence[c].append(values)
+
+    progress = float(epoch) / float(max(total_epochs - 1, 1))
+    # Become moderately stricter over time. Unlike the old total/(total-i)
+    # multiplier, this does not force nearly every class to the 0.9 cap.
+    q = float(np.clip(threshold_quantile + 0.10 * progress, 0.0, 0.95))
+    phi_scale = float(np.clip(phi / 1.4, 0.90, 1.10))
+
+    thresholds = torch.full((class_num,), max_threshold, dtype=torch.float32)
+    support = torch.zeros(class_num, dtype=torch.long)
+
+    for c in range(class_num):
+        if not class_confidence[c]:
+            continue
+
+        values = torch.cat(class_confidence[c], dim=0)
+        support[c] = values.numel()
+
+        if values.numel() < 8:
+            threshold = max_threshold
+        else:
+            threshold = float(torch.quantile(values, q).item()) * phi_scale
+            threshold = float(np.clip(threshold, min_threshold, max_threshold))
+
+        thresholds[c] = threshold
+
+    agreement_rate = agreement_num / max(agreement_total, 1)
+    return thresholds, prior, support, agreement_rate
+
+
+@torch.no_grad()
+def build_pseudo_labels(
+    out_w1,
+    out_w2,
+    thresholds,
+    prior,
+    balance_power,
+    align_min_weight,
+):
+    prob_1 = adjust_probabilities(F.softmax(out_w1, dim=1), prior, balance_power)
+    prob_2 = adjust_probabilities(F.softmax(out_w2, dim=1), prior, balance_power)
+    avg_prob = 0.5 * (prob_1 + prob_2)
+
+    pred_1 = prob_1.argmax(dim=1)
+    pred_2 = prob_2.argmax(dim=1)
+    targets = avg_prob.argmax(dim=1)
+
+    target_conf_1 = prob_1.gather(1, targets.unsqueeze(1)).squeeze(1)
+    target_conf_2 = prob_2.gather(1, targets.unsqueeze(1)).squeeze(1)
+    stable_conf = torch.minimum(target_conf_1, target_conf_2)
+
+    thresholds = thresholds.to(out_w1.device)
+    sample_threshold = thresholds[targets]
+    agreement = pred_1.eq(pred_2)
+
+    # A strict agreement path plus a very-high-confidence escape hatch.
+    # The latter avoids completely starving a class when the two views differ
+    # only marginally.
+    ultra_threshold = torch.maximum(
+        sample_threshold + 0.05,
+        torch.full_like(sample_threshold, 0.97),
     )
+    selected = (agreement & (stable_conf >= sample_threshold)) | (stable_conf >= ultra_threshold)
 
-    max_index = F.one_hot(
-        pred_targets,
-        class_num
-    )
+    pseudo_weight = (stable_conf - sample_threshold) / (1.0 - sample_threshold + 1e-6)
+    pseudo_weight = pseudo_weight.clamp(0.0, 1.0)
+    pseudo_weight = torch.sqrt(pseudo_weight) * selected.float()
 
-    preds_mean = np.transpose(
-        (pred * max_index).detach().numpy()
-    )
-
-    class_sum = [
-        np.sum(pred_mean)
-        for pred_mean in preds_mean
-    ]
-
-    class_idx = [
-        len(np.where(pred_mean > 0)[0])
-        for pred_mean in preds_mean
-    ]
-
-    class_mean = np.array([
-        class_sum[index] / class_idx[index]
-        if class_idx[index] != 0
-        else 0
-        for index in range(len(class_idx))
-    ])
-
-    class_mean = np.array([
-        mean
-        * phi
-        * (
-            float(total_epochs)
-            / float(total_epochs - i)
-        )
-        for mean in class_mean
-    ])
-
-    # Original CAST batch-level CATM
-    class_mean = torch.from_numpy(
-        np.minimum(class_mean, 0.9)
-    ).float()
-
-    threshold = class_mean.numpy()
-
-    batch_mean = torch.index_select(
-        class_mean,
-        0,
-        pred_targets
-    ).detach().numpy()
-
-    confident_idx = torch.from_numpy(
-        (
-            pred_values.detach().numpy()
-            > batch_mean
-        ).nonzero()[0]
-    )
-
-    t = pred_targets.index_select(
-        0,
-        confident_idx
-    ).numpy()
-
-    label_dis = [
-        np.sum(t == c)
-        for c in range(class_num)
-    ]
-
-    ones = torch.ones(
-        confident_idx.shape[0]
-    )
-
-    confident_idx = torch.zeros(
-        pred.shape[0]
-    ).index_put(
-        [torch.LongTensor(confident_idx)],
-        ones
-    )
+    align_mask = selected & (pseudo_weight >= align_min_weight)
 
     return (
-        pred_targets,
-        confident_idx,
-        threshold,
-        label_dis
+        targets.cpu(),
+        selected.cpu(),
+        pseudo_weight.cpu(),
+        align_mask.cpu(),
+        agreement.cpu(),
+        stable_conf.cpu(),
     )
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data1', type=str, default='rafdb', help='source data')
-    parser.add_argument('--data2', type=str, default='fer', help='target data.')
-    parser.add_argument('--idx', type=int, default=3, help='10-folder cross validation')
-    parser.add_argument('-c', '--checkpoint', type=str, default= None,help='load model')
-    parser.add_argument('--backbone', type=str, default='resnet18', help='Backobone, resnet18, resnet50 or mobilenet_v2.')
-    parser.add_argument('--lr', type=float, default=0.001, help='Initial learning rate for sgd.')
-    parser.add_argument('--workers', default=10, type=int, help='Number of data loading workers (default: 10)')
-    parser.add_argument('--epochs', type=int, default=30, help='Total training epochs.')
-    parser.add_argument('--w1', type=float, default=4, help='classification loss weight')
-    parser.add_argument('--w2', type=float, default=0.3, help='affinity loss weight')
-    parser.add_argument('--w3', type=float, default=0.1, help='weight loss weight')
-    parser.add_argument('--phi', type=float, default=1.4, help='weight loss weight')
-    parser.add_argument('--ema_decay',type=float,default=0.999)
-    parser.add_argument('--target_w2',type=float,default=0.03)
+    parser.add_argument("--data1", type=str, default="rafdb", help="source data")
+    parser.add_argument("--data2", type=str, default="fer", help="target data")
+    parser.add_argument("--idx", type=int, default=3, help="cross-validation index")
+    parser.add_argument("-c", "--checkpoint", type=str, default=None, help="load model")
+    parser.add_argument("--backbone", type=str, default="resnet18", help="resnet18, resnet50 or mobilenet_v2")
+    parser.add_argument("--lr", type=float, default=0.001, help="source learning rate")
+    parser.add_argument("--workers", default=10, type=int)
+    parser.add_argument("--epochs", type=int, default=30, help="target adaptation epochs")
+    parser.add_argument("--w1", type=float, default=4.0, help="classification loss weight")
+    parser.add_argument("--w2", type=float, default=0.3, help="source affinity loss weight")
+    parser.add_argument("--w3", type=float, default=0.1, help="classifier weight loss weight")
+    parser.add_argument("--phi", type=float, default=1.4, help="CATM threshold aggressiveness")
+    parser.add_argument("--ema_decay", type=float, default=0.999)
+    parser.add_argument("--target_w2", type=float, default=0.03)
 
+    # Stability controls for target adaptation.
+    parser.add_argument("--ema_floor", type=float, default=0.999)
+    parser.add_argument("--teacher_warmup", type=int, default=5)
+    parser.add_argument("--target_lr", type=float, default=2e-4)
+    parser.add_argument("--target_lr_gamma", type=float, default=0.97)
+    parser.add_argument("--target_w2_cap", type=float, default=0.01)
+    parser.add_argument("--pseudo_min_threshold", type=float, default=0.80)
+    parser.add_argument("--pseudo_max_threshold", type=float, default=0.95)
+    parser.add_argument("--pseudo_quantile", type=float, default=0.40)
+    parser.add_argument("--balance_power", type=float, default=0.20)
+    parser.add_argument("--align_min_weight", type=float, default=0.70)
+    parser.add_argument("--min_align_samples", type=int, default=32)
     return parser.parse_args()
 
+
+def make_transforms():
+    return {
+        "train": transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Resize((224, 224)),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomApply([
+                transforms.RandomRotation(20),
+                transforms.RandomCrop(224, padding=32),
+            ], p=0.5),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            transforms.RandomErasing(scale=(0.02, 0.25)),
+        ]),
+        "test": transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]),
+        "augment": transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Resize((224, 224)),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomApply([
+                transforms.RandomRotation(20),
+                transforms.RandomCrop(224, padding=32),
+            ], p=0.5),
+            RandAugmentMC(n=2, m=10),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            transforms.RandomErasing(scale=(0.02, 0.25)),
+        ]),
+    }
+
+
+def make_loader(dataset, batch_size, workers, shuffle, drop_last, seed_offset):
+    generator = torch.Generator()
+    generator.manual_seed(SEED + seed_offset)
+    return torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=workers,
+        shuffle=shuffle,
+        pin_memory=True,
+        drop_last=drop_last,
+        worker_init_fn=seed_worker,
+        generator=generator,
+    )
 
 
 def run_training():
     args = parse_args()
-    model_path = os.path.join('./models', args.data1 + '_' + args.data2)
-    if not os.path.exists(model_path):
-        os.makedirs(model_path)
 
-    print('---------------------------------------------------------------------------------------')
-    print('Training %s with source data %s and target data %s, idx %s:'%(args.backbone, args.data1, args.data2, args.idx))
-    print('w1:%s        w2:%s      w3:%s'%(str(args.w1), str(args.w2), str(args.w3)))
-    print('---------------------------------------------------------------------------------------')
-     
-    if args.backbone == 'resnet18':
-        train_batch = 128
-        test_batch = 128
-        pre_epochs = 30
-        
-    elif args.backbone == 'resnet50':
-        train_batch = 128
-        test_batch = 100
-        pre_epochs = 30
-        
-    elif args.backbone == 'mobilenet_v2':
-        train_batch = 128
-        test_batch = 128
-        pre_epochs = 30
+    if args.pseudo_min_threshold >= args.pseudo_max_threshold:
+        raise ValueError("pseudo_min_threshold must be smaller than pseudo_max_threshold")
 
-    data_transforms = {
-        "train": transforms.Compose([
-        transforms.ToPILImage(),
-        transforms.Resize((224, 224)),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomApply([transforms.RandomRotation(20),
-                                transforms.RandomCrop(224, padding=32)], p=0.5),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        transforms.RandomErasing(scale=(0.02, 0.25))]),
+    model_path = os.path.join("./models", args.data1 + "_" + args.data2)
+    os.makedirs(model_path, exist_ok=True)
 
-        "test": transforms.Compose([
-        transforms.ToPILImage(),
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])]),
+    print("---------------------------------------------------------------------------------------")
+    print("Training %s with source data %s and target data %s, idx %s:" % (
+        args.backbone, args.data1, args.data2, args.idx
+    ))
+    print("w1:%s        w2:%s      w3:%s" % (args.w1, args.w2, args.w3))
+    print("---------------------------------------------------------------------------------------")
 
-        'augment': transforms.Compose([
-        transforms.ToPILImage(),
-        transforms.Resize((224, 224)),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomApply([transforms.RandomRotation(20),
-                                transforms.RandomCrop(224, padding=32)], p=0.5),
-        RandAugmentMC(n=2, m=10),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        transforms.RandomErasing(scale=(0.02, 0.25))]),
-
-    }
-
-
-    ###source data
-    if args.data1 == 'rafdb':
-        train_dataset = RafDataSet('/workspace/ttt/code/test-upload-clean/datesets/raf-basic', phase='train', transform=data_transforms['train'], strong_transform = data_transforms['augment'],
-                                   basic_aug=False)
-        val_dataset = RafDataSet('/workspace/ttt/code/test-upload-clean/datesets/raf-basic', phase='test', transform=data_transforms['test'], strong_transform = None)
-        class_num = 7
-        class_name = ['surprise', 'fear', 'disgust', 'happy', 'sad', 'angry', 'neutral']
-        source_train = train_dataset
-        source_test = val_dataset
-        source_val_num = val_dataset.__len__()
-
+    if args.backbone == "resnet18":
+        train_batch, test_batch, pre_epochs = 128, 128, 30
+    elif args.backbone == "resnet50":
+        train_batch, test_batch, pre_epochs = 128, 100, 30
+    elif args.backbone == "mobilenet_v2":
+        train_batch, test_batch, pre_epochs = 128, 128, 30
     else:
-        raise ValueError('Please input right source data')
+        raise ValueError("Backbone Error!")
 
-    if args.data2 == 'fer':
-        train_dataset = FER('/workspace/ttt/code/data/fer2013', phase='train',  transform=data_transforms['train'], strong_transform = data_transforms['augment'],
-                            basic_aug=False)
-        val_dataset = FER('/workspace/ttt/code/data/fer2013', phase='test', transform=data_transforms['test'], strong_transform = None)
-        class_num = 7
-        class_name = ['surprise', 'fear', 'disgust', 'happy', 'sad', 'angry', 'neutral']
-        target_train = train_dataset
+    data_transforms = make_transforms()
 
+    if args.data1 != "rafdb":
+        raise ValueError("Please input right source data")
 
-
-        target_test = val_dataset
-        target_val_num = val_dataset.__len__()
-        
-    else:
-        raise ValueError('Please input right target data')
-
-
-    train_loader_source = torch.utils.data.DataLoader(source_train,
-                                                      batch_size=train_batch,
-                                                      num_workers=args.workers,
-                                                      shuffle=True,
-                                                      pin_memory=True,
-                                                      drop_last=True)
-
-
-    val_loader_source = torch.utils.data.DataLoader(source_test,
-                                                    batch_size=test_batch,
-                                                    num_workers=args.workers,
-                                                    shuffle=False,
-                                                    pin_memory=True)
-
-    train_loader_target = torch.utils.data.DataLoader(
-        target_train,
-        batch_size=train_batch,
-        num_workers=args.workers,
-        shuffle=True,
-        pin_memory=True,
-        drop_last=True
+    # The source strong view was never used by training. Avoid generating a
+    # second augmentation from an already-normalized tensor in RafDataSet.
+    source_train = RafDataSet(
+        "/workspace/ttt/code/test-upload-clean/datesets/raf-basic",
+        phase="train",
+        transform=data_transforms["train"],
+        strong_transform=None,
+        basic_aug=False,
     )
-    # Used only to estimate epoch-level CATM thresholds.
-    # Must cover the whole target training set.
-    threshold_loader_target = torch.utils.data.DataLoader(
-        target_train,
-        batch_size=train_batch,
-        num_workers=args.workers,
-        shuffle=False,
-        pin_memory=True,
-        drop_last=False
+    source_test = RafDataSet(
+        "/workspace/ttt/code/test-upload-clean/datesets/raf-basic",
+        phase="test",
+        transform=data_transforms["test"],
+        strong_transform=None,
     )
-    val_loader_target = torch.utils.data.DataLoader(target_test,
-                                                    batch_size=test_batch,
-                                                    num_workers=args.workers,
-                                                    shuffle=False,
-                                                    pin_memory=True)
 
+    if args.data2 != "fer":
+        raise ValueError("Please input right target data")
+
+    target_train = FER(
+        "/workspace/ttt/code/data/fer2013",
+        phase="train",
+        transform=data_transforms["train"],
+        strong_transform=data_transforms["augment"],
+        basic_aug=False,
+    )
+    target_test = FER(
+        "/workspace/ttt/code/data/fer2013",
+        phase="test",
+        transform=data_transforms["test"],
+        strong_transform=None,
+    )
+
+    class_num = 7
+    target_val_num = len(target_test)
+
+    train_loader_source = make_loader(source_train, train_batch, args.workers, True, True, 1)
+    train_loader_target = make_loader(target_train, train_batch, args.workers, True, True, 2)
+    threshold_loader_target = make_loader(target_train, train_batch, args.workers, False, False, 3)
+    val_loader_target = make_loader(target_test, test_batch, args.workers, False, False, 4)
 
     model = Networks.Model(backbone=args.backbone, num_classes=class_num)
 
     if args.checkpoint:
         print("Loading pretrained weights...", args.checkpoint)
         checkpoint = torch.load(args.checkpoint)
-        model.load_state_dict(checkpoint['model'], strict=True)
-
-    param = model.parameters()
-    optimizer = torch.optim.Adam(param, args.lr, weight_decay=1e-4)
-
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
+        model.load_state_dict(checkpoint["model"], strict=True)
 
     model = model.cuda()
-    criterion = torch.nn.CrossEntropyLoss(reduce = False)
-    
-    ####training the model on the source dataset
-    best_acc = 0.
-    for i in range(0, pre_epochs):
-        train_loss1, train_loss2, train_loss3 = 0.0, 0.0, 0.0
+    criterion = torch.nn.CrossEntropyLoss(reduction="none")
+    optimizer = torch.optim.Adam(model.parameters(), args.lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
+
+    # ------------------------------------------------------------------
+    # Source pre-training
+    # ------------------------------------------------------------------
+    best_acc = 0.0
+    for i in range(pre_epochs):
+        train_loss1 = 0.0
+        train_loss2 = 0.0
+        train_loss3 = 0.0
         count = 0
+        bingo_cnt = 0
         model.train()
-        bingo_cnt = 0.
-        for batch_i, (imgs, _, targets) in enumerate(train_loader_source):
-            imgs = imgs.cuda()
-            targets = targets.cuda()
-            output = model(imgs, targets, None, 'train', 'source')
-            cls_loss = torch.mean(criterion(output[0], targets))               
-            ###classifiers modulation
-            fc_weight = model.fc.weight
-            fc_weight_norm = torch.norm(fc_weight, dim = 1).unsqueeze(1)
-            fc_weight_ = fc_weight.mm(torch.transpose(fc_weight, 1, 0))
-            fc_weight_norm_ = fc_weight_norm.mm(torch.transpose(fc_weight_norm, 1, 0))
-            weight_loss = torch.mean(((fc_weight_ / fc_weight_norm_ -  torch.eye(fc_weight.shape[0]).cuda()) + 1) / 2)
 
+        for imgs, targets in train_loader_source:
+            imgs = imgs.cuda(non_blocking=True)
+            targets = targets.cuda(non_blocking=True)
+
+            output = model(imgs, targets, None, "train", "source")
+            cls_loss = criterion(output[0], targets).mean()
             aff_loss = output[1]
-            loss = cls_loss * args.w1 + aff_loss * args.w2 + weight_loss * args.w3    
-            train_loss2 += aff_loss
+            weight_loss = classifier_weight_loss(model)
+            loss = cls_loss * args.w1 + aff_loss * args.w2 + weight_loss * args.w3
 
+            optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            _, predicts = torch.max(output[0], 1)
-            correct_or_not = torch.eq(predicts, targets)
-            bingo_cnt += correct_or_not.sum().cpu().numpy()
-            train_loss1 += cls_loss
-            train_loss3 += weight_loss
-            optimizer.zero_grad()
+            predicts = output[0].argmax(dim=1)
+            bingo_cnt += predicts.eq(targets).sum().item()
+            train_loss1 += cls_loss.item()
+            train_loss2 += aff_loss.item()
+            train_loss3 += weight_loss.item()
             count += 1
 
-        train_acc = bingo_cnt / (count * train_batch)
-        train_acc = np.around(train_acc, 4)
-        train_loss1 = train_loss1 / count
-        train_loss2 = train_loss2 / count
-        train_loss3 = train_loss3 / count
-        
-        print('[Epoch %d] Training accuracy: %.4f.   Classification Loss: %.3f   Affinity Loss: %.3f  Weight Loss: %.3f  LR: %.6f' %
-                  (i, train_acc, train_loss1, train_loss2, train_loss3, optimizer.param_groups[0]["lr"]))
+        train_acc = bingo_cnt / float(max(count * train_batch, 1))
+        print(
+            "[Epoch %d] Training accuracy: %.4f.   Classification Loss: %.3f   "
+            "Affinity Loss: %.3f  Weight Loss: %.3f  LR: %.6f"
+            % (
+                i,
+                train_acc,
+                train_loss1 / max(count, 1),
+                train_loss2 / max(count, 1),
+                train_loss3 / max(count, 1),
+                optimizer.param_groups[0]["lr"],
+            )
+        )
+
         scheduler.step()
+        best_acc = test(
+            model,
+            optimizer,
+            val_loader_target,
+            criterion,
+            target_val_num,
+            best_acc,
+            model_path,
+            i,
+            args,
+        )
 
-        best_acc = test(model, optimizer, val_loader_target, criterion, target_val_num, best_acc, model_path, i, args)
-
-    # ============================================================
-    # Source training finished: reload the BEST source checkpoint
-    # ============================================================
+    # Reload the best source checkpoint, not the final source epoch.
     source_best_acc = best_acc
     source_checkpoint_path = os.path.join(
         model_path,
-        args.backbone
-        + '_'
-        + args.data1
-        + '_'
-        + args.data2
-        + '_'
-        + str(source_best_acc)
-        + '.pth'
+        "%s_%s_%s_%s.pth" % (args.backbone, args.data1, args.data2, source_best_acc),
     )
-
-    print(
-        "Loading best source checkpoint:",
-        source_checkpoint_path
-    )
-
+    print("Loading best source checkpoint:", source_checkpoint_path)
     checkpoint = torch.load(source_checkpoint_path)
-    model.load_state_dict(checkpoint['model'])
+    model.load_state_dict(checkpoint["model"])
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    print("Best source checkpoint loaded, acc:", source_best_acc)
 
-    print(
-        "Best source checkpoint loaded, acc:",
-        source_best_acc
+    source_fixed_path = os.path.join(
+        model_path,
+        "%s_%s_%s_source_best.pth" % (args.backbone, args.data1, args.data2),
     )
+    torch.save(checkpoint, source_fixed_path)
+    print("Source checkpoint saved:", source_fixed_path)
 
-    # ============================================================
-    # Create EMA Teacher from the BEST source model
-    # ============================================================
-    teacher = copy.deepcopy(
-        model
-    ).cuda()
-
+    teacher = copy.deepcopy(model).cuda()
     teacher.eval()
-
     for param in teacher.parameters():
         param.requires_grad = False
 
-    # ============================================================
-    # Restore optimizer corresponding to best source checkpoint
-    # ============================================================
-    optimizer.load_state_dict(
-        checkpoint['optimizer']
+    # Remove stale source-phase LR coupling. Keep Adam moments, but use a
+    # controlled target LR and a separate target scheduler.
+    for group in optimizer.param_groups:
+        group["lr"] = min(float(group["lr"]), args.target_lr)
+        group["initial_lr"] = group["lr"]
+    target_scheduler = torch.optim.lr_scheduler.ExponentialLR(
+        optimizer,
+        gamma=args.target_lr_gamma,
     )
 
-    # ============================================================
-    # Keep a permanent copy of source checkpoint
-    # ============================================================
-    source_fixed_path = os.path.join(
-        model_path,
-        args.backbone
-        + '_'
-        + args.data1
-        + '_'
-        + args.data2
-        + '_source_best.pth'
-    )
-
-    torch.save(
-        checkpoint,
-        source_fixed_path
-    )
+    effective_ema_decay = max(args.ema_decay, args.ema_floor)
+    requested_target_w2 = max(args.target_w2, 0.0)
+    target_w2_ceiling = min(requested_target_w2, args.target_w2_cap)
 
     print(
-        "Source checkpoint saved:",
-        source_fixed_path
+        "Target adaptation controls: LR=%.6f EMA=%.5f (requested %.5f) target_w2<=%.4f (requested %.4f)"
+        % (
+            optimizer.param_groups[0]["lr"],
+            effective_ema_decay,
+            args.ema_decay,
+            target_w2_ceiling,
+            args.target_w2,
+        )
     )
 
-    # ============================================================
-    # Target adaptation uses its OWN best accuracy
-    # ============================================================
     best_acc = 0.0
-
-    # Initialize source iterator before target adaptation.
     source_train_iter = iter(train_loader_source)
 
-    for i in range(0, args.epochs):
-
-        # ============================================================
-        # Target-only DDRL weight schedule
-        # ============================================================
-        if i < 5:
-            current_w2 = 0.0
-        elif i < 10:
-            current_w2 = 0.01
-        else:
-            current_w2 = args.target_w2
-
-        print(
-            "[Epoch %d] Current target w2: %.4f"
-            % (i, current_w2)
+    # ------------------------------------------------------------------
+    # Stable target adaptation
+    # ------------------------------------------------------------------
+    for i in range(args.epochs):
+        thresholds, target_prior, threshold_support, threshold_agreement = estimate_target_statistics(
+            teacher=teacher,
+            loader=threshold_loader_target,
+            class_num=class_num,
+            epoch=i,
+            total_epochs=args.epochs,
+            min_threshold=args.pseudo_min_threshold,
+            max_threshold=args.pseudo_max_threshold,
+            threshold_quantile=args.pseudo_quantile,
+            balance_power=args.balance_power,
+            phi=args.phi,
         )
 
-        train_loss1, train_loss2 = 0, 0
+        if i < 8:
+            scheduled_w2 = 0.0
+        else:
+            ramp = min(1.0, float(i - 7) / 7.0)
+            scheduled_w2 = target_w2_ceiling * ramp
+
+        print("[Epoch %d] Target prior: %s" % (
+            i, [round(float(x), 4) for x in target_prior.tolist()]
+        ))
+        print("[Epoch %d] CATM thresholds: %s | support: %s | full-set agreement: %.4f" % (
+            i,
+            [round(float(x), 4) for x in thresholds.tolist()],
+            threshold_support.tolist(),
+            threshold_agreement,
+        ))
+        print("[Epoch %d] Scheduled target w2: %.4f" % (i, scheduled_w2))
+
+        train_loss1 = 0.0
+        train_loss2 = 0.0
         count = 0
         confident_num = 0
-
-
-
-        # E3: two-view consistency statistics
+        align_num = 0
         agreement_num = 0
         agreement_total = 0
-
-        # Diagnostic only
-        pseudo_correct = 0
-        pseudo_total = 0
-
-        pseudo_class_correct = np.zeros(
-            class_num,
-            dtype=np.int64
-        )
-
-        pseudo_class_total = np.zeros(
-            class_num,
-            dtype=np.int64
-        )
-
-        # NEW: confidence-weight statistics
         pseudo_weight_sum = 0.0
         pseudo_weight_num = 0
+        pseudo_correct = 0
+        pseudo_total = 0
+        pseudo_class_correct = np.zeros(class_num, dtype=np.int64)
+        pseudo_class_total = np.zeros(class_num, dtype=np.int64)
+        applied_w2_sum = 0.0
 
-        for batch_i, (
-                imgs_w1,
-                imgs_w2,
-                imgs_aug,
-                gt_target
-        ) in enumerate(train_loader_target):
+        for imgs_w1, imgs_w2, imgs_aug, gt_target in train_loader_target:
             try:
-                source_imgs, _, source_targets = next(source_train_iter)
+                source_imgs, source_targets = next(source_train_iter)
             except StopIteration:
                 source_train_iter = iter(train_loader_source)
-                source_imgs, _, source_targets = next(source_train_iter)
-            model.eval()
-            ####forward the model get pseudo labels
+                source_imgs, source_targets = next(source_train_iter)
+
             teacher.eval()
-
             with torch.no_grad():
-
-                # ==================================================
-                # E3: EMA Teacher predicts two independent views
-                # ==================================================
-
                 out_w1, _ = teacher(
-                    imgs_w1.cuda(),
-                    None,
-                    None,
-                    'test',
-                    'target'
+                    imgs_w1.cuda(non_blocking=True), None, None, "test", "target"
                 )
-
                 out_w2, _ = teacher(
-                    imgs_w2.cuda(),
-                    None,
-                    None,
-                    'test',
-                    'target'
+                    imgs_w2.cuda(non_blocking=True), None, None, "test", "target"
                 )
 
-            targets, con_idx, threshold, label_dis = annotate_target(
-                out_w1,
-                class_num,
-                i,
-                args.epochs,
-                args.phi,
-            )
-            # ============================================================
-            # E3: Two-view EMA consistency
-            # ============================================================
-
-            with torch.no_grad():
-
-                pred_w1 = torch.argmax(
-                    out_w1,
-                    dim=1
-                ).cpu()
-
-                pred_w2 = torch.argmax(
-                    out_w2,
-                    dim=1
-                ).cpu()
-
-                # 1 = two Teacher predictions agree
-                agreement_mask = (
-                        pred_w1 == pred_w2
-                ).float()
-
-            # Statistics
-            agreement_num += int(
-                agreement_mask.sum().item()
-            )
-
-            agreement_total += int(
-                agreement_mask.numel()
-            )
-
-            # ============================================================
-            # Original CATM AND two-view agreement
-            # ============================================================
-
-            con_idx = (
-                    con_idx.float()
-                    * agreement_mask
-            )
-
-            with torch.no_grad():
-                prob = F.softmax(
-                    out_w1,
-                    dim=1
-                ).cpu()
-
-                pred_values, _ = torch.max(
-                    prob,
-                    dim=1
-                )
-
-            threshold_tensor = torch.from_numpy(
-                    np.asarray(threshold)
-                ).float()
-
-            sample_threshold = threshold_tensor[
-                targets
-            ]
-
-            pseudo_weight = (
-                        (pred_values - sample_threshold)
-                        / (1.0 - sample_threshold + 1e-6)
-                )
-
-            pseudo_weight = torch.clamp(
+                (
+                    targets,
+                    selected_mask,
                     pseudo_weight,
-                    min=0.0,
-                    max=1.0
+                    align_mask,
+                    agreement_mask,
+                    stable_conf,
+                ) = build_pseudo_labels(
+                    out_w1,
+                    out_w2,
+                    thresholds,
+                    target_prior,
+                    args.balance_power,
+                    args.align_min_weight,
                 )
 
-            pseudo_weight = (
-                        pseudo_weight
-                        * con_idx.float()
-                )
+            agreement_num += int(agreement_mask.sum().item())
+            agreement_total += int(agreement_mask.numel())
+            confident_num += int(selected_mask.sum().item())
+            align_count = int(align_mask.sum().item())
+            align_num += align_count
 
-            # ============================================================
-            # Reliable target samples for DDRL alignment
-            # Classification can use all con_idx samples,
-            # but feature alignment only uses high-reliability samples.
-            # ============================================================
-
-            align_idx = (
-                    con_idx.bool()
-                    & (pseudo_weight >= 0.75)
-            ).float()
-
-
-            # -----------------------------------------
-            # Accumulate pseudo-label confidence weights
-            # -----------------------------------------
-            selected_weight = pseudo_weight[
-                con_idx.bool()
-            ]
-
+            selected_weight = pseudo_weight[selected_mask]
             if selected_weight.numel() > 0:
                 pseudo_weight_sum += selected_weight.sum().item()
                 pseudo_weight_num += selected_weight.numel()
-            # -----------------------------------------
-            # Pseudo-label diagnostic
-            # gt_target is ONLY used for evaluation.
-            # Never use it in loss / threshold selection.
-            # -----------------------------------------
-            mask = con_idx.bool()
 
+            # Diagnostic only. Target labels never enter thresholding or loss.
             gt_cpu = gt_target.cpu().long()
-
-
-            if mask.any():
-                pseudo_correct += (
-                    targets[mask]
-                    == gt_cpu[mask]
-                ).sum().item()
-
-                pseudo_total += mask.sum().item()
-
+            if selected_mask.any():
+                pseudo_correct += targets[selected_mask].eq(gt_cpu[selected_mask]).sum().item()
+                pseudo_total += int(selected_mask.sum().item())
                 for c in range(class_num):
-                    class_mask = (
-                        mask
-                        & (targets == c)
-                    )
-
-                    n_c = class_mask.sum().item()
-
+                    class_mask = selected_mask & targets.eq(c)
+                    n_c = int(class_mask.sum().item())
                     if n_c > 0:
                         pseudo_class_total[c] += n_c
-
-                        pseudo_class_correct[c] += (
-                            targets[class_mask]
-                            == gt_cpu[class_mask]
-                        ).sum().item()
-
+                        pseudo_class_correct[c] += targets[class_mask].eq(gt_cpu[class_mask]).sum().item()
 
             model.train()
-            source_con_idx = torch.ones(source_imgs.shape[0])
-            ###cmbine the source and target batch
-            train_imgs = torch.cat((source_imgs, imgs_aug), 0).cuda()
-            train_targets = torch.cat((source_targets, targets), 0).cuda()
-            train_con_idx = torch.cat(
-                (
-                    source_con_idx,
-                    align_idx
-                ),
-                0
-            ).cuda()
+            source_imgs = source_imgs.cuda(non_blocking=True)
+            source_targets = source_targets.long()
+            target_imgs = imgs_aug.cuda(non_blocking=True)
 
-            # Classification reliability weights:
-            # source samples always have weight 1
-            source_cls_weight = torch.ones(
-                source_imgs.shape[0]
-            )
-
+            source_con_idx = torch.ones(source_imgs.shape[0], dtype=torch.float32)
+            train_imgs = torch.cat((source_imgs, target_imgs), dim=0)
+            train_targets = torch.cat((source_targets, targets), dim=0).cuda(non_blocking=True)
+            train_con_idx = torch.cat((source_con_idx, align_mask.float()), dim=0).cuda(non_blocking=True)
             train_cls_weight = torch.cat(
-                (
-                    source_cls_weight,
-                    pseudo_weight
-                ),
-                dim=0
-            ).cuda()
+                (torch.ones(source_imgs.shape[0]), pseudo_weight.float()),
+                dim=0,
+            ).cuda(non_blocking=True)
 
-            output = model(train_imgs, train_targets, train_con_idx, 'train', 'target')
-            ##classification _loss
-            per_sample_loss = criterion(
-                output[0],
-                train_targets
-            )
+            output = model(train_imgs, train_targets, train_con_idx, "train", "target")
+            per_sample_loss = criterion(output[0], train_targets)
 
-            cls_loss = torch.mean(
-                per_sample_loss
-                * train_cls_weight
-            )
-
-            fc_weight = model.fc.weight
-            fc_weight_norm = torch.norm(fc_weight, dim = 1).unsqueeze(1)
-            fc_weight_ = fc_weight.mm(torch.transpose(fc_weight, 1, 0))
-            fc_weight_norm_ = fc_weight_norm.mm(torch.transpose(fc_weight_norm, 1, 0))
-            weight_loss = torch.mean(((fc_weight_ / fc_weight_norm_ -  torch.eye(fc_weight.shape[0]).cuda()) + 1) / 2)
-
+            # Do not dilute source replay by zero-weight target samples.
+            cls_loss = (per_sample_loss * train_cls_weight).sum() / train_cls_weight.sum().clamp_min(1.0)
             aff_loss = output[1]
+            weight_loss = classifier_weight_loss(model)
 
-            loss = (
-                    cls_loss * args.w1
-                    + aff_loss * current_w2
-                    + weight_loss * args.w3
-            )
-            train_loss2 += aff_loss
+            # DDRL affinity is useful only when enough high-reliability target
+            # samples are present. This prevents a few noisy pseudo labels from
+            # producing a large negative affinity term.
+            applied_w2 = scheduled_w2 if align_count >= args.min_align_samples else 0.0
+            loss = cls_loss * args.w1 + aff_loss * applied_w2 + weight_loss * args.w3
+
+            optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            update_ema(
-                model,
-                teacher,
-                args.ema_decay
-            )
+            if i >= args.teacher_warmup:
+                update_ema(model, teacher, effective_ema_decay)
 
-            train_loss1 += cls_loss
-            optimizer.zero_grad()
-            confident_num += int(mask.sum().item())
+            train_loss1 += cls_loss.item()
+            train_loss2 += aff_loss.item()
+            applied_w2_sum += applied_w2
             count += 1
 
-        scheduler.step()
+        target_scheduler.step()
 
-
-        train_loss1 = train_loss1 / count
-        train_loss2 = train_loss2 / count
-
-        mean_pseudo_weight = (
-                pseudo_weight_sum
-                / max(pseudo_weight_num, 1)
-        )
-
-        print(
-            "[Epoch %d] Mean pseudo weight: %.4f"
-            % (
-                i,
-                mean_pseudo_weight
-            )
-        )
-        agreement_rate = (
-                agreement_num
-                / max(agreement_total, 1)
-        )
-
-        print(
-            "[Epoch %d] Two-view Agreement: %.4f (%d/%d)"
-            % (
-                i,
-                agreement_rate,
-                agreement_num,
-                agreement_total
-            )
-        )
-
-
-        pseudo_acc = (
-            pseudo_correct
-            / max(pseudo_total, 1)
-        )
-
+        mean_pseudo_weight = pseudo_weight_sum / max(pseudo_weight_num, 1)
+        agreement_rate = agreement_num / max(agreement_total, 1)
+        pseudo_acc = pseudo_correct / max(pseudo_total, 1)
         pseudo_class_acc = []
-
         for c in range(class_num):
             if pseudo_class_total[c] > 0:
-                acc_c = (
-                    pseudo_class_correct[c]
-                    / pseudo_class_total[c]
-                )
+                pseudo_class_acc.append(round(
+                    pseudo_class_correct[c] / float(pseudo_class_total[c]), 4
+                ))
             else:
-                acc_c = 0.0
+                pseudo_class_acc.append(0.0)
 
-            pseudo_class_acc.append(
-                round(acc_c, 4)
-            )
-
+        print("[Epoch %d] Mean pseudo weight: %.4f" % (i, mean_pseudo_weight))
+        print("[Epoch %d] Two-view Agreement: %.4f (%d/%d)" % (
+            i, agreement_rate, agreement_num, agreement_total
+        ))
+        print("[Epoch %d] Pseudo Acc: %.4f | Pseudo class acc: %s | Pseudo class num: %s" % (
+            i, pseudo_acc, pseudo_class_acc, pseudo_class_total.tolist()
+        ))
         print(
-            "[Epoch %d] Pseudo Acc: %.4f | "
-            "Pseudo class acc: %s | "
-            "Pseudo class num: %s"
+            "[Epoch %d] Confident_Num: %d Align_Num: %d Classification Loss: %.3f "
+            "Affinity Loss: %.3f Applied_w2: %.4f LR: %.6f"
             % (
                 i,
-                pseudo_acc,
-                pseudo_class_acc,
-                pseudo_class_total.tolist()
+                confident_num,
+                align_num,
+                train_loss1 / max(count, 1),
+                train_loss2 / max(count, 1),
+                applied_w2_sum / max(count, 1),
+                optimizer.param_groups[0]["lr"],
             )
         )
 
-        print('[Epoch %d]  Confident_Num: %d    Classification Loss: %.3f   Affinity Loss: %.3f   LR: %.6f' %
-                  (i, confident_num, train_loss1, train_loss2, optimizer.param_groups[0]["lr"]))
-        best_acc = test(model, optimizer, val_loader_target, criterion, target_val_num, best_acc, model_path, i, args)
+        best_acc = test(
+            model,
+            optimizer,
+            val_loader_target,
+            criterion,
+            target_val_num,
+            best_acc,
+            model_path,
+            i,
+            args,
+        )
+
     print("best_acc %s " % str(best_acc))
-    
-def evaluate_only(
-        model,
-        val_loader_target,
-        criterion,
-        num
-):
 
+
+def test(model, optimizer, val_loader_target, criterion, num, best_acc, path, epoch, args):
     with torch.no_grad():
-
         val_loss = 0.0
         iter_cnt = 0
         bingo_cnt = 0
-
+        preds = []
+        labels = []
         model.eval()
 
-        for batch_i, (
-                imgs,
-                targets
-        ) in enumerate(
-            val_loader_target
-        ):
-
-            imgs = imgs.cuda()
-            targets = targets.cuda()
-
-            out, _ = model(
-                imgs,
-                targets,
-                None,
-                mode='test'
-            )
-
-            loss = torch.mean(
-                criterion(
-                    out,
-                    targets
-                )
-            )
+        for imgs, targets in val_loader_target:
+            imgs = imgs.cuda(non_blocking=True)
+            targets = targets.cuda(non_blocking=True)
+            out, _ = model(imgs, targets, None, mode="test")
+            loss = criterion(out, targets).mean()
 
             val_loss += loss.item()
             iter_cnt += 1
-
-            _, predicts = torch.max(
-                out,
-                1
-            )
-
-            bingo_cnt += torch.eq(
-                predicts,
-                targets
-            ).sum().item()
-
-        val_acc = (
-            float(bingo_cnt)
-            / float(num)
-        )
-
-        val_loss = (
-            val_loss
-            / max(iter_cnt, 1)
-        )
-
-    return val_acc, val_loss
-
-def test(model, optimizer, val_loader_target, criterion, num, best_acc, path, epoch, args):
-
-    with torch.no_grad():
-        val_loss = 0.0
-        iter_cnt = 0
-        bingo_cnt = 0
-        preds, labels = [], []
-        model.eval()
-        for batch_i, (imgs, targets) in enumerate(val_loader_target):
-            out, _ = model(imgs.cuda(), targets, None, mode = 'test')
-            targets = targets.cuda()
-            loss = torch.mean(criterion(out, targets))
-            val_loss += loss
-            iter_cnt += 1
-            _, predicts = torch.max(out, 1)
-            correct_or_not = torch.eq(predicts, targets)
-            bingo_cnt += correct_or_not.sum().cpu()
+            predicts = out.argmax(dim=1)
+            bingo_cnt += predicts.eq(targets).sum().item()
             preds.append(predicts.cpu())
             labels.append(targets.cpu())
 
-        val_loss = val_loss / iter_cnt
-        val_acc = bingo_cnt.float() / float(num)
-        val_acc = np.around(val_acc.numpy(), 4)
-        print("[Epoch %d] Target Validation accuracy:%.4f.  Loss:%.3f" % (epoch, val_acc, val_loss))
-        class_acc, _ = util.make_confucion_matrix(preds, labels)
-        pred = torch.cat(preds, dim=0)
-        labelss = torch.cat(labels, dim=0)
-        mean_acc = val_acc #np.mean(class_acc)
-        
+        val_loss /= max(iter_cnt, 1)
+        val_acc = np.around(float(bingo_cnt) / float(num), 4)
+        print("[Epoch %d] Target Validation accuracy:%.4f.  Loss:%.3f" % (
+            epoch, val_acc, val_loss
+        ))
+
+        # Keep the original confusion-matrix side effect for compatibility.
+        util.make_confucion_matrix(preds, labels)
+        mean_acc = val_acc
+
         if mean_acc > best_acc:
+            old_path = os.path.join(
+                path,
+                "%s_%s_%s_%s.pth" % (args.backbone, args.data1, args.data2, best_acc),
+            )
             try:
-                os.remove(os.path.join(path, args.backbone + '_' + args.data1 + '_' + args.data2 + '_' + str(best_acc) + ".pth"))
-            except:
+                os.remove(old_path)
+            except OSError:
                 pass
+
             best_acc = mean_acc
-            save_data = {'model': model.state_dict(),
-                         'optimizer': optimizer.state_dict()}
-            torch.save(save_data,
-                       os.path.join(path, args.backbone + '_' + args.data1 + '_' + args.data2 + '_' + str(best_acc) + ".pth"))
-                       
+            save_data = {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+            }
+            save_path = os.path.join(
+                path,
+                "%s_%s_%s_%s.pth" % (args.backbone, args.data1, args.data2, best_acc),
+            )
+            torch.save(save_data, save_path)
             print("best_acc %s " % str(best_acc))
 
     return best_acc
 
 
-
-    
-
 if __name__ == "__main__":
-    class RecorderMeter():
-        pass
-
-    acc = run_training()
+    run_training()
