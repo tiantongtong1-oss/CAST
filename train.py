@@ -373,12 +373,39 @@ def run_training():
         scheduler.step()
 
         best_acc = test(model, optimizer, val_loader_target, criterion, target_val_num, best_acc, model_path, i, args)
-        # ============================================================
-        # Save fixed best target checkpoint
-        # Student + EMA Teacher
-        # ============================================================
 
+    # ============================================================
+    # Source training finished: reload the BEST source checkpoint
+    # ============================================================
+    source_best_acc = best_acc
+    source_checkpoint_path = os.path.join(
+        model_path,
+        args.backbone
+        + '_'
+        + args.data1
+        + '_'
+        + args.data2
+        + '_'
+        + str(source_best_acc)
+        + '.pth'
+    )
 
+    print(
+        "Loading best source checkpoint:",
+        source_checkpoint_path
+    )
+
+    checkpoint = torch.load(source_checkpoint_path)
+    model.load_state_dict(checkpoint['model'])
+
+    print(
+        "Best source checkpoint loaded, acc:",
+        source_best_acc
+    )
+
+    # ============================================================
+    # Create EMA Teacher from the BEST source model
+    # ============================================================
     teacher = copy.deepcopy(
         model
     ).cuda()
@@ -391,7 +418,6 @@ def run_training():
     # ============================================================
     # Restore optimizer corresponding to best source checkpoint
     # ============================================================
-
     optimizer.load_state_dict(
         checkpoint['optimizer']
     )
@@ -399,7 +425,6 @@ def run_training():
     # ============================================================
     # Keep a permanent copy of source checkpoint
     # ============================================================
-
     source_fixed_path = os.path.join(
         model_path,
         args.backbone
@@ -423,8 +448,10 @@ def run_training():
     # ============================================================
     # Target adaptation uses its OWN best accuracy
     # ============================================================
-
     best_acc = 0.0
+
+    # Initialize source iterator before target adaptation.
+    source_train_iter = iter(train_loader_source)
 
     for i in range(0, args.epochs):
 
@@ -479,7 +506,7 @@ def run_training():
         ) in enumerate(train_loader_target):
             try:
                 source_imgs, _, source_targets = next(source_train_iter)
-            except:
+            except StopIteration:
                 source_train_iter = iter(train_loader_source)
                 source_imgs, _, source_targets = next(source_train_iter)
             model.eval()
