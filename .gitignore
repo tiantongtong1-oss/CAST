@@ -1,0 +1,12 @@
+*.pth
+*.pt
+*.ckpt
+datesets/
+__pycache__/
+*.pyc
+*.jpg
+*.txt
+
+data/
+hello.py
+test.py

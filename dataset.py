@@ -22,7 +22,7 @@ class RafDataSet(data.Dataset):
 
         NAME_COLUMN = 0
         LABEL_COLUMN = 1
-        df = pd.read_csv(os.path.join(self.raf_path, '/workspace/ttt/code/test-upload-clean/datesets/raf-basic/EmoLabel/list_patition_label.txt'), sep=' ', header=None)
+        df = pd.read_csv(os.path.join(self.raf_path, 'EmoLabel/list_patition_label.txt'), sep=' ', header=None)
         if phase == 'train':
             dataset = df[df[NAME_COLUMN].str.startswith('train')]
         else:
@@ -169,26 +169,66 @@ class FER(data.Dataset):
 
     def __getitem__(self, idx):
         path = self.file_paths[idx]
+
         image = cv2.imread(path)
+
         if image is None:
-            raise FileNotFoundError("Failed to read image: %s" % path)
-        image = image[:, :, ::-1]  # BGR to RGB
-        img = image
+            raise FileNotFoundError(
+                "Failed to read image: %s" % path
+            )
+
+        # BGR -> RGB
+        image = image[:, :, ::-1]
+
         label = self.label[idx]
+
+        # --------------------------------------------------
+        # Basic augmentation
+        # --------------------------------------------------
         if self.phase == 'train':
             if self.basic_aug and random.uniform(0, 1) > 0.5:
                 index = random.randint(0, 1)
                 image = self.aug_func[index](image)
 
+        # ==================================================
+        # E3: Two independent target views
+        # ==================================================
         if self.transform is not None:
-            img = self.transform(image)
 
-        if self.strong_transform is not None:
-            img_aug = self.strong_transform(image)
-            return img, img_aug, label
+            # View 1
+            img_w1 = self.transform(image)
+
+            # View 2
+            # Calling the same random transform again gives
+            # another independent augmentation of the same image.
+            if self.phase == 'train':
+                img_w2 = self.transform(image)
+            else:
+                img_w2 = None
 
         else:
-            return img, label
+            img_w1 = image
+            img_w2 = image if self.phase == 'train' else None
+
+        # ==================================================
+        # Target training:
+        # two Teacher views + one strong Student view
+        # ==================================================
+        if self.strong_transform is not None:
+
+            img_aug = self.strong_transform(image)
+
+            return (
+                img_w1,
+                img_w2,
+                img_aug,
+                label
+            )
+
+
+        # Validation / test
+        else:
+            return img_w1, label
 if __name__ == '__main__':
     train_dataset = FER(
         '/workspace/ttt/code/data/fer2013/',
