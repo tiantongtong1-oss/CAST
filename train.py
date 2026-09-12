@@ -1,930 +1,365 @@
-import warnings
-warnings.filterwarnings("ignore")
-import numpy as np
-import torch.utils.data as data
-from torchvision import transforms
-import os, torch
 import argparse
+import copy
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+from datetime import datetime, timezone
+
+import numpy as np
+import torch
+from torchvision import transforms
+
 import Networks
 from dataset import RafDataSet, FER
-import torch.nn.functional as F
-import math
-from thop import profile
-import image_utils as util
-import random
-from einops import rearrange, repeat
-from torchvision.utils import save_image
-from randaugment import  RandAugmentMC
-from sklearn.cluster import KMeans
-
-import copy
+from randaugment import RandAugmentMC
+from training_utils import (classifier_weight_loss, classification_losses,
+                            seed_everything, seed_worker, select_pseudo_labels,
+                            target_affinity_weight, update_ema)
 
 
-global epoch
-seed = 1314 
-np.random.seed(seed)
-
-torch.manual_seed(seed)
-torch.cuda.manual_seed(seed)
-torch.cuda.manual_seed_all(seed)  # if you are using multi-GPU.
-np.random.seed(seed)  # Numpy module.
-random.seed(seed)  # Python random module.
-torch.manual_seed(seed)
-torch.backends.cudnn.benchmark = False
-torch.backends.cudnn.deterministic = True
+CLASS_NAMES = ['surprise', 'fear', 'disgust', 'happy', 'sad', 'angry', 'neutral']
 
 
-
-def _init_fn(worker_id):
-    np.random.seed(int(seed))
-
-@torch.no_grad()
-def update_ema(student, teacher, decay=0.999):
-
- # EMA update for trainable parameters
-    for teacher_param, student_param in zip(
-                teacher.parameters(),
-                student.parameters()
-        ):
-            teacher_param.data.mul_(decay).add_(
-                student_param.data,
-                alpha=1.0 - decay
-            )
-
-        # Important for BatchNorm running_mean / running_var
-    for teacher_buffer, student_buffer in zip(
-                teacher.buffers(),
-                student.buffers()
-        ):
-        if teacher_buffer.dtype.is_floating_point:
-                teacher_buffer.data.mul_(decay).add_(
-                    student_buffer.data,
-                    alpha=1.0 - decay
-                )
-        else:
-                teacher_buffer.data.copy_(
-                    student_buffer.data
-                )
-# ============================================================
-# Calculate one set of CATM thresholds using the whole target set
-# ============================================================
-
-
-def annotate_target(pred, class_num, i, total_epochs, phi):
-
-    pred = pred.detach().cpu()
-    pred = F.softmax(pred, dim=1)
-
-    pred_values, pred_targets = torch.max(
-        pred,
-        dim=1
-    )
-
-    max_index = F.one_hot(
-        pred_targets,
-        class_num
-    )
-
-    preds_mean = np.transpose(
-        (pred * max_index).detach().numpy()
-    )
-
-    class_sum = [
-        np.sum(pred_mean)
-        for pred_mean in preds_mean
-    ]
-
-    class_idx = [
-        len(np.where(pred_mean > 0)[0])
-        for pred_mean in preds_mean
-    ]
-
-    class_mean = np.array([
-        class_sum[index] / class_idx[index]
-        if class_idx[index] != 0
-        else 0
-        for index in range(len(class_idx))
-    ])
-
-    class_mean = np.array([
-        mean
-        * phi
-        * (
-            float(total_epochs)
-            / float(total_epochs - i)
-        )
-        for mean in class_mean
-    ])
-
-    # Original CAST batch-level CATM
-    class_mean = torch.from_numpy(
-        np.minimum(class_mean, 0.9)
-    ).float()
-
-    threshold = class_mean.numpy()
-
-    batch_mean = torch.index_select(
-        class_mean,
-        0,
-        pred_targets
-    ).detach().numpy()
-
-    confident_idx = torch.from_numpy(
-        (
-            pred_values.detach().numpy()
-            > batch_mean
-        ).nonzero()[0]
-    )
-
-    t = pred_targets.index_select(
-        0,
-        confident_idx
-    ).numpy()
-
-    label_dis = [
-        np.sum(t == c)
-        for c in range(class_num)
-    ]
-
-    ones = torch.ones(
-        confident_idx.shape[0]
-    )
-
-    confident_idx = torch.zeros(
-        pred.shape[0]
-    ).index_put(
-        [torch.LongTensor(confident_idx)],
-        ones
-    )
-
-    return (
-        pred_targets,
-        confident_idx,
-        threshold,
-        label_dis
-    )
-
-
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data1', type=str, default='rafdb', help='source data')
-    parser.add_argument('--data2', type=str, default='fer', help='target data.')
-    parser.add_argument('--idx', type=int, default=3, help='10-folder cross validation')
-    parser.add_argument('-c', '--checkpoint', type=str, default= None,help='load model')
-    parser.add_argument('--backbone', type=str, default='resnet18', help='Backobone, resnet18, resnet50 or mobilenet_v2.')
-    parser.add_argument('--lr', type=float, default=0.001, help='Initial learning rate for sgd.')
-    parser.add_argument('--workers', default=10, type=int, help='Number of data loading workers (default: 10)')
-    parser.add_argument('--epochs', type=int, default=30, help='Total training epochs.')
-    parser.add_argument('--w1', type=float, default=4, help='classification loss weight')
-    parser.add_argument('--w2', type=float, default=0.3, help='affinity loss weight')
-    parser.add_argument('--w3', type=float, default=0.1, help='weight loss weight')
-    parser.add_argument('--phi', type=float, default=1.4, help='weight loss weight')
-    parser.add_argument('--ema_decay',type=float,default=0.999)
-    parser.add_argument('--target_w2',type=float,default=0.03)
+    parser.add_argument('--data1', choices=['rafdb'], default='rafdb')
+    parser.add_argument('--data2', choices=['fer'], default='fer')
+    parser.add_argument('--idx', type=int, default=3, help='Legacy experiment identifier (not a split selector).')
+    parser.add_argument('-c', '--checkpoint', help='Initialize model weights, then train on source.')
+    parser.add_argument('--source_checkpoint', help='Skip source training and adapt these source weights directly.')
+    parser.add_argument('--backbone', choices=['resnet18', 'resnet50', 'mobilenet_v2'], default='resnet18')
+    parser.add_argument('--lr', type=float, default=0.001, help='Source Adam learning rate.')
+    parser.add_argument('--target_lr', type=float, default=0.0003, help='Independent target Adam learning rate.')
+    parser.add_argument('--workers', type=int, default=10)
+    parser.add_argument('--epochs', type=int, default=30, help='Target adaptation epochs.')
+    parser.add_argument('--source_epochs', type=int, default=30)
+    parser.add_argument('--batch_size', type=int, default=128)
+    parser.add_argument('--w1', type=float, default=4)
+    parser.add_argument('--w2', type=float, default=0.3, help='Source affinity weight.')
+    parser.add_argument('--w3', type=float, default=0.1)
+    parser.add_argument('--phi', type=float, default=1.4, help='CATM class threshold multiplier.')
+    parser.add_argument('--ema_decay', type=float, default=0.995)
+    parser.add_argument('--target_w2', type=float, default=0.0, help='Target affinity maximum; zero disables it completely.')
+    parser.add_argument('--affinity_warmup', type=int, default=5)
+    parser.add_argument('--affinity_ramp', type=int, default=5)
+    parser.add_argument('--target_cls_weight', type=float, default=0.5, help='Weight of normalized target CE relative to source CE.')
+    parser.add_argument('--pseudo_ramp', type=int, default=5)
+    parser.add_argument('--threshold_min', type=float, default=0.8)
+    parser.add_argument('--threshold_max', type=float, default=0.95)
+    parser.add_argument('--teacher_views', choices=['weak', 'legacy'], default='weak',
+                        help='weak: resize/flip; legacy: source rotation/crop/erasing transforms.')
+    parser.add_argument('--target_loss_reduction', choices=['normalized', 'legacy'], default='normalized',
+                        help='legacy keeps the old reduction over all source/target samples for ablation.')
+    parser.add_argument('--source_root', default='/workspace/ttt/code/test-upload-clean/datesets/raf-basic')
+    parser.add_argument('--target_root', default='/workspace/ttt/code/data/fer2013')
+    parser.add_argument('--output_dir', default='./models/rafdb_fer')
+    parser.add_argument('--run_name', help='New subdirectory under output_dir; existing runs are never overwritten.')
+    parser.add_argument('--seed', type=int, default=1314)
+    parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
+    parser.add_argument('--no_pretrained', action='store_true', help='Do not download ImageNet initialization.')
+    args = parser.parse_args(argv)
+    if args.checkpoint and args.source_checkpoint:
+        parser.error('Use only one of --checkpoint and --source_checkpoint.')
+    if not 0 <= args.threshold_min <= args.threshold_max < 1:
+        parser.error('Require 0 <= threshold_min <= threshold_max < 1.')
+    if not 0 <= args.ema_decay < 1:
+        parser.error('ema_decay must be in [0, 1).')
+    if args.epochs < 0 or args.source_epochs < 0 or (args.source_epochs == 0 and not args.source_checkpoint):
+        parser.error('Epochs must be nonnegative; source_epochs=0 requires --source_checkpoint.')
+    if args.batch_size < 2 or args.workers < 0:
+        parser.error('batch_size must be >= 2 and workers must be nonnegative.')
+    if min(args.w1, args.w2, args.w3, args.target_w2, args.target_cls_weight,
+           args.affinity_warmup, args.affinity_ramp, args.pseudo_ramp) < 0:
+        parser.error('Loss weights and ramp lengths must be nonnegative.')
+    if args.lr <= 0 or args.target_lr <= 0 or args.phi <= 0:
+        parser.error('Learning rates and phi must be positive.')
+    if args.run_name and (Path(args.run_name).name != args.run_name or args.run_name in {'.', '..'}):
+        parser.error('run_name must be a directory name, not a path.')
+    return args
 
-    return parser.parse_args()
 
-
-
-def run_training():
-    args = parse_args()
-    model_path = os.path.join('./models', args.data1 + '_' + args.data2)
-    if not os.path.exists(model_path):
-        os.makedirs(model_path)
-
-    print('---------------------------------------------------------------------------------------')
-    print('Training %s with source data %s and target data %s, idx %s:'%(args.backbone, args.data1, args.data2, args.idx))
-    print('w1:%s        w2:%s      w3:%s'%(str(args.w1), str(args.w2), str(args.w3)))
-    print('---------------------------------------------------------------------------------------')
-     
-    if args.backbone == 'resnet18':
-        train_batch = 128
-        test_batch = 128
-        pre_epochs = 30
-        
-    elif args.backbone == 'resnet50':
-        train_batch = 128
-        test_batch = 100
-        pre_epochs = 30
-        
-    elif args.backbone == 'mobilenet_v2':
-        train_batch = 128
-        test_batch = 128
-        pre_epochs = 30
-
-    data_transforms = {
-        "train": transforms.Compose([
-        transforms.ToPILImage(),
-        transforms.Resize((224, 224)),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomApply([transforms.RandomRotation(20),
-                                transforms.RandomCrop(224, padding=32)], p=0.5),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        transforms.RandomErasing(scale=(0.02, 0.25))]),
-
-        "test": transforms.Compose([
-        transforms.ToPILImage(),
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])]),
-
+def build_transforms():
+    normalize = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    return {
+        'train': transforms.Compose([
+            transforms.ToPILImage(), transforms.Resize((224, 224)),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomApply([transforms.RandomRotation(20),
+                                    transforms.RandomCrop(224, padding=32)], p=0.5),
+            transforms.ToTensor(), normalize, transforms.RandomErasing(scale=(0.02, 0.25))]),
+        'weak': transforms.Compose([
+            transforms.ToPILImage(), transforms.Resize((224, 224)),
+            transforms.RandomHorizontalFlip(), transforms.ToTensor(), normalize]),
+        'test': transforms.Compose([
+            transforms.ToPILImage(), transforms.Resize((224, 224)),
+            transforms.ToTensor(), normalize]),
         'augment': transforms.Compose([
-        transforms.ToPILImage(),
-        transforms.Resize((224, 224)),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomApply([transforms.RandomRotation(20),
-                                transforms.RandomCrop(224, padding=32)], p=0.5),
-        RandAugmentMC(n=2, m=10),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        transforms.RandomErasing(scale=(0.02, 0.25))]),
-
+            transforms.ToPILImage(), transforms.Resize((224, 224)),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomApply([transforms.RandomRotation(20),
+                                    transforms.RandomCrop(224, padding=32)], p=0.5),
+            RandAugmentMC(n=2, m=10), transforms.ToTensor(), normalize,
+            transforms.RandomErasing(scale=(0.02, 0.25))]),
     }
 
 
-    ###source data
-    if args.data1 == 'rafdb':
-        train_dataset = RafDataSet('/workspace/ttt/code/test-upload-clean/datesets/raf-basic', phase='train', transform=data_transforms['train'], strong_transform = data_transforms['augment'],
-                                   basic_aug=False)
-        val_dataset = RafDataSet('/workspace/ttt/code/test-upload-clean/datesets/raf-basic', phase='test', transform=data_transforms['test'], strong_transform = None)
-        class_num = 7
-        class_name = ['surprise', 'fear', 'disgust', 'happy', 'sad', 'angry', 'neutral']
-        source_train = train_dataset
-        source_test = val_dataset
-        source_val_num = val_dataset.__len__()
-
-    else:
-        raise ValueError('Please input right source data')
-
-    if args.data2 == 'fer':
-        train_dataset = FER('/workspace/ttt/code/data/fer2013', phase='train',  transform=data_transforms['train'], strong_transform = data_transforms['augment'],
-                            basic_aug=False)
-        val_dataset = FER('/workspace/ttt/code/data/fer2013', phase='test', transform=data_transforms['test'], strong_transform = None)
-        class_num = 7
-        class_name = ['surprise', 'fear', 'disgust', 'happy', 'sad', 'angry', 'neutral']
-        target_train = train_dataset
+def file_digest(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
 
 
-
-        target_test = val_dataset
-        target_val_num = val_dataset.__len__()
-        
-    else:
-        raise ValueError('Please input right target data')
-
-
-    train_loader_source = torch.utils.data.DataLoader(source_train,
-                                                      batch_size=train_batch,
-                                                      num_workers=args.workers,
-                                                      shuffle=True,
-                                                      pin_memory=True,
-                                                      drop_last=True)
+def dataset_manifest(dataset, root):
+    # Identifies file membership/order and labels, not the image byte contents.
+    records = [(os.path.relpath(p, root), int(y)) for p, y in zip(dataset.file_paths, dataset.label)]
+    return {'count': len(records), 'class_counts': [int(x) for x in dataset.label_dis],
+            'paths_labels_sha256': hashlib.sha256(json.dumps(records).encode()).hexdigest()}
 
 
-    val_loader_source = torch.utils.data.DataLoader(source_test,
-                                                    batch_size=test_batch,
-                                                    num_workers=args.workers,
-                                                    shuffle=False,
-                                                    pin_memory=True)
-
-    train_loader_target = torch.utils.data.DataLoader(
-        target_train,
-        batch_size=train_batch,
-        num_workers=args.workers,
-        shuffle=True,
-        pin_memory=True,
-        drop_last=True
-    )
-    # Used only to estimate epoch-level CATM thresholds.
-    # Must cover the whole target training set.
-    threshold_loader_target = torch.utils.data.DataLoader(
-        target_train,
-        batch_size=train_batch,
-        num_workers=args.workers,
-        shuffle=False,
-        pin_memory=True,
-        drop_last=False
-    )
-    val_loader_target = torch.utils.data.DataLoader(target_test,
-                                                    batch_size=test_batch,
-                                                    num_workers=args.workers,
-                                                    shuffle=False,
-                                                    pin_memory=True)
+def make_loader(dataset, args, shuffle, seed):
+    if len(dataset) == 0:
+        raise ValueError('Dataset is empty; check --source_root/--target_root and *.jpg files.')
+    if shuffle and len(dataset) < args.batch_size:
+        raise ValueError('Training dataset is smaller than batch_size; reduce --batch_size.')
+    return torch.utils.data.DataLoader(
+        dataset, batch_size=args.batch_size, num_workers=args.workers,
+        shuffle=shuffle, drop_last=shuffle, pin_memory=str(args.device).startswith('cuda'),
+        worker_init_fn=seed_worker, generator=torch.Generator().manual_seed(seed))
 
 
-    model = Networks.Model(backbone=args.backbone, num_classes=class_num)
+@torch.no_grad()
+def evaluate_only(model, loader, device):
+    model.eval()
+    confusion = torch.zeros((7, 7), dtype=torch.long)
+    loss_sum, total = 0.0, 0
+    for imgs, targets in loader:
+        targets = targets.to(device)
+        logits, _ = model(imgs.to(device), None, None, mode='test')
+        loss_sum += torch.nn.functional.cross_entropy(logits, targets, reduction='sum').item()
+        predictions = logits.argmax(1)
+        confusion += torch.bincount((targets * 7 + predictions).cpu(), minlength=49).reshape(7, 7)
+        total += targets.numel()
+    if not total:
+        raise ValueError('Cannot evaluate an empty dataset.')
+    counts = confusion.sum(1)
+    recalls = confusion.diag().float() / counts.clamp_min(1)
+    return {'accuracy': confusion.diag().sum().item() / total, 'loss': loss_sum / total,
+            'class_recall': recalls.tolist(), 'class_counts': counts.tolist(),
+            'confusion_matrix': confusion.tolist(), 'num_samples': total}
 
-    if args.checkpoint:
-        print("Loading pretrained weights...", args.checkpoint)
-        checkpoint = torch.load(args.checkpoint)
+
+def save_checkpoint(path, model, optimizer, scheduler, args, epoch, metrics,
+                    model_kind, teacher=None, student=None):
+    payload = {'model': model.state_dict(), 'optimizer': optimizer.state_dict(),
+               'scheduler': scheduler.state_dict(), 'args': vars(args), 'epoch': epoch,
+               'metrics': metrics, 'model_kind': model_kind}
+    if teacher is not None:
+        payload['teacher'] = teacher.state_dict()
+    if student is not None:
+        payload['student'] = student.state_dict()
+    temporary = path.with_suffix('.tmp')
+    torch.save(payload, temporary)
+    temporary.replace(path)
+
+
+def record_metrics(run_dir, row):
+    with (run_dir / 'history.jsonl').open('a') as stream:
+        stream.write(json.dumps(row) + '\n')
+
+
+def run_training(args=None):
+    args = parse_args() if args is None else args
+    seed_everything(args.seed)
+    run_name = args.run_name or datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S_%fZ')
+    run_dir = Path(args.output_dir) / run_name
+    run_dir.mkdir(parents=True, exist_ok=False)
+    device = torch.device(args.device)
+    tx = build_transforms()
+    source_train = RafDataSet(args.source_root, 'train', transform=tx['train'],
+                             strong_transform=tx['augment'], basic_aug=False)
+    target_train = FER(args.target_root, 'train',
+                       transform=tx['weak' if args.teacher_views == 'weak' else 'train'],
+                       strong_transform=tx['augment'], basic_aug=False)
+    target_test = FER(args.target_root, 'test', transform=tx['test'])
+    source_loader = make_loader(source_train, args, True, args.seed)
+    target_loader = make_loader(target_train, args, True, args.seed + 1)
+    val_loader = make_loader(target_test, args, False, args.seed + 2)
+    initial_path = args.source_checkpoint or args.checkpoint
+    metadata = {'args': vars(args), 'torch': str(torch.__version__), 'cuda': torch.version.cuda,
+                'evaluation_split': 'FER test (legacy target-validation protocol)',
+                'source_train': dataset_manifest(source_train, args.source_root),
+                'target_train': dataset_manifest(target_train, args.target_root),
+                'target_test': dataset_manifest(target_test, args.target_root)}
+    try:
+        metadata['git_commit'] = subprocess.check_output(
+            ['git', 'rev-parse', 'HEAD'], cwd=Path(__file__).parent, text=True).strip()
+        metadata['git_dirty'] = bool(subprocess.check_output(
+            ['git', 'status', '--porcelain'], cwd=Path(__file__).parent, text=True).strip())
+    except (OSError, subprocess.CalledProcessError):
+        metadata['git_commit'] = 'unavailable'
+    if initial_path:
+        metadata['initial_checkpoint_sha256'] = file_digest(initial_path)
+    (run_dir / 'config.json').write_text(json.dumps(metadata, indent=2))
+    print('Run directory:', run_dir, flush=True)
+    print('Configuration:', json.dumps(vars(args), sort_keys=True), flush=True)
+    print('Class order:', CLASS_NAMES)
+    print('Evaluation: FER test, matching the previous target-validation protocol.')
+
+    model = Networks.Model(backbone=args.backbone, num_classes=7,
+                           pretrained=not (args.no_pretrained or initial_path)).to(device)
+    if initial_path:
+        checkpoint = torch.load(initial_path, map_location=device)
         model.load_state_dict(checkpoint['model'], strict=True)
-
-    param = model.parameters()
-    optimizer = torch.optim.Adam(param, args.lr, weight_decay=1e-4)
-
+        print('Loaded weights:', initial_path)
+    optimizer = torch.optim.Adam(model.parameters(), args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
+    source_best_path = run_dir / 'source_best.pth'
+    source_best = -1.0
+    if not args.source_checkpoint:
+        for epoch in range(args.source_epochs):
+            model.train()
+            sums = np.zeros(3)
+            correct, total = 0, 0
+            for imgs, _, targets in source_loader:
+                imgs, targets = imgs.to(device), targets.to(device)
+                optimizer.zero_grad()
+                logits, affinity = model(imgs, targets, None, 'train', 'source',
+                                         compute_affinity=args.w2 > 0)
+                ce = torch.nn.functional.cross_entropy(logits, targets)
+                modulation = classifier_weight_loss(model.fc.weight)
+                loss = args.w1 * ce + args.w2 * affinity + args.w3 * modulation
+                if not torch.isfinite(loss):
+                    raise FloatingPointError('Non-finite source loss; training stopped before optimizer step.')
+                loss.backward()
+                optimizer.step()
+                sums += [ce.item(), affinity.item(), modulation.item()]
+                correct += logits.argmax(1).eq(targets).sum().item()
+                total += targets.numel()
+            metrics = evaluate_only(model, val_loader, device)
+            print('[Source %d] train_acc=%.4f CE=%.3f affinity=%.3f val_acc=%.4f loss=%.3f LR=%.6f' %
+                  (epoch, correct / total, sums[0] / len(source_loader), sums[1] / len(source_loader),
+                   metrics['accuracy'], metrics['loss'], optimizer.param_groups[0]['lr']), flush=True)
+            scheduler.step()
+            record_metrics(run_dir, {'stage': 'source', 'epoch': epoch, **metrics})
+            if metrics['accuracy'] > source_best:
+                source_best = metrics['accuracy']
+                save_checkpoint(source_best_path, model, optimizer, scheduler, args, epoch, metrics, 'source')
+        checkpoint = torch.load(source_best_path, map_location=device)
+        model.load_state_dict(checkpoint['model'])
 
-    model = model.cuda()
-    criterion = torch.nn.CrossEntropyLoss(reduce = False)
-    
-    ####training the model on the source dataset
-    best_acc = 0.
-    for i in range(0, pre_epochs):
-        train_loss1, train_loss2, train_loss3 = 0.0, 0.0, 0.0
-        count = 0
-        model.train()
-        bingo_cnt = 0.
-        for batch_i, (imgs, _, targets) in enumerate(train_loader_source):
-            imgs = imgs.cuda()
-            targets = targets.cuda()
-            output = model(imgs, targets, None, 'train', 'source')
-            cls_loss = torch.mean(criterion(output[0], targets))               
-            ###classifiers modulation
-            fc_weight = model.fc.weight
-            fc_weight_norm = torch.norm(fc_weight, dim = 1).unsqueeze(1)
-            fc_weight_ = fc_weight.mm(torch.transpose(fc_weight, 1, 0))
-            fc_weight_norm_ = fc_weight_norm.mm(torch.transpose(fc_weight_norm, 1, 0))
-            weight_loss = torch.mean(((fc_weight_ / fc_weight_norm_ -  torch.eye(fc_weight.shape[0]).cuda()) + 1) / 2)
+    # Independent optimizer/scheduler: the source best epoch no longer silently sets target LR.
+    optimizer = torch.optim.Adam(model.parameters(), args.target_lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
+    teacher = copy.deepcopy(model).eval()
+    teacher.requires_grad_(False)
+    baseline = evaluate_only(model, val_loader, device)
+    if args.source_checkpoint:
+        save_checkpoint(source_best_path, model, optimizer, scheduler, args, -1, baseline, 'source')
+    print('Source initialization target accuracy: %.4f' % baseline['accuracy'], flush=True)
+    # Keep the source baseline as a candidate, even if all adaptation epochs regress.
+    best = {'student': baseline['accuracy'], 'ema': baseline['accuracy'], 'overall': baseline['accuracy']}
+    for name in ['target_student_best.pth', 'target_ema_best.pth', 'best.pth']:
+        save_checkpoint(run_dir / name, model, optimizer, scheduler, args, -1, baseline,
+                        'source', teacher=teacher, student=model)
+    record_metrics(run_dir, {'stage': 'initial', 'epoch': -1, **baseline})
 
-            aff_loss = output[1]
-            loss = cls_loss * args.w1 + aff_loss * args.w2 + weight_loss * args.w3    
-            train_loss2 += aff_loss
-
-            loss.backward()
-            optimizer.step()
-
-            _, predicts = torch.max(output[0], 1)
-            correct_or_not = torch.eq(predicts, targets)
-            bingo_cnt += correct_or_not.sum().cpu().numpy()
-            train_loss1 += cls_loss
-            train_loss3 += weight_loss
-            optimizer.zero_grad()
-            count += 1
-
-        train_acc = bingo_cnt / (count * train_batch)
-        train_acc = np.around(train_acc, 4)
-        train_loss1 = train_loss1 / count
-        train_loss2 = train_loss2 / count
-        train_loss3 = train_loss3 / count
-        
-        print('[Epoch %d] Training accuracy: %.4f.   Classification Loss: %.3f   Affinity Loss: %.3f  Weight Loss: %.3f  LR: %.6f' %
-                  (i, train_acc, train_loss1, train_loss2, train_loss3, optimizer.param_groups[0]["lr"]))
-        scheduler.step()
-
-        best_acc = test(model, optimizer, val_loader_target, criterion, target_val_num, best_acc, model_path, i, args)
-
-    # ============================================================
-    # Source training finished: reload the BEST source checkpoint
-    # ============================================================
-    source_best_acc = best_acc
-    source_checkpoint_path = os.path.join(
-        model_path,
-        args.backbone
-        + '_'
-        + args.data1
-        + '_'
-        + args.data2
-        + '_'
-        + str(source_best_acc)
-        + '.pth'
-    )
-
-    print(
-        "Loading best source checkpoint:",
-        source_checkpoint_path
-    )
-
-    checkpoint = torch.load(source_checkpoint_path)
-    model.load_state_dict(checkpoint['model'])
-
-    print(
-        "Best source checkpoint loaded, acc:",
-        source_best_acc
-    )
-
-    # ============================================================
-    # Create EMA Teacher from the BEST source model
-    # ============================================================
-    teacher = copy.deepcopy(
-        model
-    ).cuda()
-
-    teacher.eval()
-
-    for param in teacher.parameters():
-        param.requires_grad = False
-
-    # ============================================================
-    # Restore optimizer corresponding to best source checkpoint
-    # ============================================================
-    optimizer.load_state_dict(
-        checkpoint['optimizer']
-    )
-
-    # ============================================================
-    # Keep a permanent copy of source checkpoint
-    # ============================================================
-    source_fixed_path = os.path.join(
-        model_path,
-        args.backbone
-        + '_'
-        + args.data1
-        + '_'
-        + args.data2
-        + '_source_best.pth'
-    )
-
-    torch.save(
-        checkpoint,
-        source_fixed_path
-    )
-
-    print(
-        "Source checkpoint saved:",
-        source_fixed_path
-    )
-
-    # ============================================================
-    # Target adaptation uses its OWN best accuracy
-    # ============================================================
-    best_acc = 0.0
-
-    # Initialize source iterator before target adaptation.
-    source_train_iter = iter(train_loader_source)
-
-    for i in range(0, args.epochs):
-
-        # ============================================================
-        # Target-only DDRL weight schedule
-        # ============================================================
-        if i < 5:
-            current_w2 = 0.0
-        elif i < 10:
-            current_w2 = 0.01
-        else:
-            current_w2 = args.target_w2
-
-        print(
-            "[Epoch %d] Current target w2: %.4f"
-            % (i, current_w2)
-        )
-
-        train_loss1, train_loss2 = 0, 0
-        count = 0
-        confident_num = 0
-
-
-
-        # E3: two-view consistency statistics
-        agreement_num = 0
-        agreement_total = 0
-
-        # Diagnostic only
-        pseudo_correct = 0
-        pseudo_total = 0
-
-        pseudo_class_correct = np.zeros(
-            class_num,
-            dtype=np.int64
-        )
-
-        pseudo_class_total = np.zeros(
-            class_num,
-            dtype=np.int64
-        )
-
-        # NEW: confidence-weight statistics
-        pseudo_weight_sum = 0.0
-        pseudo_weight_num = 0
-
-        for batch_i, (
-                imgs_w1,
-                imgs_w2,
-                imgs_aug,
-                gt_target
-        ) in enumerate(train_loader_target):
+    # Reset target-stage randomness so training/reusing identical source weights is comparable.
+    seed_everything(args.seed + 100)
+    source_loader.generator.manual_seed(args.seed + 100)
+    target_loader.generator.manual_seed(args.seed + 101)
+    val_loader.generator.manual_seed(args.seed + 102)
+    source_iter = iter(source_loader)
+    for epoch in range(args.epochs):
+        current_w2 = target_affinity_weight(epoch, args.target_w2, args.affinity_warmup, args.affinity_ramp)
+        pseudo_scale = args.target_cls_weight * min(1.0, (epoch + 1) / max(args.pseudo_ramp, 1))
+        sums = np.zeros(4)
+        pseudo_counts = torch.zeros(7, dtype=torch.long)
+        pseudo_correct = torch.zeros(7, dtype=torch.long)
+        agreements, seen, weight_sum, selected_total = 0, 0, 0.0, 0
+        lr = optimizer.param_groups[0]['lr']
+        for w1, w2, strong, gt in target_loader:
             try:
-                source_imgs, _, source_targets = next(source_train_iter)
+                source_imgs, _, source_targets = next(source_iter)
             except StopIteration:
-                source_train_iter = iter(train_loader_source)
-                source_imgs, _, source_targets = next(source_train_iter)
-            model.eval()
-            ####forward the model get pseudo labels
+                source_iter = iter(source_loader)
+                source_imgs, _, source_targets = next(source_iter)
             teacher.eval()
-
             with torch.no_grad():
-
-                # ==================================================
-                # E3: EMA Teacher predicts two independent views
-                # ==================================================
-
-                out_w1, _ = teacher(
-                    imgs_w1.cuda(),
-                    None,
-                    None,
-                    'test',
-                    'target'
-                )
-
-                out_w2, _ = teacher(
-                    imgs_w2.cuda(),
-                    None,
-                    None,
-                    'test',
-                    'target'
-                )
-
-            targets, con_idx, threshold, label_dis = annotate_target(
-                out_w1,
-                class_num,
-                i,
-                args.epochs,
-                args.phi,
-            )
-            # ============================================================
-            # E3: Two-view EMA consistency
-            # ============================================================
-
-            with torch.no_grad():
-
-                pred_w1 = torch.argmax(
-                    out_w1,
-                    dim=1
-                ).cpu()
-
-                pred_w2 = torch.argmax(
-                    out_w2,
-                    dim=1
-                ).cpu()
-
-                # 1 = two Teacher predictions agree
-                agreement_mask = (
-                        pred_w1 == pred_w2
-                ).float()
-
-            # Statistics
-            agreement_num += int(
-                agreement_mask.sum().item()
-            )
-
-            agreement_total += int(
-                agreement_mask.numel()
-            )
-
-            # ============================================================
-            # Original CATM AND two-view agreement
-            # ============================================================
-
-            con_idx = (
-                    con_idx.float()
-                    * agreement_mask
-            )
-
-            with torch.no_grad():
-                prob = F.softmax(
-                    out_w1,
-                    dim=1
-                ).cpu()
-
-                pred_values, _ = torch.max(
-                    prob,
-                    dim=1
-                )
-
-            threshold_tensor = torch.from_numpy(
-                    np.asarray(threshold)
-                ).float()
-
-            sample_threshold = threshold_tensor[
-                targets
-            ]
-
-            pseudo_weight = (
-                        (pred_values - sample_threshold)
-                        / (1.0 - sample_threshold + 1e-6)
-                )
-
-            pseudo_weight = torch.clamp(
-                    pseudo_weight,
-                    min=0.0,
-                    max=1.0
-                )
-
-            pseudo_weight = (
-                        pseudo_weight
-                        * con_idx.float()
-                )
-
-            # ============================================================
-            # Reliable target samples for DDRL alignment
-            # Classification can use all con_idx samples,
-            # but feature alignment only uses high-reliability samples.
-            # ============================================================
-
-            align_idx = (
-                    con_idx.bool()
-                    & (pseudo_weight >= 0.75)
-            ).float()
-
-
-            # -----------------------------------------
-            # Accumulate pseudo-label confidence weights
-            # -----------------------------------------
-            selected_weight = pseudo_weight[
-                con_idx.bool()
-            ]
-
-            if selected_weight.numel() > 0:
-                pseudo_weight_sum += selected_weight.sum().item()
-                pseudo_weight_num += selected_weight.numel()
-            # -----------------------------------------
-            # Pseudo-label diagnostic
-            # gt_target is ONLY used for evaluation.
-            # Never use it in loss / threshold selection.
-            # -----------------------------------------
-            mask = con_idx.bool()
-
-            gt_cpu = gt_target.cpu().long()
-
-
-            if mask.any():
-                pseudo_correct += (
-                    targets[mask]
-                    == gt_cpu[mask]
-                ).sum().item()
-
-                pseudo_total += mask.sum().item()
-
-                for c in range(class_num):
-                    class_mask = (
-                        mask
-                        & (targets == c)
-                    )
-
-                    n_c = class_mask.sum().item()
-
-                    if n_c > 0:
-                        pseudo_class_total[c] += n_c
-
-                        pseudo_class_correct[c] += (
-                            targets[class_mask]
-                            == gt_cpu[class_mask]
-                        ).sum().item()
-
+                logits1, _ = teacher(w1.to(device), None, None, mode='test')
+                logits2, _ = teacher(w2.to(device), None, None, mode='test')
+                labels, mask, weights, thresholds, agreement = select_pseudo_labels(
+                    logits1, logits2, epoch, args.epochs, args.phi,
+                    args.threshold_min, args.threshold_max)
+            # Ground-truth target labels are used ONLY for the following diagnostics.
+            labels_cpu, mask_cpu = labels.cpu(), mask.cpu()
+            pseudo_counts += torch.bincount(labels_cpu[mask_cpu], minlength=7)
+            correct_mask = mask_cpu & labels_cpu.eq(gt)
+            pseudo_correct += torch.bincount(labels_cpu[correct_mask], minlength=7)
+            agreements += agreement.sum().item()
+            seen += mask.numel()
+            weight_sum += weights.sum().item()
+            selected_total += mask.sum().item()
 
             model.train()
-            source_con_idx = torch.ones(source_imgs.shape[0])
-            ###cmbine the source and target batch
-            train_imgs = torch.cat((source_imgs, imgs_aug), 0).cuda()
-            train_targets = torch.cat((source_targets, targets), 0).cuda()
-            train_con_idx = torch.cat(
-                (
-                    source_con_idx,
-                    align_idx
-                ),
-                0
-            ).cuda()
-
-            # Classification reliability weights:
-            # source samples always have weight 1
-            source_cls_weight = torch.ones(
-                source_imgs.shape[0]
-            )
-
-            train_cls_weight = torch.cat(
-                (
-                    source_cls_weight,
-                    pseudo_weight
-                ),
-                dim=0
-            ).cuda()
-
-            output = model(train_imgs, train_targets, train_con_idx, 'train', 'target')
-            ##classification _loss
-            per_sample_loss = criterion(
-                output[0],
-                train_targets
-            )
-
-            cls_loss = torch.mean(
-                per_sample_loss
-                * train_cls_weight
-            )
-
-            fc_weight = model.fc.weight
-            fc_weight_norm = torch.norm(fc_weight, dim = 1).unsqueeze(1)
-            fc_weight_ = fc_weight.mm(torch.transpose(fc_weight, 1, 0))
-            fc_weight_norm_ = fc_weight_norm.mm(torch.transpose(fc_weight_norm, 1, 0))
-            weight_loss = torch.mean(((fc_weight_ / fc_weight_norm_ -  torch.eye(fc_weight.shape[0]).cuda()) + 1) / 2)
-
-            aff_loss = output[1]
-
-            loss = (
-                    cls_loss * args.w1
-                    + aff_loss * current_w2
-                    + weight_loss * args.w3
-            )
-            train_loss2 += aff_loss
+            source_targets = source_targets.to(device)
+            n_source = source_targets.numel()
+            images = torch.cat([source_imgs.to(device), strong.to(device)])
+            targets = torch.cat([source_targets, labels])
+            align_mask = torch.cat([torch.ones(n_source, device=device, dtype=torch.bool),
+                                    mask & (weights >= 0.75)])
+            optimizer.zero_grad()
+            logits, affinity = model(images, targets, align_mask, 'train', 'target',
+                                     source_count=n_source, compute_affinity=current_w2 > 0)
+            source_ce, target_ce = classification_losses(logits, source_targets, labels, weights)
+            if args.target_loss_reduction == 'legacy':
+                ce_weights = torch.cat([torch.ones(n_source, device=device), weights])
+                ce = (torch.nn.functional.cross_entropy(logits, targets, reduction='none') * ce_weights).mean()
+            else:
+                ce = 0.5 * (source_ce + pseudo_scale * target_ce)
+            loss = args.w1 * ce + current_w2 * affinity + args.w3 * classifier_weight_loss(model.fc.weight)
+            if not torch.isfinite(loss):
+                raise FloatingPointError('Non-finite target loss; training stopped before optimizer step.')
             loss.backward()
             optimizer.step()
-
-            update_ema(
-                model,
-                teacher,
-                args.ema_decay
-            )
-
-            train_loss1 += cls_loss
-            optimizer.zero_grad()
-            confident_num += int(mask.sum().item())
-            count += 1
-
+            update_ema(model, teacher, args.ema_decay)
+            sums += [source_ce.item(), target_ce.item(), affinity.item(), ce.item()]
         scheduler.step()
+        stats = {'pseudo_accuracy': pseudo_correct.sum().item() / max(selected_total, 1),
+                 'pseudo_class_accuracy': (pseudo_correct.float() / pseudo_counts.clamp_min(1)).tolist(),
+                 'pseudo_class_counts': pseudo_counts.tolist(), 'selected': selected_total,
+                 'agreement': agreements / max(seen, 1), 'mean_pseudo_weight': weight_sum / max(selected_total, 1),
+                 'source_ce': sums[0] / len(target_loader), 'target_ce': sums[1] / len(target_loader),
+                 'affinity': sums[2] / len(target_loader), 'lr': lr,
+                 'target_w2': current_w2, 'target_cls_scale': pseudo_scale}
+        print('[Target %d] selected=%d pseudo_acc=%.4f agreement=%.4f source_CE=%.3f target_CE=%.3f w2=%.4f LR=%.6f' %
+              (epoch, selected_total, stats['pseudo_accuracy'], stats['agreement'], stats['source_ce'],
+               stats['target_ce'], current_w2, lr), flush=True)
+        print('Pseudo class counts:', stats['pseudo_class_counts'])
+        for kind, candidate in [('student', model), ('ema', teacher)]:
+            metrics = evaluate_only(candidate, val_loader, device)
+            print('[Target %d] %s accuracy=%.4f loss=%.3f recall=%s' %
+                  (epoch, kind, metrics['accuracy'], metrics['loss'],
+                   [round(x, 4) for x in metrics['class_recall']]), flush=True)
+            record_metrics(run_dir, {'stage': 'target', 'epoch': epoch, 'model_kind': kind,
+                                     **stats, **metrics})
+            if metrics['accuracy'] > best[kind]:
+                best[kind] = metrics['accuracy']
+                save_checkpoint(run_dir / ('target_%s_best.pth' % kind), candidate, optimizer, scheduler,
+                                args, epoch, metrics, kind, teacher=teacher, student=model)
+            if metrics['accuracy'] > best['overall']:
+                best['overall'] = metrics['accuracy']
+                save_checkpoint(run_dir / 'best.pth', candidate, optimizer, scheduler,
+                                args, epoch, metrics, kind, teacher=teacher, student=model)
+    (run_dir / 'summary.json').write_text(json.dumps(best, indent=2))
+    print('Best student: %.4f | Best EMA: %.4f | best_acc %.4f' %
+          (best['student'], best['ema'], best['overall']), flush=True)
+    print('Best checkpoint:', run_dir / 'best.pth', flush=True)
+    return best
 
 
-        train_loss1 = train_loss1 / count
-        train_loss2 = train_loss2 / count
-
-        mean_pseudo_weight = (
-                pseudo_weight_sum
-                / max(pseudo_weight_num, 1)
-        )
-
-        print(
-            "[Epoch %d] Mean pseudo weight: %.4f"
-            % (
-                i,
-                mean_pseudo_weight
-            )
-        )
-        agreement_rate = (
-                agreement_num
-                / max(agreement_total, 1)
-        )
-
-        print(
-            "[Epoch %d] Two-view Agreement: %.4f (%d/%d)"
-            % (
-                i,
-                agreement_rate,
-                agreement_num,
-                agreement_total
-            )
-        )
-
-
-        pseudo_acc = (
-            pseudo_correct
-            / max(pseudo_total, 1)
-        )
-
-        pseudo_class_acc = []
-
-        for c in range(class_num):
-            if pseudo_class_total[c] > 0:
-                acc_c = (
-                    pseudo_class_correct[c]
-                    / pseudo_class_total[c]
-                )
-            else:
-                acc_c = 0.0
-
-            pseudo_class_acc.append(
-                round(acc_c, 4)
-            )
-
-        print(
-            "[Epoch %d] Pseudo Acc: %.4f | "
-            "Pseudo class acc: %s | "
-            "Pseudo class num: %s"
-            % (
-                i,
-                pseudo_acc,
-                pseudo_class_acc,
-                pseudo_class_total.tolist()
-            )
-        )
-
-        print('[Epoch %d]  Confident_Num: %d    Classification Loss: %.3f   Affinity Loss: %.3f   LR: %.6f' %
-                  (i, confident_num, train_loss1, train_loss2, optimizer.param_groups[0]["lr"]))
-        best_acc = test(model, optimizer, val_loader_target, criterion, target_val_num, best_acc, model_path, i, args)
-    print("best_acc %s " % str(best_acc))
-    
-def evaluate_only(
-        model,
-        val_loader_target,
-        criterion,
-        num
-):
-
-    with torch.no_grad():
-
-        val_loss = 0.0
-        iter_cnt = 0
-        bingo_cnt = 0
-
-        model.eval()
-
-        for batch_i, (
-                imgs,
-                targets
-        ) in enumerate(
-            val_loader_target
-        ):
-
-            imgs = imgs.cuda()
-            targets = targets.cuda()
-
-            out, _ = model(
-                imgs,
-                targets,
-                None,
-                mode='test'
-            )
-
-            loss = torch.mean(
-                criterion(
-                    out,
-                    targets
-                )
-            )
-
-            val_loss += loss.item()
-            iter_cnt += 1
-
-            _, predicts = torch.max(
-                out,
-                1
-            )
-
-            bingo_cnt += torch.eq(
-                predicts,
-                targets
-            ).sum().item()
-
-        val_acc = (
-            float(bingo_cnt)
-            / float(num)
-        )
-
-        val_loss = (
-            val_loss
-            / max(iter_cnt, 1)
-        )
-
-    return val_acc, val_loss
-
-def test(model, optimizer, val_loader_target, criterion, num, best_acc, path, epoch, args):
-
-    with torch.no_grad():
-        val_loss = 0.0
-        iter_cnt = 0
-        bingo_cnt = 0
-        preds, labels = [], []
-        model.eval()
-        for batch_i, (imgs, targets) in enumerate(val_loader_target):
-            out, _ = model(imgs.cuda(), targets, None, mode = 'test')
-            targets = targets.cuda()
-            loss = torch.mean(criterion(out, targets))
-            val_loss += loss
-            iter_cnt += 1
-            _, predicts = torch.max(out, 1)
-            correct_or_not = torch.eq(predicts, targets)
-            bingo_cnt += correct_or_not.sum().cpu()
-            preds.append(predicts.cpu())
-            labels.append(targets.cpu())
-
-        val_loss = val_loss / iter_cnt
-        val_acc = bingo_cnt.float() / float(num)
-        val_acc = np.around(val_acc.numpy(), 4)
-        print("[Epoch %d] Target Validation accuracy:%.4f.  Loss:%.3f" % (epoch, val_acc, val_loss))
-        class_acc, _ = util.make_confucion_matrix(preds, labels)
-        pred = torch.cat(preds, dim=0)
-        labelss = torch.cat(labels, dim=0)
-        mean_acc = val_acc #np.mean(class_acc)
-        
-        if mean_acc > best_acc:
-            try:
-                os.remove(os.path.join(path, args.backbone + '_' + args.data1 + '_' + args.data2 + '_' + str(best_acc) + ".pth"))
-            except:
-                pass
-            best_acc = mean_acc
-            save_data = {'model': model.state_dict(),
-                         'optimizer': optimizer.state_dict()}
-            torch.save(save_data,
-                       os.path.join(path, args.backbone + '_' + args.data1 + '_' + args.data2 + '_' + str(best_acc) + ".pth"))
-                       
-            print("best_acc %s " % str(best_acc))
-
-    return best_acc
-
-
-
-    
-
-if __name__ == "__main__":
-    class RecorderMeter():
-        pass
-
-    acc = run_training()
+if __name__ == '__main__':
+    run_training()

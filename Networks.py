@@ -9,23 +9,32 @@ import itertools
 from sklearn.neighbors import KernelDensity
 
 def cal_weight(x):
-    w = 1 / x
-    w = np.exp(w) / np.sum(np.exp(w))
-    return np.array(w)
+    # Absent classes must not receive exp(1 / 1e-6), which overflows
+    # and suppresses every present class.
+    x = np.asarray(x, dtype=np.float64)
+    valid = np.isfinite(x) & (np.abs(x) > 1e-12)
+    weights = np.zeros_like(x)
+    if valid.any():
+        scores = 1.0 / x[valid]
+        scores -= scores.max()
+        weights[valid] = np.exp(scores) / np.exp(scores).sum()
+    return weights
 
 def mmd_loss(source_features, target_features):
     num_samples = min(source_features.size(0), target_features.size(0))
-    matched_source = source_features[torch.randperm(source_features.size(0))[:num_samples]]
+    if num_samples == 0:
+        return (source_features.sum() + target_features.sum()) * 0.0
+    matched_source = source_features[torch.randperm(source_features.size(0), device=source_features.device)[:num_samples]]
     loss = 0.
     for _ in range(6):
-        matched_target = target_features[torch.randperm(target_features.size(0))[:num_samples]]
-        
+        matched_target = target_features[torch.randperm(target_features.size(0), device=target_features.device)[:num_samples]]
+
         kernels = compute_kernel_matrix(matched_source, matched_target)
         XX = kernels[:num_samples, :num_samples]
         YY = kernels[num_samples:, num_samples:]
         XY = kernels[:num_samples, num_samples:]
         YX = kernels[num_samples:, :num_samples]
-        loss += torch.mean(XX + YY - XY -YX)    
+        loss += torch.mean(XX + YY - XY -YX)
     return loss / 6
 
 def compute_kernel_matrix(source, target, kernel_mul=2.0, kernel_num=5):
@@ -36,6 +45,7 @@ def compute_kernel_matrix(source, target, kernel_mul=2.0, kernel_num=5):
     L2_distance = ((total0-total1)**2).sum(2)
     # bandwidth=5
     bandwidth = torch.sum(L2_distance.data) / (n_samples**2-n_samples) ##bandwidth=0.5
+    bandwidth = bandwidth.clamp_min(torch.finfo(total.dtype).eps)
     bandwidth /= (kernel_mul ** (kernel_num // 2))
     bandwidth_list = [bandwidth * (kernel_mul**i) for i in range(kernel_num)]
     kernel_val = [torch.exp(-L2_distance / bandwidth_temp) for bandwidth_temp in bandwidth_list]
@@ -43,16 +53,8 @@ def compute_kernel_matrix(source, target, kernel_mul=2.0, kernel_num=5):
     return sum(kernel_val)#/len(kernel_val)
 
 def remove_element(matrix, index):
-    dim = matrix[0].shape[-1]
-    matrix1 = matrix[:index]
-    matrix2 = matrix[index+1:]
-    data = []
-    for item in matrix1:
-        data.extend(item)
-    for item in matrix2:
-        data.extend(item)
-    result = torch.cat(data, 0).reshape(-1, dim)
-    return result
+    remaining = [part for i, part in enumerate(matrix) if i != index and part.shape[0]]
+    return torch.cat(remaining, dim=0) if remaining else matrix[index].new_empty((0, matrix[index].shape[1]))
 
 
 class Model(nn.Module):
@@ -78,36 +80,41 @@ class Model(nn.Module):
         else:
             raise ValueError('Backbone Error!')
 
-    def forward(self, x, targets, idx, mode = 'train', task = 'target', epoch=0):
+    def forward(self, x, targets, idx, mode='train', task='target', epoch=0,
+                source_count=None, compute_affinity=True):
         fea = self.feature(x)
         out = self.bn(self.fc(fea))
         batch = fea.shape[0]
         if mode == 'train':
+              if not compute_affinity:
+                    return [out, fea.new_zeros(())]
               if task == 'source':
                     features = self.split_feature_makeLD(fea, targets)
                     weight = self.volume(features)
-                    w = torch.from_numpy(np.array(weight)).cuda()            
-                    inter_loss = torch.tensor(0.).cuda()            
-                    for i in range(7):
+                    w = fea.new_tensor(weight)
+                    inter_loss = fea.new_zeros(())
+                    for i in range(self.num_classes):
                         fea = features[i]
                         if len(fea) != 0:
-                            fea_= remove_element(features, i).cuda()
+                            fea_= remove_element(features, i)
                             inter_loss += mmd_loss(fea, fea_) * w[i]
                     affinity_loss = -1 * inter_loss
-                    return [out, affinity_loss] 
+                    return [out, affinity_loss]
 
               if task == 'target':  ####calculate affinity loss for all source and confident target samples.
-                    idx = (idx == 1).nonzero().squeeze()
-                    fea = torch.index_select(fea, 0, idx)
-                    targets = torch.index_select(targets, 0, idx)
-
-                    source_features = self.split_feature_makeLD(fea[:batch//2], targets[:batch//2])
-                    target_features = self.split_feature_makeLD(fea[batch//2:], targets[batch//2:])
-                    features = self.split_feature_makeLD(fea, targets)
+                    # Split domains BEFORE filtering: unequal source/target batches
+                    # and sparse masks must not move target samples into source.
+                    n_source = batch // 2 if source_count is None else source_count
+                    mask = idx.bool()
+                    source_features = self.split_feature_makeLD(
+                        fea[:n_source][mask[:n_source]], targets[:n_source][mask[:n_source]])
+                    target_features = self.split_feature_makeLD(
+                        fea[n_source:][mask[n_source:]], targets[n_source:][mask[n_source:]])
+                    features = self.split_feature_makeLD(fea[mask], targets[mask])
                     weight = self.volume(features)
-                    w = torch.from_numpy(np.array(weight)).cuda()       
-                    intra_loss, inter_loss = torch.tensor(0.).cuda(), torch.tensor(0.).cuda()             
-                    for i in range(7):
+                    w = fea.new_tensor(weight)
+                    intra_loss, inter_loss = fea.new_zeros(()), fea.new_zeros(())
+                    for i in range(self.num_classes):
                         fea_s = source_features[i]
                         fea_t = target_features[i]
                         if len(fea_s) != 0 and len(fea_t) != 0:
@@ -115,16 +122,16 @@ class Model(nn.Module):
 
                         fea = features[i]
                         if len(fea) != 0:
-                            fea_= remove_element(features, i).cuda()
+                            fea_= remove_element(features, i)
                             inter_loss += mmd_loss(fea, fea_) * w[i]
 
                     affinity_loss = intra_loss - inter_loss
-                    return [out, affinity_loss]              
+                    return [out, affinity_loss]
 
         else:
           return out, fea.cpu()
 
-        
+
     def split_feature_makeLD(self, x, target):
         x_parts = []
         inds = []
@@ -142,7 +149,7 @@ class Model(nn.Module):
                 self.kde.fit(f)
                 v = np.sum(1/(self.kde.score_samples(f)))
             else:
-                v = 0.000001
+                v = 0.0
             volume[idx] = v
         weight = cal_weight(volume)
         return weight

@@ -31,10 +31,9 @@ class RafDataSet(data.Dataset):
         self.label = dataset.iloc[:,
                      LABEL_COLUMN].values - 1  # 0:Surprise, 1:Fear, 2:Disgust, 3:Happiness, 4:Sadness, 5:Anger, 6:Neutral
         ###shuffle dataset
-        seed = np.random.seed(2000)
-        np.random.shuffle(file_names)
-        seed = np.random.seed(2000)
-        np.random.shuffle(self.label)
+        order = np.random.RandomState(2000).permutation(len(file_names))
+        file_names = file_names[order]
+        self.label = self.label[order]
                 
         self.file_paths = []
         # use raf-db aligned images for training/testing
@@ -64,21 +63,21 @@ class RafDataSet(data.Dataset):
     def __getitem__(self, idx):
         path = self.file_paths[idx]
         image = cv2.imread(path)
-        img = image[:, :, ::-1]  # BGR to RGB
+        if image is None:
+            raise FileNotFoundError("Failed to read image: %s" % path)
+        img = image[:, :, ::-1].copy()  # BGR to RGB
         label = self.label[idx]
         if self.phase == 'train':
             if self.basic_aug and random.uniform(0, 1) > 0.5:
                 index = random.randint(0, 2)
                 img = self.aug_func[index](img)
 
-        if self.transform is not None:
-            img = self.transform(img)
-            
+        # Each view must start from raw RGB, never a normalized tensor.
+        img_w = self.transform(img.copy()) if self.transform is not None else img
         if self.strong_transform is not None:
-            img_aug = self.strong_transform(img)
-            return img, img_aug, label
-        else:
-            return img, label
+            img_aug = self.strong_transform(img.copy())
+            return img_w, img_aug, label
+        return img_w, label
 
 
 class FER(data.Dataset):
@@ -92,18 +91,17 @@ class FER(data.Dataset):
         self.file_paths, self.label = [], []
 
         if self.phase == 'train':
-            files = glob.glob(
+            files = sorted(glob.glob(
                 os.path.join(
                     path,
                     'train',
                     '*',
                     '*.jpg'
                 )
-            )
-            seed = np.random.seed(2000)
-            np.random.shuffle(files)
+            ))
+            np.random.RandomState(2000).shuffle(files)
         else:
-            files = glob.glob(os.path.join(path, 'test/*/*.jpg'))
+            files = sorted(glob.glob(os.path.join(path, 'test/*/*.jpg')))
             print("FER test images:", len(files))
 
         print("FER %s path: %s" % (
@@ -178,7 +176,7 @@ class FER(data.Dataset):
             )
 
         # BGR -> RGB
-        image = image[:, :, ::-1]
+        image = image[:, :, ::-1].copy()
 
         label = self.label[idx]
 
@@ -196,13 +194,13 @@ class FER(data.Dataset):
         if self.transform is not None:
 
             # View 1
-            img_w1 = self.transform(image)
+            img_w1 = self.transform(image.copy())
 
             # View 2
             # Calling the same random transform again gives
             # another independent augmentation of the same image.
-            if self.phase == 'train':
-                img_w2 = self.transform(image)
+            if self.phase == 'train' and self.strong_transform is not None:
+                img_w2 = self.transform(image.copy())
             else:
                 img_w2 = None
 
@@ -216,7 +214,7 @@ class FER(data.Dataset):
         # ==================================================
         if self.strong_transform is not None:
 
-            img_aug = self.strong_transform(image)
+            img_aug = self.strong_transform(image.copy())
 
             return (
                 img_w1,
@@ -251,4 +249,3 @@ if __name__ == '__main__':
 
     print('train distribution:', train_dataset.label_dis)
     print('test distribution:', test_dataset.label_dis)
-

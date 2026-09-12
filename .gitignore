@@ -10,3 +10,7 @@ __pycache__/
 data/
 hello.py
 test.py
+.pytest_cache/
+models/
+logs/
+pytest-of-root/
