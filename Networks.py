@@ -34,9 +34,10 @@ def compute_kernel_matrix(source, target, kernel_mul=2.0, kernel_num=5):
     total = torch.cat([source, target], dim=0)
     n_samples = int(total.size(0))
 
-    total0 = total.unsqueeze(0).expand(n_samples, n_samples, total.size(1))
-    total1 = total.unsqueeze(1).expand(n_samples, n_samples, total.size(1))
-    l2_distance = ((total0 - total1) ** 2).sum(2)
+    # The Gram identity avoids an N x N x feature_dim temporary allocation.
+    squared_norm = total.square().sum(dim=1, keepdim=True)
+    l2_distance = (squared_norm + squared_norm.t() - 2.0 * total.mm(total.t())).clamp_min(0.0)
+    l2_distance = l2_distance - torch.diag_embed(l2_distance.diagonal())
 
     denominator = max(n_samples * n_samples - n_samples, 1)
     bandwidth = l2_distance.detach().sum() / float(denominator)

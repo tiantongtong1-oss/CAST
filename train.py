@@ -1,5 +1,6 @@
 import argparse
 import copy
+import json
 import os
 import random
 import warnings
@@ -42,6 +43,20 @@ class IndexedTargetDataset(Dataset):
         return weak1, weak2, strong, label, idx
 
 
+class TargetScanDataset(Dataset):
+    """Use a deterministic original/flip pair for epoch-level pseudo labels."""
+
+    def __init__(self, base):
+        self.base = base
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, idx):
+        image, label = self.base[idx]
+        return image, torch.flip(image, dims=[-1]), image, label, idx
+
+
 def seed_worker(worker_id):
     worker_seed = torch.initial_seed() % (2 ** 32)
     np.random.seed(worker_seed)
@@ -63,7 +78,7 @@ def make_loader(dataset, batch_size, workers, shuffle, drop_last, seed_offset):
     )
 
 
-def make_transforms():
+def make_transforms(augmentation="face"):
     normalize = transforms.Normalize(
         mean=[0.485, 0.456, 0.406],
         std=[0.229, 0.224, 0.225],
@@ -106,6 +121,29 @@ def make_transforms():
         transforms.ToTensor(),
         normalize,
     ])
+    if augmentation == "face":
+        # FER2013 faces are only 48 x 48. Preserve the eyes/mouth and avoid
+        # stacking severe crops, solarization, rotation and large erasing.
+        source = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Resize((224, 224)),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomCrop(224, padding=12, padding_mode="reflect"),
+            transforms.RandomRotation(10),
+            transforms.RandomGrayscale(p=0.2),
+            transforms.ToTensor(), normalize,
+            transforms.RandomErasing(p=0.25, scale=(0.02, 0.10)),
+        ])
+        strong = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Resize((224, 224)),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomCrop(224, padding=12, padding_mode="reflect"),
+            transforms.RandomRotation(10),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2),
+            transforms.ToTensor(), normalize,
+            transforms.RandomErasing(p=0.25, scale=(0.02, 0.10)),
+        ])
     return {"source": source, "weak": weak, "strong": strong, "test": test}
 
 
@@ -116,10 +154,25 @@ def classifier_weight_loss(model):
 
 
 def freeze_backbone_bn_stats(model):
-    """Keep the target-recalibrated ResNet BN running statistics fixed."""
-    for module in model.feature.modules():
+    """Freeze all BN statistics, including the seven-logit classification head.
+
+    BN affine parameters still receive gradients. Mixed source/strong-target
+    batches must not change the statistics used by the weak-view EMA teacher.
+    """
+    for module in model.modules():
         if isinstance(module, nn.modules.batchnorm._BatchNorm):
             module.eval()
+
+
+def optimizer_groups(model, head_lr, backbone_multiplier):
+    """Fine-tune pretrained convolutions more slowly than the new projection."""
+    projection = [p for layer in model.feature.children()
+                  if isinstance(layer, nn.Linear) for p in layer.parameters()]
+    projection_ids = {id(p) for p in projection}
+    backbone = [p for p in model.feature.parameters() if id(p) not in projection_ids]
+    head = projection + list(model.fc.parameters()) + list(model.bn.parameters())
+    return [{"params": backbone, "lr": head_lr * backbone_multiplier},
+            {"params": head, "lr": head_lr}]
 
 
 @torch.no_grad()
@@ -165,7 +218,7 @@ def save_checkpoint(model, optimizer, path, epoch, accuracy, kind):
 
 @torch.no_grad()
 def adapt_backbone_bn(model, target_loader, max_batches, momentum):
-    """Unsupervised target-domain BN recalibration for the pretrained backbone."""
+    """Recalibrate backbone, then head, using only clean target-train images."""
     if max_batches <= 0:
         return
 
@@ -189,7 +242,24 @@ def adapt_backbone_bn(model, target_loader, max_batches, momentum):
     for module, old in zip(bn_layers, old_momentum):
         module.momentum = old
     model.eval()
-    print("Target BN recalibration batches:", used)
+
+    # Calibrate the head with the *final* backbone statistics and no dropout.
+    # Otherwise a calibrated backbone feeds a head normalized for source data.
+    old_head_momentum = model.bn.momentum
+    model.bn.momentum = momentum
+    model.bn.train()
+    head_used = 0
+    for weak1, _, _, _, _ in target_loader:
+        if weak1.shape[0] < 2:
+            continue
+        features = model.feature(weak1.cuda(non_blocking=True))
+        model.bn(model.fc(features))
+        head_used += 1
+        if head_used >= max_batches:
+            break
+    model.bn.momentum = old_head_momentum
+    model.eval()
+    print("Target BN recalibration batches: backbone=%d head=%d" % (used, head_used))
 
 
 @torch.no_grad()
@@ -226,11 +296,12 @@ def tempered_probability(logits, temperature):
 
 
 @torch.no_grad()
-def estimate_target_thresholds(teacher, anchor, loader, args, epoch):
+def estimate_target_thresholds(teacher, anchor, loader, args, epoch, previous=None):
     teacher.eval()
     anchor.eval()
     class_all = [[] for _ in range(7)]
     class_anchor = [[] for _ in range(7)]
+    class_stable = [[] for _ in range(7)]
     predicted = torch.zeros(7, dtype=torch.long)
     total = 0
     weak_agree = 0
@@ -265,6 +336,9 @@ def estimate_target_thresholds(teacher, anchor, loader, args, epoch):
             all_values = confidence[target == c]
             if all_values.numel():
                 class_all[c].append(all_values)
+            consistent_values = stable_conf[(target == c) & agreement]
+            if consistent_values.numel():
+                class_stable[c].append(consistent_values)
             stable_values = stable_conf[(target == c) & agreement & anchor_match]
             if stable_values.numel():
                 class_anchor[c].append(stable_values)
@@ -290,6 +364,18 @@ def estimate_target_thresholds(teacher, anchor, loader, args, epoch):
             if stable_values.numel() >= 8:
                 q_threshold = float(torch.quantile(stable_values, quantile).item())
                 threshold = 0.80 * cast_threshold + 0.20 * q_threshold
+        if args.threshold_mode == "quantile":
+            # Estimate the same min-view confidence used by the selector.
+            # No epochs/(epochs-epoch) factor: it saturates all classes late
+            # in training, defeating class adaptation and starving hard classes.
+            if class_stable[c]:
+                stable_values = torch.cat(class_stable[c])
+                threshold = float(torch.quantile(stable_values, quantile).item())
+            else:
+                threshold = args.pseudo_max_threshold
+            if previous is not None:
+                threshold = (args.threshold_momentum * float(previous[c])
+                             + (1.0 - args.threshold_momentum) * threshold)
         thresholds[c] = float(np.clip(
             threshold, args.pseudo_min_threshold, args.pseudo_max_threshold
         ))
@@ -329,6 +415,8 @@ def build_epoch_pseudo_bank(
     anchor_prob_all = torch.zeros((n_samples, 7), dtype=torch.float32)
     proto_sim_all = torch.zeros((n_samples, 7), dtype=torch.float32)
     teacher_rank_all = torch.full((n_samples, 7), 7, dtype=torch.long)
+    proto_pred_all = torch.full((n_samples,), -1, dtype=torch.long)
+    proto_margin_all = torch.zeros(n_samples, dtype=torch.float32)
 
     strict_anchor = epoch < args.anchor_guard_epochs
 
@@ -390,7 +478,8 @@ def build_epoch_pseudo_bank(
         )
 
         avg_cpu = avg.cpu()
-        rank = (avg_cpu.unsqueeze(1) < avg_cpu.unsqueeze(2)).sum(dim=2) + 1
+        # rank[c] = 1 + count(P(other) > P(c)); highest probability is rank 1.
+        rank = (avg_cpu.unsqueeze(1) > avg_cpu.unsqueeze(2)).sum(dim=2) + 1
 
         top1_label[idx] = target.cpu()
         trusted[idx] = trusted_batch
@@ -400,6 +489,8 @@ def build_epoch_pseudo_bank(
         anchor_prob_all[idx] = anchor_prob.cpu()
         proto_sim_all[idx] = ((similarity.cpu() + 1.0) * 0.5).clamp(0.0, 1.0)
         teacher_rank_all[idx] = rank.long()
+        proto_pred_all[idx] = proto_pred
+        proto_margin_all[idx] = proto_margin
 
     trusted_counts = torch.zeros(7, dtype=torch.long)
     for c in range(7):
@@ -429,8 +520,21 @@ def build_epoch_pseudo_bank(
     for c in range(7):
         if not bool(recovery_needed[c]):
             continue
+        # Absolute cosine similarity alone is insufficient: unrelated classes
+        # can all have large similarities. Require relative semantic evidence.
+        anchor_supports = (
+            anchor_prob_all.argmax(dim=1).eq(c)
+            & (anchor_prob_all[:, c] >= args.anchor_min_confidence)
+        )
+        prototype_supports = (
+            proto_pred_all.eq(c) & (proto_margin_all >= args.prototype_min_margin)
+        )
+        semantic_support = anchor_supports | prototype_supports
+        # Overriding teacher top-1 needs BOTH source classifier/prototype votes.
+        semantic_support &= top1_label.eq(c) | (anchor_supports & prototype_supports)
         valid = (
             (~trusted)
+            & semantic_support
             & (stable_prob_all[:, c] >= args.recovery_teacher_min_prob)
             & (proto_sim_all[:, c] >= args.recovery_proto_min_similarity)
             & (teacher_rank_all[:, c] <= args.recovery_teacher_topk)
@@ -521,7 +625,9 @@ def build_epoch_pseudo_bank(
         proposed_score[selected] * class_weight[proposed_label[selected]]
     )
     epoch_weight.clamp_(0.0, 1.5)
-    epoch_align = selected & (epoch_weight >= args.align_min_weight)
+    # Recovery labels may train the classifier cautiously, but must not pull
+    # the source/target feature distributions together until independently trusted.
+    epoch_align = selected & trusted & (epoch_weight >= args.align_min_weight)
 
     align_counts = torch.zeros(7, dtype=torch.long)
     for c in range(7):
@@ -561,13 +667,16 @@ def parse_args():
     parser.add_argument("-c", "--checkpoint", default=None)
     parser.add_argument("--source_root", default="/workspace/ttt/code/test-upload-clean/datesets/raf-basic")
     parser.add_argument("--target_root", default="/workspace/ttt/code/data/fer2013")
-    parser.add_argument("--model_dir", default="./models/cast_resnet50_v3")
+    parser.add_argument("--model_dir", default="./models/cast_resnet50_v4")
     parser.add_argument("--workers", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--augmentation", choices=["face", "legacy"], default="face")
 
     parser.add_argument("--source_epochs", type=int, default=30)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--source_backbone_lr_mult", type=float, default=0.1)
+    parser.add_argument("--grad_clip", type=float, default=5.0)
     parser.add_argument("--source_lr_gamma", type=float, default=0.95)
     parser.add_argument("--w1", type=float, default=4.0)
     parser.add_argument("--w2", type=float, default=0.3)
@@ -584,7 +693,9 @@ def parse_args():
     parser.add_argument("--bn_adapt_momentum", type=float, default=0.03)
 
     parser.add_argument("--phi", type=float, default=1.4)
-    parser.add_argument("--teacher_temperature", type=float, default=1.4)
+    parser.add_argument("--teacher_temperature", type=float, default=1.0)
+    parser.add_argument("--threshold_mode", choices=["quantile", "cast"], default="quantile")
+    parser.add_argument("--threshold_momentum", type=float, default=0.8)
     parser.add_argument("--pseudo_min_threshold", type=float, default=0.52)
     parser.add_argument("--pseudo_max_threshold", type=float, default=0.90)
     parser.add_argument("--threshold_quantile", type=float, default=0.60)
@@ -599,11 +710,12 @@ def parse_args():
     parser.add_argument("--starvation_support", type=int, default=64)
     parser.add_argument("--recovery_trigger_count", type=int, default=96)
     parser.add_argument("--recovery_topk_per_class", type=int, default=128)
-    parser.add_argument("--recovery_teacher_topk", type=int, default=4)
+    parser.add_argument("--recovery_teacher_topk", type=int, default=2)
     parser.add_argument("--recovery_teacher_min_prob", type=float, default=0.12)
     parser.add_argument("--recovery_proto_min_similarity", type=float, default=0.45)
     parser.add_argument("--recovery_min_score", type=float, default=0.40)
     parser.add_argument("--recovery_weight_scale", type=float, default=0.70)
+    parser.add_argument("--min_pseudo_batch", type=int, default=8)
 
     parser.add_argument("--class_balance_floor", type=int, default=256)
     parser.add_argument("--class_balance_max", type=int, default=1200)
@@ -627,12 +739,24 @@ def parse_args():
         parser.error("recovery_teacher_topk must be in [1, 7]")
     if args.class_balance_floor < 1 or args.class_balance_max < args.class_balance_floor:
         parser.error("invalid class balance cap")
+    if not 0 <= args.threshold_momentum < 1 or not 0 <= args.threshold_quantile <= 1:
+        parser.error("invalid threshold quantile/momentum")
+    if args.teacher_temperature <= 0 or args.min_pseudo_batch < 1:
+        parser.error("temperature and min_pseudo_batch must be positive")
+    if args.batch_size < 2 or args.epochs < 1:
+        parser.error("batch_size must be >= 2 and epochs must be positive")
+    if not 0 < args.bn_adapt_momentum <= 1 or args.grad_clip <= 0:
+        parser.error("invalid BN momentum or gradient clip")
+    if args.source_backbone_lr_mult <= 0:
+        parser.error("source_backbone_lr_mult must be positive")
     return args
 
 
 def train_source(model, loader, args, source_path):
     criterion = torch.nn.CrossEntropyLoss(reduction="none")
-    optimizer = torch.optim.Adam(model.parameters(), args.lr, weight_decay=1e-4)
+    optimizer = torch.optim.Adam(
+        optimizer_groups(model, args.lr, args.source_backbone_lr_mult), weight_decay=1e-4
+    )
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=args.source_lr_gamma)
 
     for epoch in range(args.source_epochs):
@@ -661,6 +785,7 @@ def train_source(model, loader, args, source_path):
 
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
 
             correct += output[0].argmax(dim=1).eq(targets).sum().item()
@@ -688,7 +813,9 @@ def train_source(model, loader, args, source_path):
 def main():
     args = parse_args()
     os.makedirs(args.model_dir, exist_ok=True)
-    tx = make_transforms()
+    with open(os.path.join(args.model_dir, "config.json"), "w", encoding="utf-8") as handle:
+        json.dump(vars(args), handle, ensure_ascii=False, indent=2)
+    tx = make_transforms(args.augmentation)
 
     source_train = RafDataSet(
         args.source_root, "train", transform=tx["source"], strong_transform=None, basic_aug=False
@@ -700,6 +827,12 @@ def main():
         args.target_root, "train", transform=tx["weak"], strong_transform=tx["strong"], basic_aug=False
     )
     target_train = IndexedTargetDataset(target_base)
+    target_scan_base = FER(
+        args.target_root, "train", transform=tx["test"], strong_transform=None, basic_aug=False
+    )
+    if target_scan_base.file_paths != target_base.file_paths:
+        raise RuntimeError("Target scan and training sample indices differ")
+    target_scan = TargetScanDataset(target_scan_base)
     target_test = FER(
         args.target_root, "test", transform=tx["test"], strong_transform=None
     )
@@ -707,10 +840,13 @@ def main():
     source_loader = make_loader(source_train, args.batch_size, args.workers, True, True, 1)
     proto_loader = make_loader(source_proto, args.batch_size, args.workers, False, False, 2)
     target_loader = make_loader(target_train, args.batch_size, args.workers, True, True, 3)
-    target_scan_loader = make_loader(target_train, args.batch_size, args.workers, False, False, 4)
+    target_scan_loader = make_loader(target_scan, args.batch_size, args.workers, False, False, 4)
     test_loader = make_loader(target_test, args.batch_size, args.workers, False, False, 5)
+    if len(source_loader) == 0 or len(target_loader) == 0 or len(target_test) == 0:
+        raise RuntimeError("Empty loader: check dataset paths, split and batch_size")
 
-    model = Networks.Model(backbone=args.backbone, num_classes=7).cuda()
+    model = Networks.Model(backbone=args.backbone, num_classes=7,
+                           pretrained=args.checkpoint is None).cuda()
     prefix = "%s_rafdb_fer" % args.backbone
     source_path = os.path.join(args.model_dir, prefix + "_source_final.pth")
     student_best_path = os.path.join(args.model_dir, prefix + "_student_best.pth")
@@ -748,13 +884,8 @@ def main():
     target_start_acc = evaluate(model, test_loader, len(target_test))
     print("[Target start after BN] accuracy %.4f" % target_start_acc)
 
-    feature_lr = args.target_lr * (0.20 if args.backbone == "resnet50" else 0.35)
     optimizer = torch.optim.Adam(
-        [
-            {"params": model.feature.parameters(), "lr": feature_lr},
-            {"params": model.fc.parameters(), "lr": args.target_lr},
-            {"params": model.bn.parameters(), "lr": args.target_lr},
-        ],
+        optimizer_groups(model, args.target_lr, 0.20 if args.backbone == "resnet50" else 0.35),
         weight_decay=1e-4,
     )
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=args.target_lr_gamma)
@@ -763,6 +894,7 @@ def main():
 
     temporal_label = torch.full((len(target_train),), -1, dtype=torch.long)
     temporal_streak = torch.zeros(len(target_train), dtype=torch.long)
+    previous_thresholds = None
 
     best_student = target_start_acc
     best_ema = target_start_acc
@@ -784,7 +916,10 @@ def main():
             predicted_count,
             weak_agreement,
             anchor_agreement,
-        ) = estimate_target_thresholds(teacher, anchor, target_scan_loader, args, epoch)
+        ) = estimate_target_thresholds(
+            teacher, anchor, target_scan_loader, args, epoch, previous_thresholds
+        )
+        previous_thresholds = thresholds.clone()
 
         pseudo_bank = build_epoch_pseudo_bank(
             teacher,
@@ -862,6 +997,8 @@ def main():
                         class_correct[c] += int(pseudo_targets[cm].eq(gt_cpu[cm]).sum().item())
 
             model.train()
+            if freeze_backbone:
+                model.feature.eval()
             # Preserve the target-domain BN calibration while still updating convolutional weights.
             freeze_backbone_bn_stats(model)
 
@@ -881,7 +1018,10 @@ def main():
                 align_cuda,
             ), dim=0)
 
-            batch_w2 = active_w2 if int(align_cuda.sum().item()) > 0 else 0.0
+            source_classes = torch.bincount(source_targets, minlength=7) > 0
+            target_counts = torch.bincount(safe_target[align_cuda], minlength=7)
+            supported_classes = source_classes & (target_counts >= 2)
+            batch_w2 = active_w2 if int(supported_classes.sum().item()) >= 2 else 0.0
             output = model(
                 train_imgs,
                 train_targets,
@@ -898,9 +1038,12 @@ def main():
                 target_labels = safe_target[selected_cuda]
                 per_target = target_criterion(target_logits, target_labels)
                 selected_weight = weight_cuda[selected_cuda]
+                # Keep absolute reliability: dividing by sum(weights) cancels
+                # the recovery discount when a batch contains only recovery
+                # samples. A small support floor also limits sparse-batch noise.
                 target_loss = (
                     per_target * selected_weight
-                ).sum() / selected_weight.sum().clamp_min(1.0)
+                ).sum() / float(max(selected_n, args.min_pseudo_batch))
             else:
                 target_loss = source_loss.new_zeros(())
 
@@ -915,6 +1058,7 @@ def main():
 
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
             update_ema(model, teacher, args.ema_decay)
 
