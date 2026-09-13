@@ -1,5 +1,5 @@
-import os
 import glob
+import os
 import random
 
 import cv2
@@ -37,18 +37,18 @@ class RafDataSet(data.Dataset):
         file_names = dataset.iloc[:, name_column].to_numpy(copy=True)
         labels = dataset.iloc[:, label_column].to_numpy(copy=True) - 1
 
-        # Deterministic paired shuffle. Using one permutation is safer than
-        # independently shuffling filenames and labels.
+        # Shuffle image paths and labels with one shared permutation.
         rng = np.random.RandomState(2000)
         perm = rng.permutation(len(file_names))
         file_names = file_names[perm]
         self.label = labels[perm]
 
         self.file_paths = []
-        for f in file_names:
-            stem = f.split(".")[0]
-            path = os.path.join(self.raf_path, "Image/aligned", stem + "_aligned.jpg")
-            self.file_paths.append(path)
+        for filename in file_names:
+            stem = filename.split(".")[0]
+            self.file_paths.append(
+                os.path.join(self.raf_path, "Image/aligned", stem + "_aligned.jpg")
+            )
 
         self.basic_aug = basic_aug
         self.aug_func = [
@@ -78,32 +78,31 @@ class RafDataSet(data.Dataset):
         if image is None:
             raise FileNotFoundError("Failed to read image: %s" % path)
 
-        image = image[:, :, ::-1]  # BGR -> RGB
+        image = image[:, :, ::-1].copy()  # BGR -> RGB
         label = int(self.label[idx])
 
         if self.phase == "train" and self.basic_aug and random.uniform(0, 1) > 0.5:
             aug_idx = random.randint(0, 2)
             image = self.aug_func[aug_idx](image)
 
-        img = self.transform(image) if self.transform is not None else image
+        img = self.transform(image.copy()) if self.transform is not None else image
 
-        # Important: strong_transform must receive the raw RGB image, not an
-        # already-normalized tensor.
+        # Strong transforms must always start from raw RGB, not a normalized tensor.
         if self.strong_transform is not None:
-            img_aug = self.strong_transform(image)
+            img_aug = self.strong_transform(image.copy())
             return img, img_aug, label
 
         return img, label
 
 
 class FER(data.Dataset):
-    """FER2013 dataset with dual weak teacher views + one strong student view.
+    """FER2013 with two weak teacher views and one strong student view.
 
-    Training return format when strong_transform is enabled:
-        weak_view_1, weak_view_2, strong_view, mapped_label, sample_index
+    Target training returns:
+        weak_view_1, weak_view_2, strong_view, mapped_label
 
-    The mapped label is returned only for diagnostics in UDA training. The
-    training loss must not use it as target supervision.
+    mapped_label is used only for diagnostics in UDA training, never for
+    pseudo-label selection or target training loss.
     """
 
     def __init__(self, path, phase, transform=None, strong_transform=None, basic_aug=False):
@@ -129,8 +128,8 @@ class FER(data.Dataset):
         print("FER %s path: %s" % (self.phase, os.path.abspath(path)))
         print("FER %s found images: %d" % (self.phase, len(files)))
 
-        # FER2013 -> CAST label mapping
-        # FER: 0 angry, 1 disgust, 2 fear, 3 happy, 4 sad, 5 surprise, 6 neutral
+        # Standard FER2013 folder order -> CAST order.
+        # FER:  0 angry, 1 disgust, 2 fear, 3 happy, 4 sad, 5 surprise, 6 neutral
         # CAST: 0 surprise, 1 fear, 2 disgust, 3 happy, 4 sad, 5 angry, 6 neutral
         fer_to_cast = {
             0: 5,
@@ -145,8 +144,10 @@ class FER(data.Dataset):
         self.file_paths = []
         self.label = []
         for file in files:
-            self.file_paths.append(file)
             original_label = int(os.path.basename(os.path.dirname(file)))
+            if original_label not in fer_to_cast:
+                raise ValueError("Unexpected FER2013 class folder: %s" % original_label)
+            self.file_paths.append(file)
             self.label.append(fer_to_cast[original_label])
 
         distribute = np.asarray(self.label)
@@ -169,7 +170,7 @@ class FER(data.Dataset):
         if image is None:
             raise FileNotFoundError("Failed to read image: %s" % path)
 
-        image = image[:, :, ::-1]  # BGR -> RGB
+        image = image[:, :, ::-1].copy()  # BGR -> RGB
         label = int(self.label[idx])
 
         if self.phase == "train" and self.basic_aug and random.uniform(0, 1) > 0.5:
@@ -177,18 +178,16 @@ class FER(data.Dataset):
             image = self.aug_func[aug_idx](image)
 
         if self.transform is not None:
-            img_w1 = self.transform(image)
-            img_w2 = self.transform(image) if self.phase == "train" else None
+            img_w1 = self.transform(image.copy())
+            img_w2 = self.transform(image.copy()) if self.phase == "train" else None
         else:
             img_w1 = image
-            img_w2 = image if self.phase == "train" else None
+            img_w2 = image.copy() if self.phase == "train" else None
 
         if self.phase == "train" and self.strong_transform is not None:
-            img_aug = self.strong_transform(image)
-            # sample index is needed by the epoch-level pseudo-label bank.
-            return img_w1, img_w2, img_aug, label, idx
+            img_aug = self.strong_transform(image.copy())
+            return img_w1, img_w2, img_aug, label
 
-        # Validation / test remains compatible with the original 2-tuple API.
         return img_w1, label
 
 
