@@ -68,7 +68,6 @@ def make_transforms():
         mean=[0.485, 0.456, 0.406],
         std=[0.229, 0.224, 0.225],
     )
-    # Keep source preprocessing aligned with the authors' public implementation.
     source = transforms.Compose([
         transforms.ToPILImage(),
         transforms.Resize((224, 224)),
@@ -116,6 +115,13 @@ def classifier_weight_loss(model):
     return ((weight.mm(weight.t()) - identity + 1.0) / 2.0).mean()
 
 
+def freeze_backbone_bn_stats(model):
+    """Keep the target-recalibrated ResNet BN running statistics fixed."""
+    for module in model.feature.modules():
+        if isinstance(module, nn.modules.batchnorm._BatchNorm):
+            module.eval()
+
+
 @torch.no_grad()
 def update_ema(student, teacher, decay):
     for teacher_param, student_param in zip(teacher.parameters(), student.parameters()):
@@ -159,7 +165,7 @@ def save_checkpoint(model, optimizer, path, epoch, accuracy, kind):
 
 @torch.no_grad()
 def adapt_backbone_bn(model, target_loader, max_batches, momentum):
-    """Unsupervised target-domain BN recalibration for the pretrained backbone only."""
+    """Unsupervised target-domain BN recalibration for the pretrained backbone."""
     if max_batches <= 0:
         return
 
@@ -172,9 +178,6 @@ def adapt_backbone_bn(model, target_loader, max_batches, momentum):
             old_momentum.append(module.momentum)
             module.momentum = momentum
             module.train()
-
-    if not bn_layers:
-        return
 
     used = 0
     for weak1, _, _, _, _ in target_loader:
@@ -203,7 +206,6 @@ def build_source_prototypes(anchor, loader, class_num=7):
 
         if sums is None:
             sums = torch.zeros(class_num, features.shape[1])
-
         for c in range(class_num):
             mask = targets.eq(c)
             if mask.any():
@@ -237,7 +239,6 @@ def estimate_target_thresholds(teacher, anchor, loader, args, epoch):
     for weak1, weak2, _, _, _ in loader:
         weak1 = weak1.cuda(non_blocking=True)
         weak2 = weak2.cuda(non_blocking=True)
-
         out1, _ = teacher(weak1, None, None, "test", "target")
         out2, _ = teacher(weak2, None, None, "test", "target")
         anchor_out, _ = anchor(weak1, None, None, "test", "target")
@@ -246,7 +247,6 @@ def estimate_target_thresholds(teacher, anchor, loader, args, epoch):
         prob2 = tempered_probability(out2, args.teacher_temperature).cpu()
         anchor_prob = tempered_probability(anchor_out, args.teacher_temperature).cpu()
         avg = 0.5 * (prob1 + prob2)
-
         confidence, target = avg.max(dim=1)
         agreement = prob1.argmax(dim=1).eq(prob2.argmax(dim=1))
         anchor_conf, anchor_pred = anchor_prob.max(dim=1)
@@ -283,7 +283,6 @@ def estimate_target_thresholds(teacher, anchor, loader, args, epoch):
         cast_threshold = float(np.clip(
             cast_threshold, args.pseudo_min_threshold, args.pseudo_max_threshold
         ))
-
         threshold = cast_threshold
         if class_anchor[c]:
             stable_values = torch.cat(class_anchor[c])
@@ -317,20 +316,21 @@ def build_epoch_pseudo_bank(
     args,
     epoch,
 ):
-    """Build one globally balanced pseudo-label bank for the whole FER train split."""
+    """Build a balanced bank and seed missing classes without requiring teacher top-1."""
     teacher.eval()
     anchor.eval()
     n_samples = len(loader.dataset)
-    raw_label = torch.full((n_samples,), -1, dtype=torch.long)
-    raw_score = torch.zeros(n_samples, dtype=torch.float32)
-    raw_margin = torch.zeros(n_samples, dtype=torch.float32)
-    raw_entropy = torch.ones(n_samples, dtype=torch.float32)
-    raw_candidate = torch.zeros(n_samples, dtype=torch.bool)
-    raw_anchor = torch.zeros(n_samples, dtype=torch.bool)
-    raw_proto = torch.zeros(n_samples, dtype=torch.bool)
+
+    top1_label = torch.full((n_samples,), -1, dtype=torch.long)
+    trusted = torch.zeros(n_samples, dtype=torch.bool)
+    trusted_score = torch.zeros(n_samples, dtype=torch.float32)
+    avg_prob_all = torch.zeros((n_samples, 7), dtype=torch.float32)
+    stable_prob_all = torch.zeros((n_samples, 7), dtype=torch.float32)
+    anchor_prob_all = torch.zeros((n_samples, 7), dtype=torch.float32)
+    proto_sim_all = torch.zeros((n_samples, 7), dtype=torch.float32)
+    teacher_rank_all = torch.full((n_samples, 7), 7, dtype=torch.long)
 
     strict_anchor = epoch < args.anchor_guard_epochs
-    starved = threshold_support < args.starvation_support
 
     for weak1, weak2, _, _, sample_idx in loader:
         weak1 = weak1.cuda(non_blocking=True)
@@ -344,12 +344,10 @@ def build_epoch_pseudo_bank(
         prob1 = tempered_probability(out1, args.teacher_temperature)
         prob2 = tempered_probability(out2, args.teacher_temperature)
         avg = 0.5 * (prob1 + prob2)
+        stable_all = torch.minimum(prob1, prob2)
         target = avg.argmax(dim=1)
         agreement = prob1.argmax(dim=1).eq(prob2.argmax(dim=1))
-        stable_conf = torch.minimum(
-            prob1.gather(1, target.unsqueeze(1)).squeeze(1),
-            prob2.gather(1, target.unsqueeze(1)).squeeze(1),
-        )
+        stable_top1 = stable_all.gather(1, target.unsqueeze(1)).squeeze(1)
         sample_threshold = thresholds.to(target.device)[target]
 
         top2 = torch.topk(avg, k=2, dim=1).values
@@ -366,76 +364,123 @@ def build_epoch_pseudo_bank(
         proto_top2 = torch.topk(similarity, k=2, dim=1)
         proto_pred = proto_top2.indices[:, 0]
         proto_margin = proto_top2.values[:, 0] - proto_top2.values[:, 1]
-        target_cpu = target.cpu()
-        proto_match = proto_pred.eq(target_cpu) & (proto_margin >= args.prototype_min_margin)
+        proto_match = proto_pred.eq(target.cpu()) & (
+            proto_margin >= args.prototype_min_margin
+        )
 
         base = (
             agreement
-            & (stable_conf >= sample_threshold)
+            & (stable_top1 >= sample_threshold)
             & (margin >= args.min_margin)
             & (entropy <= args.max_entropy)
         ).cpu()
         anchor_cpu = anchor_match.cpu()
-
         if strict_anchor:
-            trusted = base & anchor_cpu & proto_match
+            trusted_batch = base & anchor_cpu & proto_match
         else:
-            trusted = base & (anchor_cpu | proto_match)
+            trusted_batch = base & (anchor_cpu | proto_match)
 
-        sample_starved = starved[target_cpu]
-        recovery_threshold = torch.maximum(
-            sample_threshold.cpu() - args.starvation_threshold_relax,
-            torch.full_like(sample_threshold.cpu(), args.recovery_min_confidence),
-        )
-        recovery = (
-            agreement.cpu()
-            & sample_starved
-            & proto_match
-            & (stable_conf.cpu() >= recovery_threshold)
-            & (margin.cpu() >= args.recovery_min_margin)
-            & (entropy.cpu() <= args.recovery_max_entropy)
-        )
-        candidate = trusted | recovery
-
-        same = temporal_label[idx].eq(target_cpu)
-        new_streak = torch.where(
-            candidate,
-            torch.where(
-                same,
-                temporal_streak[idx] + 1,
-                torch.ones_like(temporal_streak[idx]),
-            ),
-            torch.zeros_like(temporal_streak[idx]),
-        )
-        temporal_label[idx] = torch.where(
-            candidate, target_cpu, torch.full_like(target_cpu, -1)
-        )
-        temporal_streak[idx] = new_streak
-
-        temporal_factor = (
-            new_streak.float() / float(max(args.temporal_full_streak, 1))
-        ).clamp(0.0, 1.0)
         proto_quality = ((proto_margin - args.prototype_min_margin) / 0.35).clamp(0.0, 1.0)
-        score = (
-            0.45 * stable_conf.cpu()
+        quality = (
+            0.45 * stable_top1.cpu()
             + 0.20 * margin.cpu()
             + 0.15 * (1.0 - entropy.cpu())
             + 0.10 * anchor_conf.cpu()
             + 0.10 * proto_quality
-        ) * temporal_factor
+        )
 
-        raw_label[idx] = target_cpu
-        raw_score[idx] = score
-        raw_margin[idx] = margin.cpu()
-        raw_entropy[idx] = entropy.cpu()
-        raw_candidate[idx] = candidate
-        raw_anchor[idx] = anchor_cpu
-        raw_proto[idx] = proto_match
+        avg_cpu = avg.cpu()
+        rank = (avg_cpu.unsqueeze(1) < avg_cpu.unsqueeze(2)).sum(dim=2) + 1
 
-    eligible = raw_candidate & (temporal_streak >= args.temporal_min_streak)
+        top1_label[idx] = target.cpu()
+        trusted[idx] = trusted_batch
+        trusted_score[idx] = quality
+        avg_prob_all[idx] = avg_cpu
+        stable_prob_all[idx] = stable_all.cpu()
+        anchor_prob_all[idx] = anchor_prob.cpu()
+        proto_sim_all[idx] = ((similarity.cpu() + 1.0) * 0.5).clamp(0.0, 1.0)
+        teacher_rank_all[idx] = rank.long()
+
+    trusted_counts = torch.zeros(7, dtype=torch.long)
+    for c in range(7):
+        trusted_counts[c] = int((trusted & top1_label.eq(c)).sum().item())
+
+    # Recover any class that has too few trusted samples. Recovery is class-conditioned:
+    # the teacher does not need to predict class c as top-1. We rank samples using
+    # P_teacher(c), weak-view stability, source-prototype similarity and anchor P(c).
+    recovery_needed = (
+        (trusted_counts < args.recovery_trigger_count)
+        | (threshold_support < args.starvation_support)
+    )
+    recovery_score = (
+        0.40 * stable_prob_all
+        + 0.15 * avg_prob_all
+        + 0.30 * proto_sim_all
+        + 0.15 * anchor_prob_all
+    )
+
+    proposed_label = torch.full((n_samples,), -1, dtype=torch.long)
+    proposed_score = torch.zeros(n_samples, dtype=torch.float32)
+    proposed_recovery = torch.zeros(n_samples, dtype=torch.bool)
+    proposed_label[trusted] = top1_label[trusted]
+    proposed_score[trusted] = trusted_score[trusted]
+
+    proposals = []
+    for c in range(7):
+        if not bool(recovery_needed[c]):
+            continue
+        valid = (
+            (~trusted)
+            & (stable_prob_all[:, c] >= args.recovery_teacher_min_prob)
+            & (proto_sim_all[:, c] >= args.recovery_proto_min_similarity)
+            & (teacher_rank_all[:, c] <= args.recovery_teacher_topk)
+            & (recovery_score[:, c] >= args.recovery_min_score)
+        )
+        candidate_idx = valid.nonzero(as_tuple=False).flatten()
+        if candidate_idx.numel() == 0:
+            continue
+        k = min(args.recovery_topk_per_class, int(candidate_idx.numel()))
+        keep = torch.topk(recovery_score[candidate_idx, c], k=k, largest=True).indices
+        for sample in candidate_idx[keep].tolist():
+            proposals.append((float(recovery_score[sample, c]), sample, c))
+
+    proposals.sort(key=lambda item: item[0], reverse=True)
+    recovery_quota = [0] * 7
+    for score, sample, c in proposals:
+        if proposed_label[sample] >= 0:
+            continue
+        if recovery_quota[c] >= args.recovery_topk_per_class:
+            continue
+        proposed_label[sample] = c
+        proposed_score[sample] = score * args.recovery_weight_scale
+        proposed_recovery[sample] = True
+        recovery_quota[c] += 1
+
+    recovery_counts = torch.zeros(7, dtype=torch.long)
+    for c in range(7):
+        recovery_counts[c] = int((proposed_recovery & proposed_label.eq(c)).sum().item())
+
+    has_proposal = proposed_label.ge(0)
+    same = temporal_label.eq(proposed_label)
+    new_streak = torch.where(
+        has_proposal,
+        torch.where(same, temporal_streak + 1, torch.ones_like(temporal_streak)),
+        torch.zeros_like(temporal_streak),
+    )
+    temporal_label.copy_(torch.where(
+        has_proposal, proposed_label, torch.full_like(proposed_label, -1)
+    ))
+    temporal_streak.copy_(new_streak)
+
+    temporal_factor = (
+        new_streak.float() / float(max(args.temporal_full_streak, 1))
+    ).clamp(0.0, 1.0)
+    proposed_score = proposed_score * temporal_factor
+    eligible = has_proposal & (new_streak >= args.temporal_min_streak)
+
     eligible_counts = torch.zeros(7, dtype=torch.long)
     for c in range(7):
-        eligible_counts[c] = int((eligible & raw_label.eq(c)).sum().item())
+        eligible_counts[c] = int((eligible & proposed_label.eq(c)).sum().item())
 
     nonzero = eligible_counts[eligible_counts > 0].float()
     if nonzero.numel():
@@ -449,18 +494,17 @@ def build_epoch_pseudo_bank(
 
     selected = torch.zeros(n_samples, dtype=torch.bool)
     for c in range(7):
-        class_idx = (eligible & raw_label.eq(c)).nonzero(as_tuple=False).flatten()
+        class_idx = (eligible & proposed_label.eq(c)).nonzero(as_tuple=False).flatten()
         if class_idx.numel() == 0:
             continue
         if class_idx.numel() > class_cap:
-            scores = raw_score[class_idx]
-            keep = torch.topk(scores, k=class_cap, largest=True).indices
+            keep = torch.topk(proposed_score[class_idx], k=class_cap, largest=True).indices
             class_idx = class_idx[keep]
         selected[class_idx] = True
 
     selected_counts = torch.zeros(7, dtype=torch.long)
     for c in range(7):
-        selected_counts[c] = int((selected & raw_label.eq(c)).sum().item())
+        selected_counts[c] = int((selected & proposed_label.eq(c)).sum().item())
 
     class_weight = torch.ones(7, dtype=torch.float32)
     valid_counts = selected_counts > 0
@@ -471,9 +515,11 @@ def build_epoch_pseudo_bank(
         ).clamp(args.min_class_weight, args.max_class_weight)
 
     epoch_label = torch.full((n_samples,), -1, dtype=torch.long)
-    epoch_label[selected] = raw_label[selected]
+    epoch_label[selected] = proposed_label[selected]
     epoch_weight = torch.zeros(n_samples, dtype=torch.float32)
-    epoch_weight[selected] = raw_score[selected] * class_weight[raw_label[selected]]
+    epoch_weight[selected] = (
+        proposed_score[selected] * class_weight[proposed_label[selected]]
+    )
     epoch_weight.clamp_(0.0, 1.5)
     epoch_align = selected & (epoch_weight >= args.align_min_weight)
 
@@ -488,18 +534,15 @@ def build_epoch_pseudo_bank(
         "weight": epoch_weight,
         "selected": selected,
         "align": epoch_align,
-        "raw_candidate": raw_candidate,
+        "trusted_counts": trusted_counts,
+        "recovery_counts": recovery_counts,
+        "recovery_needed": recovery_needed,
         "eligible_counts": eligible_counts,
         "selected_counts": selected_counts,
         "align_counts": align_counts,
-        "class_weight": class_weight,
         "class_cap": class_cap,
         "ddrl_ready": ddrl_ready,
         "ddrl_classes": ddrl_classes,
-        "margin": raw_margin,
-        "entropy": raw_entropy,
-        "anchor": raw_anchor,
-        "proto": raw_proto,
     }
 
 
@@ -518,7 +561,7 @@ def parse_args():
     parser.add_argument("-c", "--checkpoint", default=None)
     parser.add_argument("--source_root", default="/workspace/ttt/code/test-upload-clean/datesets/raf-basic")
     parser.add_argument("--target_root", default="/workspace/ttt/code/data/fer2013")
-    parser.add_argument("--model_dir", default="./models/cast_resnet50_v2")
+    parser.add_argument("--model_dir", default="./models/cast_resnet50_v3")
     parser.add_argument("--workers", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=64)
 
@@ -533,8 +576,8 @@ def parse_args():
     parser.add_argument("--target_lr", type=float, default=5e-5)
     parser.add_argument("--target_lr_gamma", type=float, default=0.97)
     parser.add_argument("--ema_decay", type=float, default=0.999)
-    parser.add_argument("--target_lambda", type=float, default=0.50)
-    parser.add_argument("--pseudo_ramp", type=int, default=6)
+    parser.add_argument("--target_lambda", type=float, default=0.35)
+    parser.add_argument("--pseudo_ramp", type=int, default=8)
     parser.add_argument("--freeze_backbone_epochs", type=int, default=2)
 
     parser.add_argument("--bn_adapt_batches", type=int, default=64)
@@ -549,15 +592,18 @@ def parse_args():
     parser.add_argument("--max_entropy", type=float, default=0.78)
     parser.add_argument("--anchor_min_confidence", type=float, default=0.38)
     parser.add_argument("--prototype_min_margin", type=float, default=0.01)
-    parser.add_argument("--anchor_guard_epochs", type=int, default=5)
+    parser.add_argument("--anchor_guard_epochs", type=int, default=3)
     parser.add_argument("--temporal_min_streak", type=int, default=2)
     parser.add_argument("--temporal_full_streak", type=int, default=3)
 
     parser.add_argument("--starvation_support", type=int, default=64)
-    parser.add_argument("--starvation_threshold_relax", type=float, default=0.18)
-    parser.add_argument("--recovery_min_confidence", type=float, default=0.70)
-    parser.add_argument("--recovery_min_margin", type=float, default=0.18)
-    parser.add_argument("--recovery_max_entropy", type=float, default=0.60)
+    parser.add_argument("--recovery_trigger_count", type=int, default=96)
+    parser.add_argument("--recovery_topk_per_class", type=int, default=128)
+    parser.add_argument("--recovery_teacher_topk", type=int, default=4)
+    parser.add_argument("--recovery_teacher_min_prob", type=float, default=0.12)
+    parser.add_argument("--recovery_proto_min_similarity", type=float, default=0.45)
+    parser.add_argument("--recovery_min_score", type=float, default=0.40)
+    parser.add_argument("--recovery_weight_scale", type=float, default=0.70)
 
     parser.add_argument("--class_balance_floor", type=int, default=256)
     parser.add_argument("--class_balance_max", type=int, default=1200)
@@ -577,6 +623,8 @@ def parse_args():
         parser.error("invalid pseudo-label threshold range")
     if args.temporal_min_streak < 1 or args.temporal_full_streak < args.temporal_min_streak:
         parser.error("invalid temporal streak configuration")
+    if not 1 <= args.recovery_teacher_topk <= 7:
+        parser.error("recovery_teacher_topk must be in [1, 7]")
     if args.class_balance_floor < 1 or args.class_balance_max < args.class_balance_floor:
         parser.error("invalid class balance cap")
     return args
@@ -656,11 +704,6 @@ def main():
         args.target_root, "test", transform=tx["test"], strong_transform=None
     )
 
-    if len(target_base) != 28709:
-        print("WARNING: FER2013 train=%d, paper uses 28709" % len(target_base))
-    if len(target_test) != 3589:
-        print("WARNING: FER2013 test=%d, paper uses 3589" % len(target_test))
-
     source_loader = make_loader(source_train, args.batch_size, args.workers, True, True, 1)
     proto_loader = make_loader(source_proto, args.batch_size, args.workers, False, False, 2)
     target_loader = make_loader(target_train, args.batch_size, args.workers, True, True, 3)
@@ -686,7 +729,6 @@ def main():
     source_target_acc = evaluate(model, test_loader, len(target_test))
     print("[Source -> Target] accuracy %.4f" % source_target_acc)
 
-    # Anchor remains a pure source model; the student gets unlabeled target BN statistics.
     anchor = copy.deepcopy(model).cuda().eval()
     for parameter in anchor.parameters():
         parameter.requires_grad = False
@@ -763,7 +805,8 @@ def main():
 
         print(
             "[Epoch %d] CATM %s support %s predicted %s weak_agree %.4f anchor_agree %.4f "
-            "cap %d eligible %s selected %s align %s ddrl_classes %d w2 %.4f pseudo_scale %.3f"
+            "trusted %s recovery %s need_recovery %s cap %d eligible %s selected %s align %s "
+            "ddrl_classes %d w2 %.4f pseudo_scale %.3f"
             % (
                 epoch,
                 [round(float(x), 4) for x in thresholds.tolist()],
@@ -771,6 +814,9 @@ def main():
                 predicted_count.tolist(),
                 weak_agreement,
                 anchor_agreement,
+                pseudo_bank["trusted_counts"].tolist(),
+                pseudo_bank["recovery_counts"].tolist(),
+                pseudo_bank["recovery_needed"].int().tolist(),
                 pseudo_bank["class_cap"],
                 pseudo_bank["eligible_counts"].tolist(),
                 pseudo_bank["selected_counts"].tolist(),
@@ -816,8 +862,8 @@ def main():
                         class_correct[c] += int(pseudo_targets[cm].eq(gt_cpu[cm]).sum().item())
 
             model.train()
-            if freeze_backbone:
-                model.feature.eval()
+            # Preserve the target-domain BN calibration while still updating convolutional weights.
+            freeze_backbone_bn_stats(model)
 
             source_imgs = source_imgs.cuda(non_blocking=True)
             source_targets = source_targets.long().cuda(non_blocking=True)
