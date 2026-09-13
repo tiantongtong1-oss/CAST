@@ -10,3 +10,7 @@ __pycache__/
 data/
 hello.py
 test.py
+
+logs/
+models/
+*.bak

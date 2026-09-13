@@ -1,254 +1,214 @@
-import torch.utils.data as data
-import cv2
-import pandas as pd
 import os
-import image_utils as util
-import random
 import glob
-import numpy as np
 import random
-import shutil
+
+import cv2
+import numpy as np
+import pandas as pd
+import torch.utils.data as data
+
+import image_utils as util
 
 
+# CAST label order:
+# 0: surprise, 1: fear, 2: disgust, 3: happy, 4: sad, 5: angry, 6: neutral
 
-"0: surprise, 1: fear, 2: disgust, 3: happy 4: sad  5: angry 6: neutral 7:attempt"
 
 class RafDataSet(data.Dataset):
-    def __init__(self, raf_path, phase, transform=None, strong_transform =None, basic_aug=False, ratio=1):
+    def __init__(self, raf_path, phase, transform=None, strong_transform=None, basic_aug=False, ratio=1):
         self.phase = phase
         self.transform = transform
         self.strong_transform = strong_transform
         self.raf_path = raf_path
 
-        NAME_COLUMN = 0
-        LABEL_COLUMN = 1
-        df = pd.read_csv(os.path.join(self.raf_path, 'EmoLabel/list_patition_label.txt'), sep=' ', header=None)
-        if phase == 'train':
-            dataset = df[df[NAME_COLUMN].str.startswith('train')]
+        name_column = 0
+        label_column = 1
+        df = pd.read_csv(
+            os.path.join(self.raf_path, "EmoLabel/list_patition_label.txt"),
+            sep=" ",
+            header=None,
+        )
+
+        if phase == "train":
+            dataset = df[df[name_column].str.startswith("train")]
         else:
-            dataset = df[df[NAME_COLUMN].str.startswith('test')]
-        file_names = dataset.iloc[:, NAME_COLUMN].values
-        self.label = dataset.iloc[:,
-                     LABEL_COLUMN].values - 1  # 0:Surprise, 1:Fear, 2:Disgust, 3:Happiness, 4:Sadness, 5:Anger, 6:Neutral
-        ###shuffle dataset
-        seed = np.random.seed(2000)
-        np.random.shuffle(file_names)
-        seed = np.random.seed(2000)
-        np.random.shuffle(self.label)
-                
+            dataset = df[df[name_column].str.startswith("test")]
+
+        file_names = dataset.iloc[:, name_column].to_numpy(copy=True)
+        labels = dataset.iloc[:, label_column].to_numpy(copy=True) - 1
+
+        # Deterministic paired shuffle. Using one permutation is safer than
+        # independently shuffling filenames and labels.
+        rng = np.random.RandomState(2000)
+        perm = rng.permutation(len(file_names))
+        file_names = file_names[perm]
+        self.label = labels[perm]
+
         self.file_paths = []
-        # use raf-db aligned images for training/testing
         for f in file_names:
-            f = f.split(".")[0]
-            f = f + "_aligned.jpg"
-            path = os.path.join(self.raf_path, 'Image/aligned', f)
+            stem = f.split(".")[0]
+            path = os.path.join(self.raf_path, "Image/aligned", stem + "_aligned.jpg")
             self.file_paths.append(path)
 
         self.basic_aug = basic_aug
-        self.aug_func = [util.flip_image, util.add_gaussian_noise, util.crop, util.rotation]
-        distribute = np.array(self.label)
+        self.aug_func = [
+            util.flip_image,
+            util.add_gaussian_noise,
+            util.crop,
+            util.rotation,
+        ]
 
-        self.label_dis = [np.sum(distribute == 0), np.sum(distribute == 1), np.sum(distribute == 2),
-                          np.sum(distribute == 3), \
-                          np.sum(distribute == 4), np.sum(distribute == 5), np.sum(distribute == 6)]
-        print('The dataset distribute: %d, %d, %d, %d, %d, %d, %d' % (
-        self.label_dis[0], self.label_dis[1], self.label_dis[2], self.label_dis[3], \
-        self.label_dis[4], self.label_dis[5], self.label_dis[6]))
+        distribute = np.asarray(self.label)
+        self.label_dis = [int(np.sum(distribute == c)) for c in range(7)]
+        print(
+            "The dataset distribute: %d, %d, %d, %d, %d, %d, %d"
+            % tuple(self.label_dis)
+        )
 
     def __len__(self):
         return len(self.file_paths)
 
     def weight(self):
-        return np.ones(shape=len(self.label_dis)) / self.label_dis * 1000
+        counts = np.asarray(self.label_dis, dtype=np.float32)
+        return np.ones_like(counts) / np.maximum(counts, 1.0) * 1000.0
 
     def __getitem__(self, idx):
         path = self.file_paths[idx]
         image = cv2.imread(path)
-        img = image[:, :, ::-1]  # BGR to RGB
-        label = self.label[idx]
-        if self.phase == 'train':
-            if self.basic_aug and random.uniform(0, 1) > 0.5:
-                index = random.randint(0, 2)
-                img = self.aug_func[index](img)
+        if image is None:
+            raise FileNotFoundError("Failed to read image: %s" % path)
 
-        if self.transform is not None:
-            img = self.transform(img)
-            
+        image = image[:, :, ::-1]  # BGR -> RGB
+        label = int(self.label[idx])
+
+        if self.phase == "train" and self.basic_aug and random.uniform(0, 1) > 0.5:
+            aug_idx = random.randint(0, 2)
+            image = self.aug_func[aug_idx](image)
+
+        img = self.transform(image) if self.transform is not None else image
+
+        # Important: strong_transform must receive the raw RGB image, not an
+        # already-normalized tensor.
         if self.strong_transform is not None:
-            img_aug = self.strong_transform(img)
+            img_aug = self.strong_transform(image)
             return img, img_aug, label
-        else:
-            return img, label
+
+        return img, label
 
 
 class FER(data.Dataset):
+    """FER2013 dataset with dual weak teacher views + one strong student view.
+
+    Training return format when strong_transform is enabled:
+        weak_view_1, weak_view_2, strong_view, mapped_label, sample_index
+
+    The mapped label is returned only for diagnostics in UDA training. The
+    training loss must not use it as target supervision.
+    """
+
     def __init__(self, path, phase, transform=None, strong_transform=None, basic_aug=False):
         self.phase = phase
         self.transform = transform
         self.strong_transform = strong_transform
-
         self.basic_aug = basic_aug
-        self.aug_func = [util.flip_image, util.add_gaussian_noise, util.crop, util.rotation]
-        self.file_paths, self.label = [], []
-
-        if self.phase == 'train':
-            files = glob.glob(
-                os.path.join(
-                    path,
-                    'train',
-                    '*',
-                    '*.jpg'
-                )
-            )
-            seed = np.random.seed(2000)
-            np.random.shuffle(files)
-        else:
-            files = glob.glob(os.path.join(path, 'test/*/*.jpg'))
-            print("FER test images:", len(files))
-
-        print("FER %s path: %s" % (
-                    self.phase,os.path.abspath(path) ) )
-
-        print(
-                "FER %s found images: %d" % (
-                    self.phase,len(files)) )
-
-            # FER2013 -> CAST label mapping
-        fer_to_cast = {
-            0: 5,  # angry
-            1: 2,  # disgust
-            2: 1,  # fear
-            3: 3,  # happy
-            4: 4,  # sad
-            5: 0,  # surprise
-            6: 6,  # neutral
-            }
-
-        for file in files:
-            self.file_paths.append(file)
-
-            original_label = int(
-                os.path.basename(os.path.dirname(file))
-            )
-            mapped_label = fer_to_cast[original_label]
-
-            self.label.append(mapped_label)
-
-
-        distribute = np.array(self.label)
-
-        self.label_dis = [
-            np.sum(distribute == 0),
-            np.sum(distribute == 1),
-            np.sum(distribute == 2),
-            np.sum(distribute == 3),
-            np.sum(distribute == 4),
-            np.sum(distribute == 5),
-            np.sum(distribute == 6)
+        self.aug_func = [
+            util.flip_image,
+            util.add_gaussian_noise,
+            util.crop,
+            util.rotation,
         ]
 
-        print(
-            'The dataset distribute: %d, %d, %d, %d, %d, %d, %d'
-            % (
-                self.label_dis[0],
-                self.label_dis[1],
-                self.label_dis[2],
-                self.label_dis[3],
-                self.label_dis[4],
-                self.label_dis[5],
-                self.label_dis[6]
-            )
-        )
+        if self.phase == "train":
+            files = sorted(glob.glob(os.path.join(path, "train", "*", "*.jpg")))
+            rng = np.random.RandomState(2000)
+            rng.shuffle(files)
+        else:
+            files = sorted(glob.glob(os.path.join(path, "test", "*", "*.jpg")))
+            print("FER test images:", len(files))
 
+        print("FER %s path: %s" % (self.phase, os.path.abspath(path)))
+        print("FER %s found images: %d" % (self.phase, len(files)))
+
+        # FER2013 -> CAST label mapping
+        # FER: 0 angry, 1 disgust, 2 fear, 3 happy, 4 sad, 5 surprise, 6 neutral
+        # CAST: 0 surprise, 1 fear, 2 disgust, 3 happy, 4 sad, 5 angry, 6 neutral
+        fer_to_cast = {
+            0: 5,
+            1: 2,
+            2: 1,
+            3: 3,
+            4: 4,
+            5: 0,
+            6: 6,
+        }
+
+        self.file_paths = []
+        self.label = []
+        for file in files:
+            self.file_paths.append(file)
+            original_label = int(os.path.basename(os.path.dirname(file)))
+            self.label.append(fer_to_cast[original_label])
+
+        distribute = np.asarray(self.label)
+        self.label_dis = [int(np.sum(distribute == c)) for c in range(7)]
+        print(
+            "The dataset distribute: %d, %d, %d, %d, %d, %d, %d"
+            % tuple(self.label_dis)
+        )
 
     def __len__(self):
         return len(self.file_paths)
 
     def weight(self):
-        return np.ones(shape = len(self.label_dis)) / self.label_dis * 1000
+        counts = np.asarray(self.label_dis, dtype=np.float32)
+        return np.ones_like(counts) / np.maximum(counts, 1.0) * 1000.0
 
     def __getitem__(self, idx):
         path = self.file_paths[idx]
-
         image = cv2.imread(path)
-
         if image is None:
-            raise FileNotFoundError(
-                "Failed to read image: %s" % path
-            )
+            raise FileNotFoundError("Failed to read image: %s" % path)
 
-        # BGR -> RGB
-        image = image[:, :, ::-1]
+        image = image[:, :, ::-1]  # BGR -> RGB
+        label = int(self.label[idx])
 
-        label = self.label[idx]
+        if self.phase == "train" and self.basic_aug and random.uniform(0, 1) > 0.5:
+            aug_idx = random.randint(0, 1)
+            image = self.aug_func[aug_idx](image)
 
-        # --------------------------------------------------
-        # Basic augmentation
-        # --------------------------------------------------
-        if self.phase == 'train':
-            if self.basic_aug and random.uniform(0, 1) > 0.5:
-                index = random.randint(0, 1)
-                image = self.aug_func[index](image)
-
-        # ==================================================
-        # E3: Two independent target views
-        # ==================================================
         if self.transform is not None:
-
-            # View 1
             img_w1 = self.transform(image)
-
-            # View 2
-            # Calling the same random transform again gives
-            # another independent augmentation of the same image.
-            if self.phase == 'train':
-                img_w2 = self.transform(image)
-            else:
-                img_w2 = None
-
+            img_w2 = self.transform(image) if self.phase == "train" else None
         else:
             img_w1 = image
-            img_w2 = image if self.phase == 'train' else None
+            img_w2 = image if self.phase == "train" else None
 
-        # ==================================================
-        # Target training:
-        # two Teacher views + one strong Student view
-        # ==================================================
-        if self.strong_transform is not None:
-
+        if self.phase == "train" and self.strong_transform is not None:
             img_aug = self.strong_transform(image)
+            # sample index is needed by the epoch-level pseudo-label bank.
+            return img_w1, img_w2, img_aug, label, idx
 
-            return (
-                img_w1,
-                img_w2,
-                img_aug,
-                label
-            )
+        # Validation / test remains compatible with the original 2-tuple API.
+        return img_w1, label
 
 
-        # Validation / test
-        else:
-            return img_w1, label
-if __name__ == '__main__':
+if __name__ == "__main__":
     train_dataset = FER(
-        '/workspace/ttt/code/data/fer2013/',
-        phase='train',
+        "/workspace/ttt/code/data/fer2013/",
+        phase="train",
         transform=None,
         strong_transform=None,
-        basic_aug=False
+        basic_aug=False,
     )
-
     test_dataset = FER(
-        '/workspace/ttt/code/data/fer2013/',
-        phase='test',
+        "/workspace/ttt/code/data/fer2013/",
+        phase="test",
         transform=None,
         strong_transform=None,
-        basic_aug=False
+        basic_aug=False,
     )
 
-    print('train size:', len(train_dataset))
-    print('test size:', len(test_dataset))
-
-    print('train distribution:', train_dataset.label_dis)
-    print('test distribution:', test_dataset.label_dis)
-
+    print("train size:", len(train_dataset))
+    print("test size:", len(test_dataset))
+    print("train distribution:", train_dataset.label_dis)
+    print("test distribution:", test_dataset.label_dis)
