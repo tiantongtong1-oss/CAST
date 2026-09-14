@@ -1,6 +1,3 @@
-import warnings
-warnings.filterwarnings('ignore')
-
 import argparse
 import os
 import random
@@ -15,7 +12,9 @@ from dataset import RafDataSet, FER
 from ema_utils import (
     PrototypeMemory,
     create_ema_teacher,
-    distribution_align,
+    align_dual_view_probabilities,
+    select_dual_view_pseudo_labels,
+    weighted_mean_loss,
     update_ema_teacher,
 )
 import image_utils as util
@@ -36,7 +35,7 @@ def _init_fn(worker_id):
     np.random.seed(seed + worker_id)
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--data1', type=str, default='rafdb', help='source data')
     parser.add_argument('--data2', type=str, default='fer', help='target data')
@@ -51,6 +50,14 @@ def parse_args():
     parser.add_argument('--backbone', type=str, default='mobilenet_v2',
                         help='mobilenet_v2 (default), resnet18 or resnet50')
     parser.add_argument('--lr', type=float, default=0.001)
+    parser.add_argument('--target_lr', type=float, default=None,
+                        help='fresh target-stage learning rate; defaults to --lr')
+    parser.add_argument('--device', choices=['auto', 'cpu', 'cuda'], default='auto')
+    parser.add_argument('--batch_size', type=int, default=128)
+    parser.add_argument('--eval_batch_size', type=int, default=128)
+    parser.add_argument('--no_pretrained', action='store_true',
+                        help='disable ImageNet weight download for offline checks')
+    parser.add_argument('--output_dir', default='./models')
     parser.add_argument('--workers', default=10, type=int)
     parser.add_argument('--pre_epochs', type=int, default=30)
     parser.add_argument('--epochs', type=int, default=30)
@@ -96,7 +103,31 @@ def parse_args():
     parser.add_argument('--class_weight_max', type=float, default=1.0)
     parser.add_argument('--loss_clip', type=float, default=5.0)
     parser.add_argument('--grad_clip', type=float, default=5.0)
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.pre_epochs < 0 or args.epochs < 0:
+        parser.error('epoch counts must be nonnegative')
+    if args.pre_epochs == 0 and not args.checkpoint:
+        parser.error('--pre_epochs 0 requires --checkpoint (source model weights)')
+    if args.batch_size < 2 or args.eval_batch_size < 1 or args.workers < 0:
+        parser.error('batch_size >= 2, eval_batch_size >= 1 and workers >= 0 required')
+    if args.teacher_temperature <= 0 or args.distribution_ratio_max < 1:
+        parser.error('temperature must be positive and distribution_ratio_max >= 1')
+    if not 0 <= args.ema_decay < 1 or not 0 <= args.prototype_momentum < 1:
+        parser.error('EMA and prototype decay must be in [0, 1)')
+    if not 0 <= args.threshold_min <= args.threshold_max <= 1:
+        parser.error('require 0 <= threshold_min <= threshold_max <= 1')
+    if not 0 <= args.consistency_min_conf <= 1 or not 0 <= args.fallback_conf <= 1:
+        parser.error('confidence cutoffs must be in [0, 1]')
+    for name in ('lr', 'pseudo_weight_max', 'class_weight_max', 'loss_clip', 'grad_clip'):
+        if getattr(args, name) <= 0:
+            parser.error('--%s must be positive' % name)
+    if args.target_lr is not None and args.target_lr <= 0:
+        parser.error('--target_lr must be positive')
+    for name in ('w1', 'w2', 'w3', 'lambda_target', 'lambda_aff', 'distribution_power',
+                 'prototype_margin', 'target_ramp_epochs', 'aff_warmup_epochs', 'aff_ramp_epochs'):
+        if getattr(args, name) < 0:
+            parser.error('--%s must be nonnegative' % name)
+    return args
 
 
 def build_transforms():
@@ -165,29 +196,30 @@ def calculate_teacher_statistics(teacher, loader, class_num, epoch,
     probabilities are mildly distribution-aligned before per-class thresholds
     are calculated. Ground-truth FER labels are never used here.
     """
-    all_probs = []
+    all_probs1, all_probs2 = [], []
+    device = next(teacher.parameters()).device
     teacher.eval()
     with torch.no_grad():
         for weak1, weak2, _ in loader:
-            weak1 = weak1.cuda(non_blocking=True)
-            weak2 = weak2.cuda(non_blocking=True)
+            weak1 = weak1.to(device, non_blocking=True)
+            weak2 = weak2.to(device, non_blocking=True)
             logits1, _ = teacher(weak1, None, None, mode='test', task='target')
             logits2, _ = teacher(weak2, None, None, mode='test', task='target')
             probs1 = F.softmax(logits1 / args.teacher_temperature, dim=1)
             probs2 = F.softmax(logits2 / args.teacher_temperature, dim=1)
-            all_probs.append(((probs1 + probs2) * 0.5).cpu())
+            all_probs1.append(probs1.cpu())
+            all_probs2.append(probs2.cpu())
 
-    probs = torch.cat(all_probs, dim=0)
-    prior = probs.mean(dim=0)
+    if not all_probs1:
+        raise ValueError('Target statistics loader is empty.')
+    probs1, probs2 = torch.cat(all_probs1), torch.cat(all_probs2)
+    prior = ((probs1 + probs2) * 0.5).mean(dim=0)
     prior = prior / prior.sum().clamp_min(1e-12)
 
-    corrected = distribution_align(
-        probs,
-        prior,
-        power=args.distribution_power,
-        ratio_max=args.distribution_ratio_max,
+    corrected1, corrected2 = align_dual_view_probabilities(
+        probs1, probs2, prior, args.distribution_power, args.distribution_ratio_max
     )
-    confidence, predicted = corrected.max(dim=1)
+    confidence, predicted = ((corrected1 + corrected2) * 0.5).max(dim=1)
 
     class_mean = torch.zeros(class_num, dtype=torch.float32)
     class_count = torch.zeros(class_num, dtype=torch.float32)
@@ -212,69 +244,38 @@ def calculate_teacher_statistics(teacher, loader, class_num, epoch,
     return thresholds, prior
 
 
+@torch.no_grad()
 def generate_dual_view_pseudo_labels(teacher, weak1, weak2,
-                                     thresholds, prior, args):
-    """EMA pseudo labels with two-view agreement and confidence filtering."""
+                                     thresholds, prior, args,
+                                     return_features=False):
+    """Frozen weak-view predictions; optionally expose stable teacher features."""
     teacher.eval()
-    with torch.no_grad():
-        logits1, _ = teacher(weak1, None, None, mode='test', task='target')
-        logits2, _ = teacher(weak2, None, None, mode='test', task='target')
-
-        probs1 = F.softmax(logits1 / args.teacher_temperature, dim=1)
-        probs2 = F.softmax(logits2 / args.teacher_temperature, dim=1)
-        probs1 = distribution_align(
-            probs1, prior, args.distribution_power, args.distribution_ratio_max
+    logits1, features1 = teacher(weak1, mode='test', task='target')
+    logits2, features2 = teacher(weak2, mode='test', task='target')
+    probs1, probs2 = align_dual_view_probabilities(
+        F.softmax(logits1 / args.teacher_temperature, dim=1),
+        F.softmax(logits2 / args.teacher_temperature, dim=1),
+        prior, args.distribution_power, args.distribution_ratio_max,
+    )
+    selected = select_dual_view_pseudo_labels(probs1, probs2, thresholds, prior, args)
+    if return_features:
+        features = F.normalize(
+            F.normalize(features1, dim=1) + F.normalize(features2, dim=1), dim=1
         )
-        probs2 = distribution_align(
-            probs2, prior, args.distribution_power, args.distribution_ratio_max
-        )
+        return selected + (features.detach(),)
+    return selected
 
-        conf1, pred1 = probs1.max(dim=1)
-        conf2, pred2 = probs2.max(dim=1)
-        mean_probs = (probs1 + probs2) * 0.5
-        confidence, pseudo_targets = mean_probs.max(dim=1)
 
-        agreement = pred1.eq(pred2) & pred1.eq(pseudo_targets)
-        min_view_conf = torch.minimum(conf1, conf2)
-        sample_threshold = thresholds.to(weak1.device).index_select(0, pseudo_targets)
-
-        reliable = (
-            agreement
-            & (confidence >= sample_threshold)
-            & (min_view_conf >= args.consistency_min_conf)
-        )
-
-        # High-confidence fallback prevents an empty target batch while still
-        # requiring both teacher views to agree.
-        if not torch.any(reliable):
-            fallback = agreement & (confidence >= args.fallback_conf)
-            if torch.any(fallback):
-                fallback_indices = fallback.nonzero(as_tuple=False).squeeze(1)
-                best_local = confidence.index_select(0, fallback_indices).argmax()
-                reliable[fallback_indices[best_local]] = True
-
-        # Reliability and mild inverse-prior weighting are both bounded.
-        uniform = torch.full_like(prior, 1.0 / float(prior.numel()))
-        balance = torch.pow(
-            uniform.to(weak1.device)
-            / prior.to(weak1.device).clamp_min(1e-6),
-            args.distribution_power * 0.5,
-        )
-        balance = torch.clamp(
-            balance,
-            min=1.0 / args.distribution_ratio_max,
-            max=args.distribution_ratio_max,
-        )
-        class_weight = balance.index_select(0, pseudo_targets)
-        pseudo_weight = torch.sqrt(
-            (confidence * min_view_conf).clamp_min(0.0)
-        ) * class_weight
-        pseudo_weight = torch.clamp(
-            pseudo_weight, min=0.0, max=args.pseudo_weight_max
-        )
-        pseudo_weight = pseudo_weight * reliable.float()
-
-    return pseudo_targets, reliable.float(), pseudo_weight, int(agreement.sum().item())
+def backward_and_step(loss, model, optimizer, grad_clip):
+    """Never write NaN/Inf parameters into the student, teacher or memory."""
+    if not torch.isfinite(loss):
+        raise FloatingPointError('Non-finite training loss; optimizer was not stepped.')
+    loss.backward()
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    if not torch.isfinite(grad_norm):
+        optimizer.zero_grad()
+        raise FloatingPointError('Non-finite gradients; optimizer was not stepped.')
+    optimizer.step()
 
 
 def evaluate(model, loader, criterion, num_samples, epoch, split_name):
@@ -283,11 +284,12 @@ def evaluate(model, loader, criterion, num_samples, epoch, split_name):
     bingo_cnt = 0
     preds, labels = [], []
 
+    device = next(model.parameters()).device
     model.eval()
     with torch.no_grad():
         for imgs, targets in loader:
-            imgs = imgs.cuda(non_blocking=True)
-            targets = targets.cuda(non_blocking=True)
+            imgs = imgs.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
             out, _ = model(imgs, targets, None, mode='test')
             loss = torch.mean(criterion(out, targets))
             val_loss += loss.item()
@@ -325,7 +327,11 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch, best_val_acc,
 
 def run_training():
     args = parse_args()
-    model_path = os.path.join('./models', args.data1 + '_' + args.data2)
+    device = torch.device(('cuda' if torch.cuda.is_available() else 'cpu')
+                          if args.device == 'auto' else args.device)
+    if device.type == 'cuda' and not torch.cuda.is_available():
+        raise RuntimeError('CUDA was requested but is unavailable.')
+    model_path = os.path.join(args.output_dir, args.data1 + '_' + args.data2)
     os.makedirs(model_path, exist_ok=True)
 
     # Use distinct checkpoint names so this branch cannot overwrite the saved
@@ -349,14 +355,9 @@ def run_training():
            args.lambda_target, args.lambda_aff))
     print('---------------------------------------------------------------------------------------')
 
-    if args.backbone == 'resnet18':
-        train_batch, test_batch = 128, 128
-    elif args.backbone == 'resnet50':
-        train_batch, test_batch = 128, 100
-    elif args.backbone == 'mobilenet_v2':
-        train_batch, test_batch = 128, 128
-    else:
+    if args.backbone not in {'mobilenet_v2', 'resnet18', 'resnet50'}:
         raise ValueError('Backbone Error!')
+    train_batch, test_batch = args.batch_size, args.eval_batch_size
 
     weak_transform, strong_transform, test_transform = build_transforms()
 
@@ -404,33 +405,38 @@ def run_training():
 
     class_num = 7
 
+    if len(source_train) < 2:
+        raise ValueError('Source training needs at least two images for BatchNorm.')
+
     train_loader_source = torch.utils.data.DataLoader(
         source_train, batch_size=train_batch, num_workers=args.workers,
-        shuffle=True, pin_memory=True, worker_init_fn=_init_fn,
+        drop_last=(len(source_train) % train_batch == 1),
+        shuffle=True, pin_memory=(device.type == 'cuda'), worker_init_fn=_init_fn,
     )
     train_loader_target = torch.utils.data.DataLoader(
         target_train, batch_size=train_batch, num_workers=args.workers,
-        shuffle=True, pin_memory=True, worker_init_fn=_init_fn,
+        shuffle=True, pin_memory=(device.type == 'cuda'), worker_init_fn=_init_fn,
     )
     threshold_loader_target = torch.utils.data.DataLoader(
         target_threshold, batch_size=test_batch, num_workers=args.workers,
-        shuffle=False, pin_memory=True, worker_init_fn=_init_fn,
+        shuffle=False, pin_memory=(device.type == 'cuda'), worker_init_fn=_init_fn,
     )
     val_loader_target = torch.utils.data.DataLoader(
         target_val, batch_size=test_batch, num_workers=args.workers,
-        shuffle=False, pin_memory=True,
+        shuffle=False, pin_memory=(device.type == 'cuda'),
     )
     test_loader_target = torch.utils.data.DataLoader(
         target_test, batch_size=test_batch, num_workers=args.workers,
-        shuffle=False, pin_memory=True,
+        shuffle=False, pin_memory=(device.type == 'cuda'),
     )
 
     model = Networks.Model(
         backbone=args.backbone,
         num_classes=class_num,
+        pretrained=not args.no_pretrained and not args.checkpoint,
         class_weight_max=args.class_weight_max,
         loss_clip=args.loss_clip,
-    ).cuda()
+    ).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
@@ -438,7 +444,7 @@ def run_training():
 
     if args.checkpoint:
         print('Loading pretrained weights...', args.checkpoint)
-        checkpoint = torch.load(args.checkpoint, map_location='cuda')
+        checkpoint = torch.load(args.checkpoint, map_location=device)
         model.load_state_dict(checkpoint['model'], strict=True)
 
     # ------------------------------------------------------------------
@@ -456,8 +462,8 @@ def run_training():
         sample_count = 0
 
         for imgs, targets in train_loader_source:
-            imgs = imgs.cuda(non_blocking=True)
-            targets = targets.cuda(non_blocking=True)
+            imgs = imgs.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
 
             optimizer.zero_grad()
             output = model(imgs, targets, None, 'train', 'source')
@@ -469,9 +475,7 @@ def run_training():
                 + ddrl_loss * args.w2
                 + weight_loss * args.w3
             )
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            optimizer.step()
+            backward_and_step(loss, model, optimizer, args.grad_clip)
 
             predicts = torch.argmax(output[0], dim=1)
             bingo_cnt += torch.eq(predicts, targets).sum().item()
@@ -502,10 +506,23 @@ def run_training():
             )
             print('best source-stage validation accuracy %.4f' % best_source_val_acc)
 
-    checkpoint = torch.load(source_best_path, map_location='cuda')
-    model.load_state_dict(checkpoint['model'])
-    optimizer.load_state_dict(checkpoint['optimizer'])
-    scheduler.load_state_dict(checkpoint['scheduler'])
+    if args.pre_epochs > 0:
+        checkpoint = torch.load(source_best_path, map_location=device)
+        model.load_state_dict(checkpoint['model'])
+    else:
+        # --checkpoint has already loaded the requested source model. Never
+        # silently pick up a stale source_best file from an earlier run.
+        best_source_val_acc = evaluate(
+            model, val_loader_target, criterion, len(target_val), -1, 'Validation'
+        )
+        save_checkpoint(source_best_path, model, optimizer, scheduler, -1,
+                        best_source_val_acc, args)
+
+    # A separate optimizer prevents source-stage decay/moments from suppressing
+    # adaptation. --target_lr controls this stage independently.
+    target_lr = args.lr if args.target_lr is None else args.target_lr
+    optimizer = torch.optim.Adam(model.parameters(), target_lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
 
     # ------------------------------------------------------------------
     # Stage 2: Dual-view EMA teacher + improved DDRL/CCDR.
@@ -514,7 +531,7 @@ def run_training():
     prototypes = PrototypeMemory(
         num_classes=class_num,
         feature_dim=model.feature_dim,
-        device=torch.device('cuda'),
+        device=device,
         momentum=args.prototype_momentum,
         margin=args.prototype_margin,
     )
@@ -566,15 +583,16 @@ def run_training():
                 source_train_iter = iter(train_loader_source)
                 source_imgs, source_targets = next(source_train_iter)
 
-            weak1 = weak1.cuda(non_blocking=True)
-            weak2 = weak2.cuda(non_blocking=True)
-            strong = strong.cuda(non_blocking=True)
-            source_imgs = source_imgs.cuda(non_blocking=True)
-            source_targets = source_targets.cuda(non_blocking=True)
+            weak1 = weak1.to(device, non_blocking=True)
+            weak2 = weak2.to(device, non_blocking=True)
+            strong = strong.to(device, non_blocking=True)
+            source_imgs = source_imgs.to(device, non_blocking=True)
+            source_targets = source_targets.to(device, non_blocking=True)
 
-            pseudo_targets, target_mask, pseudo_weights, agree_count = (
+            pseudo_targets, target_mask, pseudo_weights, agree_count, teacher_target_features = (
                 generate_dual_view_pseudo_labels(
-                    teacher, weak1, weak2, thresholds, target_prior, args
+                    teacher, weak1, weak2, thresholds, target_prior, args,
+                    return_features=True,
                 )
             )
             agreement_num += agree_count
@@ -585,7 +603,7 @@ def run_training():
                 pseudo_distribution[c] += int(np.sum(reliable_cpu == c))
 
             source_mask = torch.ones(
-                source_imgs.size(0), dtype=target_mask.dtype, device='cuda'
+                source_imgs.size(0), dtype=target_mask.dtype, device=device
             )
             train_imgs = torch.cat((source_imgs, strong), dim=0)
             train_targets = torch.cat((source_targets, pseudo_targets), dim=0)
@@ -606,15 +624,9 @@ def run_training():
             target_logits = output[0][source_count:]
             source_cls_loss = criterion(source_logits, source_targets).mean()
 
-            if torch.any(target_mask > 0):
-                target_ce = criterion(target_logits, pseudo_targets)
-                effective_weight = pseudo_weights * target_mask
-                target_cls_loss = (
-                    (target_ce * effective_weight).sum()
-                    / effective_weight.sum().clamp_min(1e-6)
-                )
-            else:
-                target_cls_loss = target_logits.sum() * 0.0
+            target_cls_loss = weighted_mean_loss(
+                criterion(target_logits, pseudo_targets), pseudo_weights * target_mask
+            )
 
             cls_loss = source_cls_loss + target_weight * target_cls_loss
             ddrl_loss = output[1]
@@ -623,12 +635,13 @@ def run_training():
             weight_loss = classifier_modulation_loss(model)
 
             all_features = output[2]
-            source_features = all_features[:source_count]
             target_features = all_features[source_count:]
 
-            # Source truth anchors prototypes; target samples contribute only
-            # if both EMA views agree and pass the class-wise threshold.
-            prototypes.update(source_features, source_targets)
+            # Use eval-mode EMA features (no dropout / strong-view noise) for
+            # stable memory anchors; live student features receive affinity gradients.
+            with torch.no_grad():
+                _, teacher_source_features = teacher(source_imgs, mode='test')
+            prototypes.update(teacher_source_features, source_targets)
             reliable = target_mask.bool()
             if torch.any(reliable):
                 proto_loss = prototypes.loss(
@@ -645,18 +658,12 @@ def run_training():
                 + proto_weight * proto_loss
                 + args.w3 * weight_loss
             )
-            loss = torch.nan_to_num(
-                loss, nan=0.0, posinf=args.loss_clip, neginf=-args.loss_clip
-            )
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            optimizer.step()
+            backward_and_step(loss, model, optimizer, args.grad_clip)
 
-            # Update target prototype memory only after the student step, using
-            # detached reliable features so pseudo-label noise cannot backprop.
+            # Only reliable weak-view teacher features enter target memory.
             if torch.any(reliable):
                 prototypes.update(
-                    target_features[reliable],
+                    teacher_target_features[reliable],
                     pseudo_targets[reliable],
                     pseudo_weights[reliable],
                 )
@@ -713,11 +720,11 @@ def run_training():
             print('best target-stage validation accuracy %.4f' % best_target_val_acc)
 
     if args.epochs > 0:
-        checkpoint = torch.load(target_best_path, map_location='cuda')
+        checkpoint = torch.load(target_best_path, map_location=device)
         model.load_state_dict(checkpoint['model'])
         selected_val_acc = best_target_val_acc
     else:
-        checkpoint = torch.load(source_best_path, map_location='cuda')
+        checkpoint = torch.load(source_best_path, map_location=device)
         model.load_state_dict(checkpoint['model'])
         selected_val_acc = best_source_val_acc
 

@@ -12,3 +12,7 @@ Ubuntu 16.04 LTS, python 3.8, pytorch 1.8.1
 [SFEW](https://paperswithcode.com/dataset/sfew),
 [FER2013](https://paperswithcode.com/dataset/fer2013)
 
+
+## MobileNetV2 dual-view EMA branch
+
+See [implementation changes and training commands](IMPROVEMENTS.md) and the behavioral tests in `tests/test_cast.py`.

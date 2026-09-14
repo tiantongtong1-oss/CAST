@@ -3,13 +3,23 @@ import torch
 from torchvision import models
 
 
+def build_backbone(name, pretrained):
+    """Keep legacy ImageNet V1 initialization and support both torchvision APIs."""
+    enums = {'mobilenet_v2': 'MobileNet_V2_Weights',
+             'resnet18': 'ResNet18_Weights', 'resnet50': 'ResNet50_Weights'}
+    builder = getattr(models, name)
+    weights_enum = getattr(models, enums[name], None)
+    if weights_enum is not None:
+        return builder(weights=weights_enum.IMAGENET1K_V1 if pretrained else None)
+    return builder(pretrained=pretrained)
+
+
 def compute_kernel_matrix(source, target, kernel_mul=2.0, kernel_num=5):
     """Multi-kernel Gaussian matrix used by MK-MMD."""
     n_samples = int(source.size(0)) + int(target.size(0))
     total = torch.cat([source, target], dim=0)
-    total0 = total.unsqueeze(0).expand(total.size(0), total.size(0), total.size(1))
-    total1 = total.unsqueeze(1).expand(total.size(0), total.size(0), total.size(1))
-    l2_distance = ((total0 - total1) ** 2).sum(2)
+    # Materialize only N x N distances, not an N x N x feature_dim tensor.
+    l2_distance = torch.cdist(total, total, p=2).pow(2)
 
     if n_samples <= 1:
         return torch.zeros_like(l2_distance)
@@ -27,7 +37,7 @@ def mmd_loss(source_features, target_features):
     ns = source_features.size(0)
     nt = target_features.size(0)
     if ns < 2 or nt < 2:
-        return source_features.new_tensor(0.0)
+        return (source_features.sum() + target_features.sum()) * 0.0
 
     kernels = compute_kernel_matrix(source_features, target_features)
     xx = kernels[:ns, :ns]
@@ -69,7 +79,7 @@ class Model(nn.Module):
 
         if backbone == 'resnet18':
             self.feature = nn.Sequential(
-                *list(models.resnet18(pretrained=pretrained).children())[:-1],
+                *list(build_backbone('resnet18', pretrained).children())[:-1],
                 nn.Flatten(),
                 nn.Dropout(drop_rate)
             )
@@ -78,7 +88,7 @@ class Model(nn.Module):
 
         elif backbone == 'resnet50':
             self.feature = nn.Sequential(
-                *list(models.resnet50(pretrained=pretrained).children())[:-1],
+                *list(build_backbone('resnet50', pretrained).children())[:-1],
                 nn.Flatten(),
                 nn.Dropout(drop_rate),
                 nn.Linear(2048, 512)
@@ -88,7 +98,7 @@ class Model(nn.Module):
 
         elif backbone == 'mobilenet_v2':
             self.feature = nn.Sequential(
-                *list(models.mobilenet_v2(pretrained=pretrained).children())[:-1],
+                *list(build_backbone('mobilenet_v2', pretrained).children())[:-1],
                 nn.AdaptiveAvgPool2d(1),
                 nn.Flatten(),
                 nn.Dropout(drop_rate),
@@ -116,7 +126,8 @@ class Model(nn.Module):
         out = self.bn(self.fc(fea))
 
         if mode != 'train':
-            return out, fea.cpu()
+            # Teacher features stay on-device for prototype memory updates.
+            return out, fea
 
         if task == 'source':
             features = self.split_feature_makeLD(fea, targets)
@@ -137,20 +148,21 @@ class Model(nn.Module):
             if idx is None or source_count is None:
                 raise ValueError('Target training requires confidence mask idx and source_count.')
 
-            valid_idx = (idx > 0).nonzero(as_tuple=False).squeeze(1)
-            if valid_idx.numel() == 0:
+            source_count = int(source_count)
+            if not 0 <= source_count <= fea.size(0):
+                raise ValueError('source_count must partition the original batch.')
+            source_mask = idx[:source_count] > 0
+            target_mask = idx[source_count:] > 0
+            source_fea = fea[:source_count][source_mask]
+            source_targets = targets[:source_count][source_mask]
+            target_fea = fea[source_count:][target_mask]
+            target_targets = targets[source_count:][target_mask]
+            if source_fea.size(0) + target_fea.size(0) == 0:
                 zero = fea.sum() * 0.0
                 return [out, zero, fea, zero, zero]
 
-            fea_selected = torch.index_select(fea, 0, valid_idx)
-            targets_selected = torch.index_select(targets, 0, valid_idx)
-
-            # Source samples are concatenated first and are always reliable.
-            source_count = min(int(source_count), fea_selected.size(0))
-            source_fea = fea_selected[:source_count]
-            source_targets = targets_selected[:source_count]
-            target_fea = fea_selected[source_count:]
-            target_targets = targets_selected[source_count:]
+            fea_selected = torch.cat((source_fea, target_fea), dim=0)
+            targets_selected = torch.cat((source_targets, target_targets), dim=0)
 
             source_features = self.split_feature_makeLD(source_fea, source_targets)
             target_features = self.split_feature_makeLD(target_fea, target_targets)
@@ -159,25 +171,28 @@ class Model(nn.Module):
 
             intra_loss = fea.new_tensor(0.0)
             inter_loss = fea.new_tensor(0.0)
+            aligned_classes = separated_classes = 0
 
             for i in range(self.num_classes):
                 fea_s = source_features[i]
                 fea_t = target_features[i]
                 if fea_s.size(0) >= 2 and fea_t.size(0) >= 2:
                     intra_loss += mmd_loss(fea_s, fea_t) * eta[i]
+                    aligned_classes += 1
 
                 class_features = all_features[i]
                 other_features = remove_element(all_features, i)
                 if class_features.size(0) >= 2 and other_features.size(0) >= 2:
                     inter_loss += mmd_loss(class_features, other_features) * eta[i]
+                    separated_classes += 1
 
-            domain_alignment_loss = intra_loss / self.num_classes
-            class_enhancement_loss = -inter_loss / self.num_classes
-            ddrl_loss = domain_alignment_loss + class_enhancement_loss
+            # Missing classes must not dilute the available constraints.
+            domain_alignment_loss = intra_loss / max(aligned_classes, 1)
+            class_enhancement_loss = -inter_loss / max(separated_classes, 1)
 
             domain_alignment_loss = self._stabilize_loss(domain_alignment_loss)
             class_enhancement_loss = self._stabilize_loss(class_enhancement_loss)
-            ddrl_loss = self._stabilize_loss(ddrl_loss)
+            ddrl_loss = domain_alignment_loss + class_enhancement_loss
             return [out, ddrl_loss, fea,
                     domain_alignment_loss, class_enhancement_loss]
 

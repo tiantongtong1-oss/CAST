@@ -45,6 +45,46 @@ def distribution_align(probs, prior, power=0.5, ratio_max=3.0):
     return corrected / corrected.sum(dim=1, keepdim=True).clamp_min(1e-12)
 
 
+def align_dual_view_probabilities(probs1, probs2, prior, power=0.5, ratio_max=3.0):
+    """Use identical per-view correction for global statistics and batch labels."""
+    return (distribution_align(probs1, prior, power, ratio_max),
+            distribution_align(probs2, prior, power, ratio_max))
+
+
+def weighted_mean_loss(losses, weights):
+    """Normalize by effective weight; an empty mask has zero loss and gradient."""
+    weights = weights.detach().to(losses).clamp_min(0.0)
+    selected = torch.where(weights > 0, losses, torch.zeros_like(losses))
+    return (selected * weights).sum() / weights.sum().clamp_min(1e-6)
+
+
+def select_dual_view_pseudo_labels(probs1, probs2, thresholds, prior, args):
+    """Select corrected predictions, including a strict two-view fallback."""
+    conf1, pred1 = probs1.max(dim=1)
+    conf2, pred2 = probs2.max(dim=1)
+    confidence, labels = ((probs1 + probs2) * 0.5).max(dim=1)
+    agreement = pred1.eq(pred2) & pred1.eq(labels)
+    min_conf = torch.minimum(conf1, conf2)
+    reliable = (agreement & (confidence >= thresholds.to(probs1)[labels])
+                & (min_conf >= args.consistency_min_conf))
+    if not torch.any(reliable):
+        # Do not let one very confident view hide an uncertain second view.
+        fallback = agreement & (min_conf >= max(args.fallback_conf,
+                                                args.consistency_min_conf))
+        if torch.any(fallback):
+            indices = fallback.nonzero(as_tuple=False).squeeze(1)
+            best = confidence[indices].argmax()
+            reliable[indices[best]] = True
+
+    prior = prior.to(probs1).clamp_min(1e-6)
+    balance = ((1.0 / prior.numel()) / prior).pow(args.distribution_power * 0.5)
+    balance = balance.clamp(1.0 / args.distribution_ratio_max,
+                            args.distribution_ratio_max)
+    weights = (confidence * min_conf).clamp_min(0.0).sqrt() * balance[labels]
+    weights = weights.clamp(0.0, args.pseudo_weight_max) * reliable.float()
+    return labels, reliable.float(), weights, int(agreement.sum().item())
+
+
 class PrototypeMemory:
     """EMA class prototypes used by the improved target affinity loss."""
 
@@ -74,13 +114,22 @@ class PrototypeMemory:
                 continue
 
             class_features = features[mask]
+            finite = torch.isfinite(class_features).all(dim=1)
+            finite &= class_features.norm(dim=1) > 1e-6
+            class_features = class_features[finite]
+            if class_features.size(0) == 0:
+                continue
             if sample_weights is None:
                 center = class_features.mean(dim=0)
             else:
-                weights = sample_weights[mask].clamp_min(0.0)
-                denom = weights.sum().clamp_min(1e-6)
+                weights = sample_weights[mask][finite].clamp_min(0.0)
+                if not torch.isfinite(weights).all() or weights.sum() <= 1e-6:
+                    continue
+                denom = weights.sum()
                 center = (class_features * weights.unsqueeze(1)).sum(dim=0) / denom
 
+            if center.norm() <= 1e-6:
+                continue
             center = F.normalize(center.unsqueeze(0), dim=1).squeeze(0)
             if self.initialized[c]:
                 center = (
@@ -102,27 +151,18 @@ class PrototypeMemory:
 
         features_valid = F.normalize(features[valid], dim=1)
         labels_valid = labels[valid]
-        prototypes_valid = self.prototypes.index_select(0, labels_valid).detach()
-        compact_loss = 1.0 - torch.sum(features_valid * prototypes_valid, dim=1)
-
-        if sample_weights is not None:
-            weights = sample_weights[valid].clamp_min(0.0)
-            compact_loss = (compact_loss * weights).sum() / weights.sum().clamp_min(1e-6)
-        else:
-            compact_loss = compact_loss.mean()
-
-        initialized_prototypes = self.prototypes[self.initialized]
-        if initialized_prototypes.size(0) >= 2:
-            initialized_prototypes = F.normalize(initialized_prototypes, dim=1)
-            cosine = initialized_prototypes.mm(initialized_prototypes.t())
-            off_diagonal = ~torch.eye(
-                cosine.size(0), dtype=torch.bool, device=cosine.device
-            )
-            separation_loss = F.relu(cosine[off_diagonal] - self.margin).mean()
-        else:
-            separation_loss = compact_loss.new_tensor(0.0)
-
-        total = compact_loss + separation_loss
+        # Prototypes are fixed anchors; BOTH terms must depend on live student
+        # features. Comparing memory prototypes to each other has no gradient.
+        similarity = features_valid.mm(self.prototypes.detach().t())
+        positive = similarity.gather(1, labels_valid.unsqueeze(1)).squeeze(1)
+        compact = (1.0 - positive).clamp_min(0.0)
+        negatives = self.initialized.unsqueeze(0).expand_as(similarity).clone()
+        negatives.scatter_(1, labels_valid.unsqueeze(1), False)
+        separation = F.relu(similarity - positive.unsqueeze(1) + self.margin)
+        separation = (separation * negatives).sum(dim=1) / negatives.sum(dim=1).clamp_min(1)
+        per_sample = compact + separation
+        total = (weighted_mean_loss(per_sample, sample_weights[valid])
+                 if sample_weights is not None else per_sample.mean())
         return torch.nan_to_num(total, nan=0.0, posinf=5.0, neginf=-5.0).clamp(-5.0, 5.0)
 
     def state_dict(self):
