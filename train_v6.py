@@ -5,6 +5,7 @@ import json
 import os
 import random
 import time
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -203,6 +204,7 @@ def main():
         start["acc"], [round(x, 4) for x in start["class_acc"]], start["predicted"]
     ))
 
+    # Use pseudo loader (weak1 is batch[0]) for BN recalibration. Only backbone BN2d is updated.
     seen = recalibrate_backbone_bn(
         student, target_pseudo_loader, device,
         batches=args.bn_recalibrate_batches,
@@ -228,6 +230,7 @@ def main():
     collapse_streak = 0
 
     for epoch in range(args.epochs):
+        # ----- Module 2: first forward, whole-target EMA pseudo-label generation -----
         bank = build_pseudo_bank(
             teacher.model,
             target_pseudo_loader,
@@ -246,10 +249,11 @@ def main():
         )
         print_pseudo_log(epoch, bank)
         health = prediction_health(bank.predicted_counts, bank.selected_counts, len(target_pseudo))
-        print("[Epoch %d][Health] max_pred_ratio=%.4f pred_entropy=%.4f selected_classes=%d selected_ratio=%.4f status=%s" % (
-            epoch, health["max_pred_ratio"], health["pred_entropy"], health["selected_classes"],
-            health["selected_ratio"], health["status"]
-        ))
+        print("[Epoch %d][Health] max_pred_ratio=%.4f pred_entropy=%.4f selected_classes=%d "
+              "selected_ratio=%.4f status=%s" % (
+                  epoch, health["max_pred_ratio"], health["pred_entropy"], health["selected_classes"],
+                  health["selected_ratio"], health["status"]
+              ))
 
         if health["status"] != "OK":
             collapse_streak += 1
@@ -259,7 +263,9 @@ def main():
             print("[ABORT] Health checks failed for two consecutive epochs. Stop before self-training amplifies collapse.")
             break
 
+        # ----- Modules 1/3/4: second forward + backward -----
         student.train()
+        # Keep every BN running buffer fixed during target adaptation. Dropout remains in train mode.
         freeze_bn_stats(student, freeze_affine=False)
         source_iter = iter(source_train_loader)
 
@@ -297,6 +303,7 @@ def main():
             src_ce = F.cross_entropy(slogits, sy)
             tgt_ce_value = target_ce(tlogits, py, pw, pm)
             cls_loss = src_ce + args.target_lambda * tgt_ce_value
+
             cscm_loss, mean_cos = classifier_modulation_loss(student.fc.weight)
 
             if int(pm.sum().item()) > 0:
@@ -355,12 +362,14 @@ def main():
             epoch, avg["ddrl_intra"], avg["ddrl_inter"], avg["ddrl"],
             last_ddrl["intra_classes"], avg["w2"]
         ))
-        print("[Epoch %d][Train] source_ce=%.4f target_ce=%.4f cls=%.4f ddrl=%.4f cscm=%.4f total=%.4f grad_norm=%.4f lr_backbone=%.7f lr_head=%.7f ema_decay=%.6f" % (
-            epoch, avg["src_ce"], avg["tgt_ce"], avg["cls"], avg["ddrl"], avg["cscm"],
-            avg["total"], avg["grad"], optimizer.param_groups[0]["lr"],
-            optimizer.param_groups[1]["lr"], ema_decay_used
-        ))
+        print("[Epoch %d][Train] source_ce=%.4f target_ce=%.4f cls=%.4f ddrl=%.4f cscm=%.4f "
+              "total=%.4f grad_norm=%.4f lr_backbone=%.7f lr_head=%.7f ema_decay=%.6f" % (
+                  epoch, avg["src_ce"], avg["tgt_ce"], avg["cls"], avg["ddrl"], avg["cscm"],
+                  avg["total"], avg["grad"], optimizer.param_groups[0]["lr"],
+                  optimizer.param_groups[1]["lr"], ema_decay_used
+              ))
 
+        # Evaluation is separated from model selection. Test labels never affect optimization.
         student_test = evaluate(student, target_test_loader, device)
         teacher_test = evaluate(teacher.model, target_test_loader, device)
         print("[Epoch %d][Eval][Student] acc=%.4f class_acc=%s predicted=%s" % (
@@ -403,7 +412,7 @@ def main():
         if target_val_loader is not None:
             val_metrics = evaluate(teacher.model, target_val_loader, device)
             print("[Epoch %d][Val][EMA] acc=%.4f class_acc=%s" % (
-                epoch, val_metrics["acc"], [round(x, 4) for x in val_metrics["class_acc"]
+                epoch, val_metrics["acc"], [round(x, 4) for x in val_metrics["class_acc"]]
             ))
             if val_metrics["acc"] > best_val:
                 best_val = val_metrics["acc"]
