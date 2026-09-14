@@ -17,7 +17,14 @@ except Exception:  # pragma: no cover
     RandAugmentMC = None
 
 
+# CAST/RAF internal label order used by the paper code and RAF checkpoint.
 CAST_CLASS_NAMES = ("surprise", "fear", "disgust", "happy", "sad", "angry", "neutral")
+
+# Canonical FER2013/Kaggle numeric folder order is:
+# 0 angry, 1 disgust, 2 fear, 3 happy, 4 sad, 5 surprise, 6 neutral.
+# The original CAST repository reads the folder number directly while using the
+# RAF class semantics above, so a canonical FER2013 directory must be remapped
+# before it can share the RAF classifier head.
 KAGGLE_TO_CAST = {0: 5, 1: 2, 2: 1, 3: 3, 4: 4, 5: 0, 6: 6}
 
 
@@ -177,7 +184,7 @@ def _fer_paths_labels(root: str, split: str, folder_order: str) -> Tuple[List[st
 
 
 def build_fer2013(root: str, split: str, mode: str | None = None,
-                   folder_order: str = "cast") -> MultiViewDataset:
+                   folder_order: str = "kaggle") -> MultiViewDataset:
     if folder_order not in ("cast", "kaggle"):
         raise ValueError("folder_order must be 'cast' or 'kaggle'")
     weak, strong, test = build_transforms()
