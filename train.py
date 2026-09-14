@@ -37,7 +37,7 @@ def parse_args():
     parser.add_argument('--source_path', type=str,
                         default='/workspace/ttt/code/test-upload-clean/datesets/raf-basic')
     parser.add_argument('--target_path', type=str,
-                        default='/workspace/ttt/code/test-upload-clean/datesets/fer2013')
+                        default='/workspace/ttt/code/data/fer2013')
     parser.add_argument('-c', '--checkpoint', type=str, default=None, help='load model')
     parser.add_argument('--backbone', type=str, default='resnet18',
                         help='resnet18, resnet50 or mobilenet_v2')
@@ -193,9 +193,14 @@ def run_training():
     args = parse_args()
     model_path = os.path.join('./models', args.data1 + '_' + args.data2)
     os.makedirs(model_path, exist_ok=True)
-    best_path = os.path.join(
+
+    source_best_path = os.path.join(
         model_path,
-        args.backbone + '_' + args.data1 + '_' + args.data2 + '_best.pth'
+        args.backbone + '_' + args.data1 + '_' + args.data2 + '_source_best.pth'
+    )
+    target_best_path = os.path.join(
+        model_path,
+        args.backbone + '_' + args.data1 + '_' + args.data2 + '_target_best.pth'
     )
 
     print('---------------------------------------------------------------------------------------')
@@ -314,7 +319,7 @@ def run_training():
     # ----------------------------------------------------------------------
     # Stage 1: source-domain pre-training (30 epochs in the paper).
     # ----------------------------------------------------------------------
-    best_val_acc = -1.0
+    best_source_val_acc = -1.0
     for i in range(args.pre_epochs):
         model.train()
         train_loss1 = 0.0
@@ -358,21 +363,27 @@ def run_training():
         val_acc = evaluate(
             model, val_loader_target, criterion, len(target_val), i, 'Validation'
         )
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            save_checkpoint(best_path, model, optimizer, scheduler, i, best_val_acc, args)
-            print('best validation accuracy %.4f' % best_val_acc)
+        if val_acc > best_source_val_acc:
+            best_source_val_acc = val_acc
+            save_checkpoint(
+                source_best_path, model, optimizer, scheduler, i,
+                best_source_val_acc, args
+            )
+            print('best source-stage validation accuracy %.4f' % best_source_val_acc)
 
     # Transfer starts from the best source-pretrained checkpoint selected on
     # the target validation split, never from the target test split.
-    checkpoint = torch.load(best_path, map_location='cuda')
+    checkpoint = torch.load(source_best_path, map_location='cuda')
     model.load_state_dict(checkpoint['model'])
     optimizer.load_state_dict(checkpoint['optimizer'])
     scheduler.load_state_dict(checkpoint['scheduler'])
 
     # ----------------------------------------------------------------------
     # Stage 2: target-domain class-adaptive self-training (30 epochs).
+    # Use an independent best metric/checkpoint for this stage so a strong
+    # source-only validation score cannot prevent adapted models from saving.
     # ----------------------------------------------------------------------
+    best_target_val_acc = -1.0
     for i in range(args.epochs):
         thresholds = calculate_target_thresholds(
             model,
@@ -447,19 +458,32 @@ def run_training():
         val_acc = evaluate(
             model, val_loader_target, criterion, len(target_val), i, 'Validation'
         )
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            save_checkpoint(best_path, model, optimizer, scheduler, i, best_val_acc, args)
-            print('best validation accuracy %.4f' % best_val_acc)
+        if val_acc > best_target_val_acc:
+            best_target_val_acc = val_acc
+            save_checkpoint(
+                target_best_path, model, optimizer, scheduler, i,
+                best_target_val_acc, args
+            )
+            print('best target-stage validation accuracy %.4f' % best_target_val_acc)
 
-    # Paper protocol: select/monitor with validation data, then report the
-    # target TEST split exactly once using the selected checkpoint.
-    checkpoint = torch.load(best_path, map_location='cuda')
-    model.load_state_dict(checkpoint['model'])
+    # Paper protocol: monitor/select using validation data, then report the
+    # target TEST split exactly once using the best adapted checkpoint.
+    if args.epochs > 0:
+        checkpoint = torch.load(target_best_path, map_location='cuda')
+        model.load_state_dict(checkpoint['model'])
+        selected_val_acc = best_target_val_acc
+    else:
+        checkpoint = torch.load(source_best_path, map_location='cuda')
+        model.load_state_dict(checkpoint['model'])
+        selected_val_acc = best_source_val_acc
+
     test_acc = evaluate(
         model, test_loader_target, criterion, len(target_test), args.epochs, 'Test'
     )
-    print('best validation accuracy %.4f' % best_val_acc)
+    print('best source-stage validation accuracy %.4f' % best_source_val_acc)
+    if args.epochs > 0:
+        print('best target-stage validation accuracy %.4f' % best_target_val_acc)
+    print('selected validation accuracy %.4f' % selected_val_acc)
     print('final target test accuracy %.4f' % test_acc)
     return test_acc
 
