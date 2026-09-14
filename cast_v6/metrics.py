@@ -24,11 +24,16 @@ def _fmt(values, ndigits=4):
 
 
 def print_pseudo_log(epoch: int, bank) -> None:
+    """Print the compact pseudo-label summary.
+
+    v6.2 renamed the old, ambiguous ``pseudo_class_accuracy`` diagnostic to
+    ``pseudo_precision`` and ``pseudo_recall``.  Precision/recall are printed by
+    train_v6.py's dedicated PseudoQuality line, so this compact line only adds
+    overall pseudo accuracy and must not depend on the removed v6.1 attribute.
+    """
     extra = ""
     if bank.pseudo_accuracy is not None:
-        extra = " pseudo_acc=%.4f class_acc=%s" % (
-            bank.pseudo_accuracy, _fmt(bank.pseudo_class_accuracy)
-        )
+        extra = " pseudo_acc=%.4f" % bank.pseudo_accuracy
     print(
         "[Epoch %d][Pseudo] agreement=%.4f thresholds=%s predicted=%s selected=%s "
         "selected_total=%d ratio=%.4f%s"
