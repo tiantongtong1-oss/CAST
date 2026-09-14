@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader, Dataset
 from cast_v6.ccdr import class_volume_weights, classifier_modulation_loss
 from cast_v6.ddrl import ddrl_loss, mmd2
 from cast_v6.model import EMATeacher
-from cast_v6.pseudo import build_pseudo_bank
+from cast_v6.pseudo import build_pseudo_bank, source_class_correction
 
 
 def test_mmd_finite_and_small_for_identical_sets():
@@ -111,3 +111,21 @@ def test_pseudo_bank_catm_and_agreement():
     assert bank.pseudo_accuracy == 1.0
     assert sum(bank.predicted_counts) == len(ds)
     assert torch.isfinite(bank.thresholds).all()
+    assert bank.pseudo_precision == [1.0, 1.0, 1.0]
+    assert bank.pseudo_recall is not None
+
+
+def test_source_class_correction_only_uses_source_bias():
+    # Class 1 is strongly under-predicted and should be boosted; class 0 is
+    # over-predicted and should not be boosted.  No target distribution enters.
+    corr = source_class_correction(
+        class_total=[100, 100, 100],
+        predicted_counts=[160, 20, 120],
+        alpha=0.5,
+        min_correction=0.85,
+        max_correction=1.5,
+    )
+    assert len(corr) == 3
+    assert corr[1] > 1.0
+    assert corr[0] <= 1.0
+    assert all(0.85 <= x <= 1.5 for x in corr)
