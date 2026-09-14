@@ -5,7 +5,6 @@ import json
 import os
 import random
 import time
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -27,13 +26,13 @@ from cast_v6.pseudo import build_pseudo_bank
 
 
 def parse_args():
-    p = argparse.ArgumentParser("CAST v6 - modular dual-view EMA + DDRL + CCDR")
+    p = argparse.ArgumentParser("CAST v6.1 - balanced dual-view EMA + normalized DDRL + CCDR")
     p.add_argument("--source-root", required=True)
     p.add_argument("--target-root", required=True)
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--backbone", default="resnet50", choices=["resnet18", "resnet50", "mobilenet_v2"])
     p.add_argument("--fer-folder-order", default="cast", choices=["cast", "kaggle"])
-    p.add_argument("--epochs", type=int, default=30)
+    p.add_argument("--epochs", type=int, default=15)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--eval-batch-size", type=int, default=128)
     p.add_argument("--workers", type=int, default=10)
@@ -46,27 +45,34 @@ def parse_args():
     p.add_argument("--grad-clip", type=float, default=5.0)
 
     p.add_argument("--w1", type=float, default=4.0)
-    p.add_argument("--w2", type=float, default=0.03,
-                   help="Stable target DDRL weight. Paper reports beta=0.3; raise only after the pipeline is stable.")
+    p.add_argument("--w2", type=float, default=0.01,
+                   help="Stable DDRL weight after warmup. v6.1 keeps this conservative because MK-MMD is now scale-normalized.")
     p.add_argument("--w3", type=float, default=0.1)
     p.add_argument("--target-lambda", type=float, default=0.35)
     p.add_argument("--ddrl-min-class-samples", type=int, default=2)
     p.add_argument("--ddrl-min-classes", type=int, default=3)
     p.add_argument("--affinity-warmup", type=int, default=5)
     p.add_argument("--affinity-mid-epochs", type=int, default=5)
-    p.add_argument("--affinity-mid-weight", type=float, default=0.01)
+    p.add_argument("--affinity-mid-weight", type=float, default=0.005)
 
     p.add_argument("--ema-decay", type=float, default=0.999)
     p.add_argument("--temperature", type=float, default=0.0,
                    help="<=0 fits scalar temperature on RAF-DB test; >0 uses fixed value")
     p.add_argument("--phi", type=float, default=1.4)
-    p.add_argument("--threshold-cap", type=float, default=0.9)
+    p.add_argument("--threshold-cap", type=float, default=0.95)
     p.add_argument("--pseudo-min-margin", type=float, default=0.0)
     p.add_argument("--pseudo-max-entropy", type=float, default=1.0)
     p.add_argument("--pseudo-confidence-floor", type=float, default=0.0)
+    p.add_argument("--pseudo-keep-start", type=float, default=0.35)
+    p.add_argument("--pseudo-keep-end", type=float, default=0.55)
+    p.add_argument("--distribution-align-alpha", type=float, default=0.35)
+    p.add_argument("--distribution-align-max", type=float, default=2.0)
+    p.add_argument("--pseudo-class-weight-max", type=float, default=2.0)
 
-    p.add_argument("--bn-recalibrate-batches", type=int, default=64)
+    p.add_argument("--bn-recalibrate-batches", type=int, default=0,
+                   help="0 disables target BN recalibration. The audited RAF->FER run degraded slightly with BN recalibration.")
     p.add_argument("--bn-recalibrate-momentum", type=float, default=0.03)
+    p.add_argument("--early-stop-patience", type=int, default=4)
     p.add_argument("--debug-target-labels", action="store_true",
                    help="Log pseudo accuracy / per-epoch target metrics. Never used in optimization.")
     p.add_argument("--abort-on-collapse", action="store_true")
@@ -152,11 +158,11 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     stamp = time.strftime("%Y%m%d_%H%M%S")
     if not args.model_dir:
-        args.model_dir = os.path.join("models", "cast_resnet50_v6", stamp)
+        args.model_dir = os.path.join("models", "cast_resnet50_v6_1", stamp)
     os.makedirs(args.model_dir, exist_ok=True)
     logger = JsonlLogger(os.path.join(args.model_dir, "metrics.jsonl"))
 
-    print("CAST v6 configuration:", json.dumps(vars(args), sort_keys=True))
+    print("CAST v6.1 configuration:", json.dumps(vars(args), sort_keys=True))
     print("Device:", device)
 
     source_train = build_rafdb(args.source_root, "train", mode="train")
@@ -192,9 +198,16 @@ def main():
         len(load_info["missing"]), len(load_info["unexpected"])
     ))
 
+    # Source diagnostics are mandatory in v6.1 because target class starvation
+    # can originate in the source checkpoint itself.
+    source_metrics = evaluate(student, source_eval_loader, device)
+    print("[Source][RAF test] accuracy %.4f class_acc=%s predicted=%s" % (
+        source_metrics["acc"], [round(x, 4) for x in source_metrics["class_acc"]], source_metrics["predicted"]
+    ))
+
     if args.temperature <= 0:
         temperature, nll_before, nll_after = fit_temperature(student, source_eval_loader, device)
-        print("Source-validation temperature %.4f NLL %.4f -> %.4f" % (temperature, nll_before, nll_after))
+        print("Source-calibration temperature %.4f NLL %.4f -> %.4f" % (temperature, nll_before, nll_after))
     else:
         temperature = args.temperature
         print("Using fixed teacher temperature %.4f" % temperature)
@@ -204,7 +217,6 @@ def main():
         start["acc"], [round(x, 4) for x in start["class_acc"]], start["predicted"]
     ))
 
-    # Use pseudo loader (weak1 is batch[0]) for BN recalibration. Only backbone BN2d is updated.
     seen = recalibrate_backbone_bn(
         student, target_pseudo_loader, device,
         batches=args.bn_recalibrate_batches,
@@ -227,10 +239,10 @@ def main():
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=args.lr_gamma)
 
     best_val = -1.0
+    no_improve = 0
     collapse_streak = 0
 
     for epoch in range(args.epochs):
-        # ----- Module 2: first forward, whole-target EMA pseudo-label generation -----
         bank = build_pseudo_bank(
             teacher.model,
             target_pseudo_loader,
@@ -245,9 +257,22 @@ def main():
             min_margin=args.pseudo_min_margin,
             max_entropy=args.pseudo_max_entropy,
             confidence_floor=args.pseudo_confidence_floor,
+            keep_ratio_start=args.pseudo_keep_start,
+            keep_ratio_end=args.pseudo_keep_end,
+            distribution_align_alpha=args.distribution_align_alpha,
+            distribution_align_max=args.distribution_align_max,
+            class_balance_max=args.pseudo_class_weight_max,
             debug_target_labels=args.debug_target_labels,
         )
         print_pseudo_log(epoch, bank)
+        print("[Epoch %d][PseudoBalance] keep=%.4f raw_prior=%s correction=%s class_weights=%s" % (
+            epoch,
+            bank.keep_ratio,
+            [round(x, 4) for x in bank.raw_prior],
+            [round(x, 4) for x in bank.correction],
+            [round(x, 4) for x in bank.class_weights],
+        ))
+
         health = prediction_health(bank.predicted_counts, bank.selected_counts, len(target_pseudo))
         print("[Epoch %d][Health] max_pred_ratio=%.4f pred_entropy=%.4f selected_classes=%d "
               "selected_ratio=%.4f status=%s" % (
@@ -263,9 +288,7 @@ def main():
             print("[ABORT] Health checks failed for two consecutive epochs. Stop before self-training amplifies collapse.")
             break
 
-        # ----- Modules 1/3/4: second forward + backward -----
         student.train()
-        # Keep every BN running buffer fixed during target adaptation. Dropout remains in train mode.
         freeze_bn_stats(student, freeze_affine=False)
         source_iter = iter(source_train_loader)
 
@@ -273,7 +296,7 @@ def main():
                 "ddrl_intra": 0.0, "ddrl_inter": 0.0, "cscm": 0.0,
                 "cscm_cos": 0.0, "total": 0.0, "grad": 0.0, "w2": 0.0}
         batches = 0
-        last_ddrl = {"intra": 0.0, "inter": 0.0, "loss": 0.0,
+        last_ddrl = {"intra": 0.0, "inter": 0.0, "raw_loss": 0.0, "loss": 0.0,
                      "intra_classes": [], "inter_classes": [], "active_classes": 0}
         eta_acc = torch.zeros(7)
         eta_batches = 0
@@ -322,7 +345,7 @@ def main():
                 eta_batches += 1
             else:
                 ddrl_value = sfeat.sum() * 0.0
-                ddrl_info = {"intra": 0.0, "inter": 0.0, "loss": 0.0,
+                ddrl_info = {"intra": 0.0, "inter": 0.0, "raw_loss": 0.0, "loss": 0.0,
                              "intra_classes": [], "inter_classes": [], "active_classes": 0}
 
             w2_eff = ddrl_weight_for_epoch(args, epoch, ddrl_info["active_classes"], health)
@@ -369,7 +392,6 @@ def main():
                   optimizer.param_groups[1]["lr"], ema_decay_used
               ))
 
-        # Evaluation is separated from model selection. Test labels never affect optimization.
         student_test = evaluate(student, target_test_loader, device)
         teacher_test = evaluate(teacher.model, target_test_loader, device)
         print("[Epoch %d][Eval][Student] acc=%.4f class_acc=%s predicted=%s" % (
@@ -387,10 +409,15 @@ def main():
                 "selected": bank.selected_counts,
                 "agreement": bank.agreement_rate,
                 "selected_ratio": bank.selected_ratio,
+                "keep_ratio": bank.keep_ratio,
+                "raw_prior": bank.raw_prior,
+                "correction": bank.correction,
+                "class_weights": bank.class_weights,
                 "pseudo_acc": bank.pseudo_accuracy,
                 "pseudo_class_acc": bank.pseudo_class_accuracy,
             },
             "health": health,
+            "source_test": source_metrics,
             "train": avg,
             "ddrl_last": last_ddrl,
             "ccdr_eta": avg_eta,
@@ -416,8 +443,16 @@ def main():
             ))
             if val_metrics["acc"] > best_val:
                 best_val = val_metrics["acc"]
+                no_improve = 0
                 torch.save(save, os.path.join(args.model_dir, "best_val.pth"))
                 print("[Epoch %d] best_val=%.4f" % (epoch, best_val))
+            else:
+                no_improve += 1
+                if args.early_stop_patience > 0 and no_improve >= args.early_stop_patience:
+                    print("[EARLY STOP] validation did not improve for %d epochs; best_val=%.4f" % (
+                        args.early_stop_patience, best_val
+                    ))
+                    break
 
     print("Training finished. Logs:", os.path.join(args.model_dir, "metrics.jsonl"))
     print("Checkpoint:", os.path.join(args.model_dir, "last.pth"))
