@@ -45,11 +45,6 @@ def _quantile_value(values: torch.Tensor, q: float) -> float:
     return float(values[idx].item())
 
 
-def _apply_class_correction(prob: torch.Tensor, correction: torch.Tensor) -> torch.Tensor:
-    adjusted = prob * correction.view(1, -1)
-    return adjusted / adjusted.sum(dim=1, keepdim=True).clamp_min(1e-8)
-
-
 def source_class_correction(
     class_total: Sequence[int],
     predicted_counts: Sequence[int],
@@ -57,14 +52,13 @@ def source_class_correction(
     min_correction: float = 0.85,
     max_correction: float = 1.5,
 ) -> List[float]:
-    """Calibrate class bias using labeled *source* data only.
+    """Estimate source-domain classifier bias from labeled source data only.
 
-    CAST's RAF checkpoint under-predicts some source classes (notably fear and
-    angry).  The previous v6.1 target-side uniform distribution alignment was
-    unsuitable for FER2013 because FER2013 is strongly imbalanced (e.g. disgust
-    is genuinely rare).  This correction instead compares source ground-truth
-    class frequency with the source model's prediction frequency, so it does
-    not assume any target class prior and does not consume target labels.
+    The returned values are *loss-side priors*.  They must not be applied to
+    target probabilities before argmax: RAF source bias is not a reliable
+    estimate of FER class-conditional shift.  v6.3 therefore uses these values
+    only to mildly reweight target pseudo-label CE after a pseudo label has
+    already been selected from the unmodified teacher probabilities.
     """
     true = torch.tensor(list(class_total), dtype=torch.float32).clamp_min(1.0)
     pred = torch.tensor(list(predicted_counts), dtype=torch.float32).clamp_min(1.0)
@@ -100,13 +94,14 @@ def build_pseudo_bank(
 ) -> PseudoBank:
     """Generate one whole-target pseudo bank from two EMA weak views.
 
-    Target labels are only read when ``debug_target_labels`` is enabled and are
-    never used in pseudo-label selection, correction, weighting, or loss.
+    Selection is deliberately based on the raw teacher probabilities.  Neither
+    a uniform target prior nor a source-derived class correction is allowed to
+    change target argmax labels, agreement, confidence, margins, entropy, or
+    CATM/quantile thresholds.
 
-    ``class_correction`` must be derived without target labels.  v6.2 supplies a
-    conservative correction estimated from labeled RAF source data.  This
-    replaces v6.1's uniform target-prior assumption, which incorrectly boosted
-    FER2013 disgust because the canonical FER2013 distribution is not uniform.
+    ``class_correction`` is source-only information and is used exclusively as
+    a conservative multiplicative weight on the target pseudo-label CE.  Target
+    labels, when enabled for debugging, never affect selection or optimization.
     """
     teacher.eval()
     p1_all = torch.zeros(dataset_size, num_classes, dtype=torch.float32)
@@ -130,8 +125,10 @@ def build_pseudo_bank(
         if debug_target_labels:
             gt[idx] = labels.long().cpu()
 
-    raw_prob = (p1_all + p2_all) * 0.5
-    raw_prior_t = raw_prob.mean(dim=0).clamp_min(1e-8)
+    # IMPORTANT: pseudo labels are generated from the unmodified teacher
+    # distributions. Source correction is not a target-prior estimator.
+    prob = (p1_all + p2_all) * 0.5
+    raw_prior_t = prob.mean(dim=0).clamp_min(1e-8)
 
     if class_correction is None:
         correction = torch.ones(num_classes, dtype=torch.float32)
@@ -141,13 +138,9 @@ def build_pseudo_bank(
             raise ValueError("class_correction must have num_classes values")
         correction = correction.clamp_min(1e-4)
 
-    p1_adj = _apply_class_correction(p1_all, correction)
-    p2_adj = _apply_class_correction(p2_all, correction)
-    prob = (p1_adj + p2_adj) * 0.5
-
     conf, pred = prob.max(dim=1)
-    y1 = p1_adj.argmax(dim=1)
-    y2 = p2_adj.argmax(dim=1)
+    y1 = p1_all.argmax(dim=1)
+    y2 = p2_all.argmax(dim=1)
     agree = y1 == y2
     top2 = prob.topk(k=2, dim=1).values
     margin = top2[:, 0] - top2[:, 1]
@@ -191,18 +184,18 @@ def build_pseudo_bank(
     selected_counts = [int(((pred == c) & selected).sum().item()) for c in range(num_classes)]
     selected_total = int(selected.sum().item())
 
-    # Only source-calibrated under-predicted classes may receive a small pseudo
-    # CE boost.  This prevents a low-count but unreliable target pseudo class
-    # (the v6.1 disgust failure) from being amplified merely because it is rare.
+    # Source correction affects only loss magnitude after selection.  Only
+    # clearly under-predicted source classes pass the gate; this prevents a
+    # weak source correction such as disgust~=1.05 from reinforcing a noisy
+    # target pseudo class.  No pseudo-label count heuristic is mixed in here so
+    # this experiment isolates the correction-vs-selection effect cleanly.
     selected_count_t = torch.tensor(selected_counts, dtype=torch.float32)
-    class_weights = torch.ones(num_classes, dtype=torch.float32)
     nonzero = selected_count_t > 0
-    if bool(nonzero.any()) and float(class_balance_max) > 1.0:
-        mean_nonzero = selected_count_t[nonzero].mean().clamp_min(1.0)
-        candidate = torch.sqrt(mean_nonzero / selected_count_t.clamp_min(1.0))
-        candidate = candidate.clamp(1.0, max(1.0, float(class_balance_max)))
-        eligible = correction >= float(class_weight_correction_gate)
-        class_weights[eligible & nonzero] = candidate[eligible & nonzero]
+    class_weights = torch.ones(num_classes, dtype=torch.float32)
+    max_weight = max(1.0, float(class_balance_max))
+    eligible = correction >= float(class_weight_correction_gate)
+    source_loss_weight = correction.clamp(1.0, max_weight)
+    class_weights[eligible & nonzero] = source_loss_weight[eligible & nonzero]
 
     weights = conf.clamp(0.05, 1.0) * class_weights[pred]
     weights = weights * selected.float()
@@ -215,7 +208,6 @@ def build_pseudo_bank(
         correct = pred[selected] == gt[selected]
         pseudo_acc = float(correct.float().mean().item())
 
-        confusion = torch.zeros(num_classes, num_classes, dtype=torch.long)
         true_sel = gt[selected]
         pred_sel = pred[selected]
         flat = true_sel * num_classes + pred_sel
@@ -260,7 +252,7 @@ def pseudo_bank_summary(bank: PseudoBank) -> Dict[str, object]:
         "selected_ratio": round(bank.selected_ratio, 4),
         "keep_ratio": round(bank.keep_ratio, 4),
         "raw_prior": [round(float(x), 4) for x in bank.raw_prior],
-        "correction": [round(float(x), 4) for x in bank.correction],
+        "loss_correction": [round(float(x), 4) for x in bank.correction],
         "class_weights": [round(float(x), 4) for x in bank.class_weights],
         "pseudo_acc": None if bank.pseudo_accuracy is None else round(bank.pseudo_accuracy, 4),
         "pseudo_precision": None if bank.pseudo_precision is None else [round(float(x), 4) for x in bank.pseudo_precision],
