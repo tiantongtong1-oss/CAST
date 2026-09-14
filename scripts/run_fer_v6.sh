@@ -32,5 +32,4 @@ python train_v6.py \
   --affinity-mid-weight 0.005 \
   --bn-recalibrate-batches 0 \
   --early-stop-patience 4 \
-  --debug-target-labels \
-  --abort-on-collapse
+  --debug-target-labels
