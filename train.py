@@ -55,10 +55,26 @@ def parse_args():
     parser.add_argument('--w3', type=float, default=0.1,
                         help='gamma: classifier modulation loss weight')
     parser.add_argument('--phi', type=float, default=1.4,
-                        help='class-adaptive threshold coefficient')
+                        help='legacy CAST threshold arg retained for CLI compatibility; '
+                             'not used by the relative threshold on this branch')
     parser.add_argument('--ema_decay', type=float, default=0.999,
                         help='EMA teacher decay')
-    return parser.parse_args()
+    parser.add_argument('--threshold_base', type=float, default=0.85,
+                        help='global center of the relative class-adaptive threshold')
+    parser.add_argument('--threshold_beta', type=float, default=0.5,
+                        help='strength of per-class confidence deviation')
+    parser.add_argument('--threshold_min', type=float, default=0.75,
+                        help='minimum class-adaptive threshold')
+    parser.add_argument('--threshold_max', type=float, default=0.95,
+                        help='maximum class-adaptive threshold')
+    args = parser.parse_args()
+    if not (0.0 <= args.threshold_min <= args.threshold_base <= args.threshold_max <= 1.0):
+        parser.error('require 0 <= threshold_min <= threshold_base <= threshold_max <= 1')
+    if args.threshold_beta < 0.0:
+        parser.error('--threshold_beta must be nonnegative')
+    if not (0.0 <= args.ema_decay < 1.0):
+        parser.error('--ema_decay must be in [0, 1)')
+    return args
 
 
 def build_transforms():
@@ -106,8 +122,17 @@ def classifier_modulation_loss(model):
     return torch.mean((matrix + 1.0) / 2.0)
 
 
-def calculate_target_thresholds(model, loader, class_num, epoch, total_epochs, phi):
-    """Original CAST class-adaptive thresholds, evaluated by the EMA teacher."""
+def calculate_target_thresholds(model, loader, class_num, threshold_base,
+                                threshold_beta, threshold_min, threshold_max):
+    """Relative class-adaptive thresholds evaluated by the EMA teacher.
+
+    tau_c = clip(tau_0 + beta * (mu_c - mean(mu)), tau_min, tau_max)
+
+    The threshold depends on each class's confidence relative to the other
+    classes, so confident/easy classes receive a stricter threshold while
+    difficult classes receive a lower threshold without collapsing all classes
+    to the same upper bound. Target ground-truth labels are not used.
+    """
     class_sum = torch.zeros(class_num, dtype=torch.float64)
     class_count = torch.zeros(class_num, dtype=torch.float64)
 
@@ -120,14 +145,23 @@ def calculate_target_thresholds(model, loader, class_num, epoch, total_epochs, p
             max_prob, pred_label = torch.max(probs, dim=1)
 
             class_sum.scatter_add_(0, pred_label, max_prob.double())
-            class_count.scatter_add_(0, pred_label, torch.ones_like(max_prob, dtype=torch.float64))
+            class_count.scatter_add_(
+                0, pred_label, torch.ones_like(max_prob, dtype=torch.float64)
+            )
 
+    valid = class_count > 0
     class_mean = class_sum / class_count.clamp_min(1.0)
-    base_threshold = class_mean * phi
-    stage_factor = float(total_epochs) / float(total_epochs - epoch)
-    thresholds = torch.clamp(base_threshold * stage_factor, max=0.9).float()
-    thresholds[class_count == 0] = 0.9
-    return thresholds
+    if torch.any(valid):
+        global_mean = class_mean[valid].mean()
+    else:
+        global_mean = class_mean.new_tensor(float(threshold_base))
+
+    thresholds = threshold_base + threshold_beta * (class_mean - global_mean)
+    thresholds = torch.clamp(
+        thresholds, min=threshold_min, max=threshold_max
+    ).float()
+    thresholds[~valid] = float(threshold_max)
+    return thresholds, class_mean.float(), float(global_mean.item())
 
 
 def evaluate(model, loader, criterion, num_samples, epoch, split_name):
@@ -181,18 +215,23 @@ def run_training():
 
     source_best_path = os.path.join(
         model_path,
-        args.backbone + '_' + args.data1 + '_' + args.data2 + '_ema_dualview_source_best.pth'
+        args.backbone + '_' + args.data1 + '_' + args.data2
+        + '_ema_dualview_adaptive_source_best.pth'
     )
     target_best_path = os.path.join(
         model_path,
-        args.backbone + '_' + args.data1 + '_' + args.data2 + '_ema_dualview_target_best.pth'
+        args.backbone + '_' + args.data1 + '_' + args.data2
+        + '_ema_dualview_adaptive_target_best.pth'
     )
 
     print('---------------------------------------------------------------------------------------')
-    print('EMA + Dual View CAST: %s with source %s and target %s' %
+    print('EMA + Dual View + Relative CAT: %s with source %s and target %s' %
           (args.backbone, args.data1, args.data2))
-    print('alpha(w1):%s beta(w2):%s gamma(w3):%s phi:%s ema:%s' %
-          (args.w1, args.w2, args.w3, args.phi, args.ema_decay))
+    print('alpha(w1):%s beta(w2):%s gamma(w3):%s ema:%s '
+          'tau0:%s threshold_beta:%s threshold_range:[%s,%s]' %
+          (args.w1, args.w2, args.w3, args.ema_decay,
+           args.threshold_base, args.threshold_beta,
+           args.threshold_min, args.threshold_max))
     print('---------------------------------------------------------------------------------------')
 
     if args.backbone == 'resnet18':
@@ -214,8 +253,6 @@ def run_training():
         strong_transform=None, basic_aug=False
     )
 
-    # Target training uses two independent weak views for teacher agreement and
-    # one strong view for student optimization.
     target_train = FER(
         args.target_path, phase='train', transform=weak_transform,
         weak2_transform=weak_transform, strong_transform=strong_transform,
@@ -267,7 +304,6 @@ def run_training():
         checkpoint = torch.load(args.checkpoint, map_location='cuda')
         model.load_state_dict(checkpoint['model'], strict=True)
 
-    # Stage 1 is unchanged from the stable baseline.
     best_source_val_acc = -1.0
     for i in range(args.pre_epochs):
         model.train()
@@ -323,15 +359,22 @@ def run_training():
     optimizer.load_state_dict(checkpoint['optimizer'])
     scheduler.load_state_dict(checkpoint['scheduler'])
 
-    # Only innovation in Stage 2: frozen EMA teacher + two-view agreement.
     teacher = create_ema_teacher(model).cuda()
     best_target_val_acc = -1.0
     global_step = 0
 
     for i in range(args.epochs):
-        thresholds = calculate_target_thresholds(
-            teacher, threshold_loader_target, class_num, i, args.epochs, args.phi
+        thresholds, class_mean, global_mean = calculate_target_thresholds(
+            teacher,
+            threshold_loader_target,
+            class_num,
+            args.threshold_base,
+            args.threshold_beta,
+            args.threshold_min,
+            args.threshold_max,
         )
+        print('[Target Epoch %d] class mean confidence: %s global_mean: %.4f' %
+              (i, np.array2string(class_mean.numpy(), precision=4), global_mean))
         print('[Target Epoch %d] class-adaptive thresholds: %s' %
               (i, np.array2string(thresholds.numpy(), precision=4)))
 

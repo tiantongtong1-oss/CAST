@@ -14,11 +14,7 @@ def create_ema_teacher(student):
 
 @torch.no_grad()
 def update_ema_teacher(teacher, student, decay=0.999, global_step=None):
-    """Update teacher parameters by EMA and copy student buffers.
-
-    BatchNorm buffers are copied directly from the student so the teacher uses
-    current running statistics instead of lagging far behind them.
-    """
+    """Update teacher parameters by EMA and copy student buffers."""
     if global_step is None:
         ema_decay = float(decay)
     else:
@@ -41,24 +37,25 @@ def update_ema_teacher(teacher, student, decay=0.999, global_step=None):
 
 @torch.no_grad()
 def select_dual_view_pseudo_labels(logits1, logits2, thresholds):
-    """Keep a pseudo label only when both weak views agree and pass threshold.
+    """Strict two-view pseudo-label filtering.
 
-    The original CAST class-adaptive threshold is preserved. No temperature
-    scaling, class-distribution correction, prototype weighting or extra sample
-    weighting is applied in this ablation.
+    A target sample is reliable only when both weak views predict the same class
+    and EACH view independently exceeds that class's adaptive threshold.
     """
     probs1 = F.softmax(logits1, dim=1)
     probs2 = F.softmax(logits2, dim=1)
 
-    _, pred1 = probs1.max(dim=1)
-    _, pred2 = probs2.max(dim=1)
+    conf1, pred1 = probs1.max(dim=1)
+    conf2, pred2 = probs2.max(dim=1)
+    agreement = pred1.eq(pred2)
 
-    mean_probs = (probs1 + probs2) * 0.5
-    confidence, pseudo_targets = mean_probs.max(dim=1)
-
-    agreement = pred1.eq(pred2) & pred1.eq(pseudo_targets)
-    thresholds = thresholds.to(device=logits1.device, dtype=confidence.dtype)
+    pseudo_targets = pred1
+    thresholds = thresholds.to(device=logits1.device, dtype=conf1.dtype)
     sample_threshold = thresholds.index_select(0, pseudo_targets)
-    reliable = agreement & (confidence >= sample_threshold)
+    reliable = (
+        agreement
+        & (conf1 >= sample_threshold)
+        & (conf2 >= sample_threshold)
+    )
 
     return pseudo_targets, reliable.float(), int(agreement.sum().item())

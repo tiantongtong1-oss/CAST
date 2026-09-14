@@ -1,45 +1,69 @@
-# MobileNetV2 + EMA Teacher + Dual View
+# MobileNetV2 + EMA Teacher + Dual View + Relative Class-Adaptive Threshold
 
 Branch: `improve/ema-dualview-cast`
 
-This branch is intentionally reduced to a clean ablation against the stable CAST baseline. It keeps the baseline CAST losses and training schedule, and adds only:
+This branch is a controlled ablation against the stable CAST baseline. It keeps the baseline source stage, MK-MMD DDRL, CCDR class-density weighting, classifier modulation loss, optimizer/scheduler behavior, and strong-view student training. The active target-stage changes are limited to:
 
-1. an EMA teacher copied from the best source-stage student;
+1. an EMA teacher initialized from the best source-stage student;
 2. two independently augmented weak target views;
-3. pseudo-label acceptance only when both teacher views agree and their averaged confidence passes the original CAST class-adaptive threshold.
+3. strict dual-view pseudo-label filtering;
+4. a relative class-adaptive threshold that does not collapse every class to 0.9.
 
-The following experimental mechanisms from earlier commits are removed from the active training path:
+No class-distribution correction, temperature scaling, prototype memory, prototype affinity loss, target-loss ramping, or pseudo-label reweighting is active.
 
-- class-distribution correction / uniform-prior alignment;
-- temperature scaling;
-- prototype memory and prototype affinity loss;
-- target-loss ramping and pseudo-label reweighting;
-- additional target-stage optimizer changes;
-- custom threshold floors/ceilings beyond the original CAST threshold rule.
+## Relative class-adaptive threshold
 
-The source stage, MK-MMD DDRL loss, CCDR class-density weighting, classifier modulation loss, optimizer, learning-rate scheduler, and source/target loss normalization are kept aligned with the stable `sep09-version` baseline.
-
-MobileNetV2 is the default backbone on this branch.
-
-## Target-stage pseudo label rule
-
-For target image `x`, draw two independent weak augmentations `x_w1` and `x_w2` and one strong augmentation `x_s`.
-
-The frozen-gradient EMA teacher predicts both weak views. Let `p1`, `p2` be their softmax probabilities. A pseudo label is accepted only when:
+For each predicted class `c`, the EMA teacher estimates the mean confidence `mu_c` on the full FER2013 training split. Let `mu_bar` be the unweighted mean of the valid class means. The threshold is:
 
 ```text
-argmax(p1) == argmax(p2) == argmax((p1+p2)/2)
-and
-max((p1+p2)/2) >= CAST_class_adaptive_threshold[class]
+tau_c = clip(tau_0 + beta * (mu_c - mu_bar), tau_min, tau_max)
 ```
 
-The accepted pseudo label supervises the student's strong view. After each successful student optimizer step:
+Default values:
+
+```text
+tau_0   = 0.85
+beta    = 0.50
+tau_min = 0.75
+tau_max = 0.95
+```
+
+Easy/high-confidence classes receive a stricter threshold and difficult/low-confidence classes receive a lower threshold. The previous multiplicative `phi * class_mean * stage_factor` rule is not used because it saturated most classes at 0.9. `--phi` remains accepted only for command-line compatibility with earlier experiments.
+
+## Strict dual-view rule
+
+For target image `x`, draw independent weak views `x_w1`, `x_w2` and strong view `x_s`. The EMA teacher predicts probabilities `p1`, `p2` on the weak views. A pseudo label is accepted only when:
+
+```text
+argmax(p1) == argmax(p2) == c
+and
+max(p1) >= tau_c
+and
+max(p2) >= tau_c
+```
+
+The accepted label supervises the student's strong view. After each successful student optimizer step:
 
 ```text
 teacher <- EMA(teacher, student)
 ```
 
-No FER2013 training labels are used for pseudo-label generation or optimization.
+FER2013 training labels are not used for pseudo-label generation or target optimization.
+
+## Logging
+
+Each target epoch prints:
+
+```text
+class mean confidence
+global mean confidence
+class-adaptive thresholds
+Agreement_Num
+Confident_Num
+Pseudo_Distribution
+```
+
+This makes it possible to verify that thresholds stay class-dependent and to monitor confirmation bias / class imbalance.
 
 ## Run
 
@@ -52,16 +76,18 @@ python train.py \
   --w1 4 \
   --w2 0.3 \
   --w3 0.1 \
-  --phi 1.4 \
   --ema_decay 0.999 \
-  2>&1 | tee logs/cast_ema_dualview_only_mobilenet_v2.log
+  --threshold_base 0.85 \
+  --threshold_beta 0.5 \
+  --threshold_min 0.75 \
+  --threshold_max 0.95 \
+  2>&1 | tee logs/cast_ema_dualview_adaptive_mobilenet_v2.log
 ```
 
-Recommended first check:
+Recommended syntax check:
 
 ```bash
 python -m py_compile train.py dataset.py Networks.py ema_utils.py
-python train.py --backbone mobilenet_v2 --pre_epochs 2 --epochs 2
 ```
 
-The checkpoints include `_ema_dualview_` in their names, so this experiment does not overwrite the saved baseline checkpoints.
+New checkpoints include `_ema_dualview_adaptive_` in their names, so this experiment does not overwrite either the 54.89% baseline checkpoints or the earlier EMA + Dual View checkpoints.
