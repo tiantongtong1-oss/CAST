@@ -11,6 +11,9 @@ data/
 hello.py
 test.py
 
+.idea/
 logs/
 models/
+tttlogs/
+test_logs/
 *.bak
