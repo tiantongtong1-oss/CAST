@@ -14,11 +14,16 @@ def create_ema_teacher(student):
 
 @torch.no_grad()
 def update_ema_teacher(teacher, student, decay=0.999, global_step=None):
-    """Update teacher parameters by EMA and copy student buffers."""
-    if global_step is None:
-        ema_decay = float(decay)
-    else:
-        ema_decay = min(float(decay), 1.0 - 1.0 / float(global_step + 1))
+    """Update teacher parameters and floating buffers with a fixed EMA decay.
+
+    The teacher is initialized from the student, so an early-step decay warmup is
+    unnecessary and makes the teacher follow noisy target updates too quickly.
+    Floating-point buffers (notably BatchNorm running_mean/running_var) receive
+    the same EMA update. Integer counters such as num_batches_tracked are copied.
+    ``global_step`` is retained only for call-site compatibility.
+    """
+    del global_step
+    ema_decay = float(decay)
 
     teacher_params = dict(teacher.named_parameters())
     student_params = dict(student.named_parameters())
@@ -30,7 +35,14 @@ def update_ema_teacher(teacher, student, decay=0.999, global_step=None):
     teacher_buffers = dict(teacher.named_buffers())
     student_buffers = dict(student.named_buffers())
     for name, teacher_buffer in teacher_buffers.items():
-        teacher_buffer.copy_(student_buffers[name].detach())
+        student_buffer = student_buffers[name].detach()
+        if torch.is_floating_point(teacher_buffer):
+            teacher_buffer.mul_(ema_decay).add_(
+                student_buffer.to(dtype=teacher_buffer.dtype),
+                alpha=1.0 - ema_decay,
+            )
+        else:
+            teacher_buffer.copy_(student_buffer)
 
     teacher.eval()
 

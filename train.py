@@ -56,22 +56,28 @@ def parse_args():
                         help='gamma: classifier modulation loss weight')
     parser.add_argument('--phi', type=float, default=1.4,
                         help='legacy CAST threshold arg retained for CLI compatibility; '
-                             'not used by the relative threshold on this branch')
+                             'not used by the stable relative threshold')
     parser.add_argument('--ema_decay', type=float, default=0.999,
-                        help='EMA teacher decay')
+                        help='fixed EMA decay for teacher parameters and floating buffers')
     parser.add_argument('--threshold_base', type=float, default=0.85,
-                        help='global center of the relative class-adaptive threshold')
+                        help='minimum global center of the adaptive threshold')
     parser.add_argument('--threshold_beta', type=float, default=0.5,
                         help='strength of per-class confidence deviation')
-    parser.add_argument('--threshold_min', type=float, default=0.75,
+    parser.add_argument('--threshold_margin', type=float, default=0.02,
+                        help='margin added above teacher global mean confidence')
+    parser.add_argument('--threshold_min', type=float, default=0.80,
                         help='minimum class-adaptive threshold')
     parser.add_argument('--threshold_max', type=float, default=0.95,
                         help='maximum class-adaptive threshold')
     args = parser.parse_args()
-    if not (0.0 <= args.threshold_min <= args.threshold_base <= args.threshold_max <= 1.0):
-        parser.error('require 0 <= threshold_min <= threshold_base <= threshold_max <= 1')
+    if not (0.0 <= args.threshold_min <= args.threshold_max <= 1.0):
+        parser.error('require 0 <= threshold_min <= threshold_max <= 1')
+    if not (0.0 <= args.threshold_base <= args.threshold_max):
+        parser.error('require 0 <= threshold_base <= threshold_max')
     if args.threshold_beta < 0.0:
         parser.error('--threshold_beta must be nonnegative')
+    if args.threshold_margin < 0.0:
+        parser.error('--threshold_margin must be nonnegative')
     if not (0.0 <= args.ema_decay < 1.0):
         parser.error('--ema_decay must be in [0, 1)')
     return args
@@ -123,15 +129,19 @@ def classifier_modulation_loss(model):
 
 
 def calculate_target_thresholds(model, loader, class_num, threshold_base,
-                                threshold_beta, threshold_min, threshold_max):
-    """Relative class-adaptive thresholds evaluated by the EMA teacher.
+                                threshold_beta, threshold_margin,
+                                threshold_min, threshold_max):
+    """Global-confidence-aware relative class-adaptive thresholds.
 
-    tau_c = clip(tau_0 + beta * (mu_c - mean(mu)), tau_min, tau_max)
+    For class c with teacher mean confidence mu_c and unweighted valid-class
+    mean mu_bar:
 
-    The threshold depends on each class's confidence relative to the other
-    classes, so confident/easy classes receive a stricter threshold while
-    difficult classes receive a lower threshold without collapsing all classes
-    to the same upper bound. Target ground-truth labels are not used.
+        center = max(threshold_base, mu_bar + threshold_margin)
+        tau_c = clip(center + beta * (mu_c - mu_bar), tau_min, tau_max)
+
+    This preserves relative class difficulty while making the whole threshold
+    schedule stricter when the EMA teacher becomes globally more confident.
+    Target ground-truth labels are never used.
     """
     class_sum = torch.zeros(class_num, dtype=torch.float64)
     class_count = torch.zeros(class_num, dtype=torch.float64)
@@ -156,12 +166,23 @@ def calculate_target_thresholds(model, loader, class_num, threshold_base,
     else:
         global_mean = class_mean.new_tensor(float(threshold_base))
 
-    thresholds = threshold_base + threshold_beta * (class_mean - global_mean)
+    threshold_center = max(
+        float(threshold_base),
+        float(global_mean.item()) + float(threshold_margin),
+    )
+    threshold_center = min(threshold_center, float(threshold_max))
+
+    thresholds = threshold_center + threshold_beta * (class_mean - global_mean)
     thresholds = torch.clamp(
         thresholds, min=threshold_min, max=threshold_max
     ).float()
     thresholds[~valid] = float(threshold_max)
-    return thresholds, class_mean.float(), float(global_mean.item())
+    return (
+        thresholds,
+        class_mean.float(),
+        float(global_mean.item()),
+        float(threshold_center),
+    )
 
 
 def evaluate(model, loader, criterion, num_samples, epoch, split_name):
@@ -216,21 +237,21 @@ def run_training():
     source_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_ema_dualview_adaptive_source_best.pth'
+        + '_ema_dualview_stable_source_best.pth'
     )
     target_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_ema_dualview_adaptive_target_best.pth'
+        + '_ema_dualview_stable_target_best.pth'
     )
 
     print('---------------------------------------------------------------------------------------')
-    print('EMA + Dual View + Relative CAT: %s with source %s and target %s' %
+    print('EMA + Dual View + Stable CAT: %s with source %s and target %s' %
           (args.backbone, args.data1, args.data2))
     print('alpha(w1):%s beta(w2):%s gamma(w3):%s ema:%s '
-          'tau0:%s threshold_beta:%s threshold_range:[%s,%s]' %
+          'tau0:%s threshold_beta:%s margin:%s threshold_range:[%s,%s]' %
           (args.w1, args.w2, args.w3, args.ema_decay,
-           args.threshold_base, args.threshold_beta,
+           args.threshold_base, args.threshold_beta, args.threshold_margin,
            args.threshold_min, args.threshold_max))
     print('---------------------------------------------------------------------------------------')
 
@@ -364,17 +385,20 @@ def run_training():
     global_step = 0
 
     for i in range(args.epochs):
-        thresholds, class_mean, global_mean = calculate_target_thresholds(
+        thresholds, class_mean, global_mean, threshold_center = calculate_target_thresholds(
             teacher,
             threshold_loader_target,
             class_num,
             args.threshold_base,
             args.threshold_beta,
+            args.threshold_margin,
             args.threshold_min,
             args.threshold_max,
         )
-        print('[Target Epoch %d] class mean confidence: %s global_mean: %.4f' %
-              (i, np.array2string(class_mean.numpy(), precision=4), global_mean))
+        print('[Target Epoch %d] class mean confidence: %s global_mean: %.4f '
+              'threshold_center: %.4f' %
+              (i, np.array2string(class_mean.numpy(), precision=4),
+               global_mean, threshold_center))
         print('[Target Epoch %d] class-adaptive thresholds: %s' %
               (i, np.array2string(thresholds.numpy(), precision=4)))
 
