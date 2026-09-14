@@ -18,7 +18,9 @@ def _multi_rbf_kernel(x: torch.Tensor, y: torch.Tensor,
     for i in range(kernel_num):
         bandwidth = base * (kernel_mul ** i)
         kernels = kernels + torch.exp(-d2 / bandwidth.clamp_min(1e-6))
-    return kernels
+    # Average instead of summing kernels. This preserves MK-MMD geometry while
+    # keeping the scale independent of kernel_num.
+    return kernels / float(max(1, kernel_num))
 
 
 def mmd2(x: torch.Tensor, y: torch.Tensor) -> Optional[torch.Tensor]:
@@ -44,11 +46,13 @@ def ddrl_loss(source_features: torch.Tensor,
               target_labels: torch.Tensor,
               eta: torch.Tensor,
               num_classes: int = 7,
-              min_class_samples: int = 2) -> Tuple[torch.Tensor, Dict[str, object]]:
-    """Paper Eq. 12 with missing-class-safe normalization.
+              min_class_samples: int = 2,
+              max_abs_loss: float = 1.5) -> Tuple[torch.Tensor, Dict[str, object]]:
+    """Class-conditional MK-MMD with missing-class-safe normalization.
 
-    intra: align source/target class-conditional distributions.
-    inter: enlarge each class vs complement discrepancy.
+    `loss = intra - inter`, matching CAST's align-within/separate-between idea.
+    The final value is clipped only as a safety bound; with averaged kernels it
+    should normally stay well inside the interval.
     """
     intra_terms, inter_terms = [], []
     intra_classes, inter_classes = [], []
@@ -76,10 +80,12 @@ def ddrl_loss(source_features: torch.Tensor,
     zero = source_features.sum() * 0.0
     intra = torch.stack(intra_terms).mean() if intra_terms else zero
     inter = torch.stack(inter_terms).mean() if inter_terms else zero
-    loss = intra - inter
+    raw_loss = intra - inter
+    loss = raw_loss.clamp(min=-float(max_abs_loss), max=float(max_abs_loss))
     info = {
         "intra": float(intra.detach().item()),
         "inter": float(inter.detach().item()),
+        "raw_loss": float(raw_loss.detach().item()),
         "loss": float(loss.detach().item()),
         "intra_classes": intra_classes,
         "inter_classes": inter_classes,
