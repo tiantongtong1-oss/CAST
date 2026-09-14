@@ -50,11 +50,14 @@ def prediction_health(predicted_counts: List[int], selected_counts: List[int],
     p = torch.tensor(predicted_counts, dtype=torch.float32)
     s = torch.tensor(selected_counts, dtype=torch.float32)
     pred_dist = p / p.sum().clamp_min(1.0)
+    sel_dist = s / s.sum().clamp_min(1.0)
     num_classes = len(predicted_counts)
     pred_entropy = float((-(pred_dist.clamp_min(1e-8) * pred_dist.clamp_min(1e-8).log()).sum()
                           / math.log(num_classes)).item())
     selected_classes = int((s > 0).sum().item())
     max_pred_ratio = float(pred_dist.max().item())
+    min_pred_ratio = float(pred_dist.min().item())
+    min_selected_ratio = float(sel_dist.min().item()) if float(s.sum().item()) > 0 else 0.0
     selected_ratio = float(s.sum().item() / max(1, total))
     reasons = []
     if max_pred_ratio > 0.55:
@@ -63,11 +66,19 @@ def prediction_health(predicted_counts: List[int], selected_counts: List[int],
         reasons.append("low_class_coverage")
     if selected_ratio < 0.02:
         reasons.append("pseudo_starvation")
+    # A class below 0.5% of all predictions is effectively starved even when it
+    # is technically non-zero. This catches the FER fear failure seen in v6.
+    if min_pred_ratio < 0.005:
+        reasons.append("minority_prediction_starvation")
+    if selected_classes == num_classes and min_selected_ratio < 0.002:
+        reasons.append("minority_pseudo_starvation")
     return {
         "max_pred_ratio": max_pred_ratio,
+        "min_pred_ratio": min_pred_ratio,
         "pred_entropy": pred_entropy,
         "selected_classes": selected_classes,
         "selected_ratio": selected_ratio,
+        "min_selected_ratio": min_selected_ratio,
         "status": "WARN:" + ",".join(reasons) if reasons else "OK",
     }
 
