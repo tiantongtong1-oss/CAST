@@ -4,7 +4,7 @@ from torchvision import models
 
 
 def compute_kernel_matrix(source, target, kernel_mul=2.0, kernel_num=5):
-    """Multi-kernel Gaussian matrix used by MK-MMD (paper Eq. 9-12)."""
+    """Multi-kernel Gaussian matrix used by MK-MMD."""
     n_samples = int(source.size(0)) + int(target.size(0))
     total = torch.cat([source, target], dim=0)
     total0 = total.unsqueeze(0).expand(total.size(0), total.size(0), total.size(1))
@@ -23,7 +23,7 @@ def compute_kernel_matrix(source, target, kernel_mul=2.0, kernel_num=5):
 
 
 def mmd_loss(source_features, target_features):
-    """Unbiased MK-MMD estimator corresponding to paper Eq. (9)-(10)."""
+    """Unbiased MK-MMD estimator."""
     ns = source_features.size(0)
     nt = target_features.size(0)
     if ns < 2 or nt < 2:
@@ -49,12 +49,22 @@ def remove_element(features, index):
 
 
 class Model(nn.Module):
-    def __init__(self, backbone='resnet50', num_classes=7, pretrained=True,
-                 drop_rate=0.5, density_bandwidth=0.2):
+    """Shared FER backbone plus CAST DDRL/CCDR feature constraints.
+
+    The improved branch keeps the original MK-MMD based DDRL and exposes
+    features to the training loop so the target prototype affinity loss can
+    be computed with reliable EMA-teacher pseudo labels.
+    """
+
+    def __init__(self, backbone='mobilenet_v2', num_classes=7, pretrained=True,
+                 drop_rate=0.5, density_bandwidth=0.2,
+                 class_weight_max=1.0, loss_clip=5.0):
         super(Model, self).__init__()
         self.drop_rate = drop_rate
         self.num_classes = num_classes
         self.density_bandwidth = density_bandwidth
+        self.class_weight_max = class_weight_max
+        self.loss_clip = loss_clip
         self.bn = nn.BatchNorm1d(num_classes)
 
         if backbone == 'resnet18':
@@ -63,7 +73,8 @@ class Model(nn.Module):
                 nn.Flatten(),
                 nn.Dropout(drop_rate)
             )
-            self.fc = nn.Linear(512, num_classes, bias=False)
+            self.feature_dim = 512
+            self.fc = nn.Linear(self.feature_dim, num_classes, bias=False)
 
         elif backbone == 'resnet50':
             self.feature = nn.Sequential(
@@ -72,7 +83,8 @@ class Model(nn.Module):
                 nn.Dropout(drop_rate),
                 nn.Linear(2048, 512)
             )
-            self.fc = nn.Linear(512, num_classes, bias=False)
+            self.feature_dim = 512
+            self.fc = nn.Linear(self.feature_dim, num_classes, bias=False)
 
         elif backbone == 'mobilenet_v2':
             self.feature = nn.Sequential(
@@ -83,10 +95,20 @@ class Model(nn.Module):
                 nn.Linear(1280, 512),
                 nn.Dropout(drop_rate)
             )
-            self.fc = nn.Linear(512, num_classes, bias=False)
+            self.feature_dim = 512
+            self.fc = nn.Linear(self.feature_dim, num_classes, bias=False)
 
         else:
             raise ValueError('Backbone Error!')
+
+    def _stabilize_loss(self, loss):
+        loss = torch.nan_to_num(
+            loss,
+            nan=0.0,
+            posinf=self.loss_clip,
+            neginf=-self.loss_clip,
+        )
+        return torch.clamp(loss, min=-self.loss_clip, max=self.loss_clip)
 
     def forward(self, x, targets=None, idx=None, mode='train', task='target',
                 epoch=0, source_count=None):
@@ -107,19 +129,23 @@ class Model(nn.Module):
                 if class_features.size(0) >= 2 and other_features.size(0) >= 2:
                     inter_loss += mmd_loss(class_features, other_features) * eta[i]
 
-            # Paper Eq. (11)-(12): maximize inter-class discrepancy.
-            affinity_loss = -inter_loss / self.num_classes
-            return [out, affinity_loss]
+            class_separation_loss = -inter_loss / self.num_classes
+            class_separation_loss = self._stabilize_loss(class_separation_loss)
+            return [out, class_separation_loss, fea]
 
         if task == 'target':
             if idx is None or source_count is None:
                 raise ValueError('Target training requires confidence mask idx and source_count.')
 
-            valid_idx = (idx == 1).nonzero(as_tuple=False).squeeze(1)
+            valid_idx = (idx > 0).nonzero(as_tuple=False).squeeze(1)
+            if valid_idx.numel() == 0:
+                zero = fea.sum() * 0.0
+                return [out, zero, fea, zero, zero]
+
             fea_selected = torch.index_select(fea, 0, valid_idx)
             targets_selected = torch.index_select(targets, 0, valid_idx)
 
-            # Source samples are concatenated first and are always confident.
+            # Source samples are concatenated first and are always reliable.
             source_count = min(int(source_count), fea_selected.size(0))
             source_fea = fea_selected[:source_count]
             source_targets = targets_selected[:source_count]
@@ -145,16 +171,21 @@ class Model(nn.Module):
                 if class_features.size(0) >= 2 and other_features.size(0) >= 2:
                     inter_loss += mmd_loss(class_features, other_features) * eta[i]
 
-            # Paper Eq. (12): intra-class domain alignment + inter-class separation.
-            affinity_loss = (intra_loss - inter_loss) / self.num_classes
-            return [out, affinity_loss]
+            domain_alignment_loss = intra_loss / self.num_classes
+            class_enhancement_loss = -inter_loss / self.num_classes
+            ddrl_loss = domain_alignment_loss + class_enhancement_loss
+
+            domain_alignment_loss = self._stabilize_loss(domain_alignment_loss)
+            class_enhancement_loss = self._stabilize_loss(class_enhancement_loss)
+            ddrl_loss = self._stabilize_loss(ddrl_loss)
+            return [out, ddrl_loss, fea,
+                    domain_alignment_loss, class_enhancement_loss]
 
         raise ValueError('Unknown task: %s' % task)
 
     def split_feature_makeLD(self, x, target):
         if x.size(0) == 0:
-            feature_dim = self.fc.in_features
-            return [x.new_empty((0, feature_dim)) for _ in range(self.num_classes)]
+            return [x.new_empty((0, self.feature_dim)) for _ in range(self.num_classes)]
 
         x_parts = []
         for c in range(self.num_classes):
@@ -163,15 +194,10 @@ class Model(nn.Module):
         return x_parts
 
     def volume(self, features):
-        """CCDR class-level representation weights from paper Eq. (2)-(5).
+        """Stable class-level representation weights used by CCDR.
 
-        The paper defines rho_i = (1 / (N_c h)) * sum_j k((f_i-f_j)/h),
-        V_c = sum_i 1/rho_i, and eta_c = 1/V_c.  We therefore compute the
-        Gaussian kernel directly in representation space instead of using
-        sklearn KernelDensity's *normalized high-dimensional probability
-        density*.  The latter contains an h^{-d} normalization term; in a
-        512-D feature space it can make densities astronomically large and
-        eta_c explode to ~1e12, which is not the quantity in Eq. (2).
+        Empty classes are assigned zero weight. The upper bound prevents an
+        unexpectedly sparse batch from producing a dominating class weight.
         """
         if not features:
             return []
@@ -192,6 +218,8 @@ class Model(nn.Module):
                 rho = rho.clamp_min(1e-12)
                 volume = torch.sum(1.0 / rho)
                 eta = 1.0 / volume.clamp_min(1e-12)
+                eta = torch.nan_to_num(eta, nan=0.0, posinf=self.class_weight_max)
+                eta = torch.clamp(eta, min=0.0, max=self.class_weight_max)
                 weights.append(float(eta.item()))
 
         return weights
