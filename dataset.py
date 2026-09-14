@@ -12,8 +12,7 @@ import numpy as np
 
 
 class RafDataSet(data.Dataset):
-    def __init__(self, raf_path, phase, transform=None, strong_transform=None,
-                 basic_aug=False, ratio=1):
+    def __init__(self, raf_path, phase, transform=None, strong_transform=None, basic_aug=False, ratio=1):
         self.phase = phase
         self.transform = transform
         self.strong_transform = strong_transform
@@ -21,10 +20,7 @@ class RafDataSet(data.Dataset):
 
         NAME_COLUMN = 0
         LABEL_COLUMN = 1
-        df = pd.read_csv(
-            os.path.join(self.raf_path, 'EmoLabel/list_patition_label.txt'),
-            sep=' ', header=None
-        )
+        df = pd.read_csv(os.path.join(self.raf_path, 'EmoLabel/list_patition_label.txt'), sep=' ', header=None)
         if phase == 'train':
             dataset = df[df[NAME_COLUMN].str.startswith('train')]
         else:
@@ -32,9 +28,9 @@ class RafDataSet(data.Dataset):
         file_names = dataset.iloc[:, NAME_COLUMN].values
         self.label = dataset.iloc[:, LABEL_COLUMN].values - 1
 
-        np.random.seed(2000)
+        seed = np.random.seed(2000)
         np.random.shuffle(file_names)
-        np.random.seed(2000)
+        seed = np.random.seed(2000)
         np.random.shuffle(self.label)
 
         self.file_paths = []
@@ -46,7 +42,11 @@ class RafDataSet(data.Dataset):
         self.basic_aug = basic_aug
         self.aug_func = [util.flip_image, util.add_gaussian_noise, util.crop, util.rotation]
         distribute = np.array(self.label)
-        self.label_dis = [np.sum(distribute == i) for i in range(7)]
+        self.label_dis = [
+            np.sum(distribute == 0), np.sum(distribute == 1), np.sum(distribute == 2),
+            np.sum(distribute == 3), np.sum(distribute == 4), np.sum(distribute == 5),
+            np.sum(distribute == 6)
+        ]
         print('The dataset distribute: %d, %d, %d, %d, %d, %d, %d' % tuple(self.label_dis))
 
     def __len__(self):
@@ -60,7 +60,7 @@ class RafDataSet(data.Dataset):
         image = cv2.imread(path)
         if image is None:
             raise FileNotFoundError('Failed to read image: %s' % path)
-        image = image[:, :, ::-1]
+        image = image[:, :, ::-1]  # BGR to RGB
         label = self.label[idx]
 
         if self.phase == 'train' and self.basic_aug and random.uniform(0, 1) > 0.5:
@@ -78,11 +78,9 @@ class RafDataSet(data.Dataset):
 class FER(data.Dataset):
     """FER2013 loader using the CAST/RAF-DB class order.
 
-    For target training, weak2_transform enables the improved dual-view EMA
-    teacher path. With weak2_transform and strong_transform enabled the item is
-    returned as (weak_view_1, weak_view_2, strong_view, label). The target
-    ground-truth label is carried only for offline evaluation/debugging and is
-    never used to generate pseudo labels.
+    For target training this class can return two independently sampled weak
+    views plus one strong view. The extra weak view is the only data-pipeline
+    change required by the EMA + Dual View ablation.
     """
 
     FER_TO_CAST = {
@@ -124,9 +122,7 @@ class FER(data.Dataset):
                 break
 
         if not files:
-            expected = ' or '.join(
-                os.path.join(path, name, '*', '*.jpg') for name in split_candidates
-            )
+            expected = ' or '.join(os.path.join(path, name, '*', '*.jpg') for name in split_candidates)
             raise FileNotFoundError(
                 'No FER2013 images found for phase %s. Expected %s' % (phase, expected)
             )
@@ -139,14 +135,12 @@ class FER(data.Dataset):
             self.file_paths.append(file)
             original_label = int(os.path.basename(os.path.dirname(file)))
             if original_label not in self.FER_TO_CAST:
-                raise ValueError('Unexpected FER2013 class id %s in %s' %
-                                 (original_label, file))
+                raise ValueError('Unexpected FER2013 class id %s in %s' % (original_label, file))
             self.label.append(self.FER_TO_CAST[original_label])
 
         distribute = np.array(self.label)
         self.label_dis = [np.sum(distribute == i) for i in range(7)]
-        print('FER %s split (%s), samples: %d' %
-              (phase, used_split, len(self.file_paths)))
+        print('FER %s split (%s), samples: %d' % (phase, used_split, len(self.file_paths)))
         print('The dataset distribute: %d, %d, %d, %d, %d, %d, %d' % tuple(self.label_dis))
 
     def __len__(self):
@@ -160,26 +154,24 @@ class FER(data.Dataset):
         image = cv2.imread(path)
         if image is None:
             raise FileNotFoundError('Failed to read image: %s' % path)
-        image = image[:, :, ::-1]
+        image = image[:, :, ::-1]  # BGR to RGB
         label = self.label[idx]
 
         if self.phase == 'train' and self.basic_aug and random.uniform(0, 1) > 0.5:
             index = random.randint(0, 1)
             image = self.aug_func[index](image)
 
-        weak1 = self.transform(image) if self.transform is not None else image
-        weak2 = None
-        strong = None
+        img = self.transform(image) if self.transform is not None else image
 
         if self.weak2_transform is not None:
-            weak2 = self.weak2_transform(image)
-        if self.strong_transform is not None:
-            strong = self.strong_transform(image)
+            img_weak2 = self.weak2_transform(image)
+            if self.strong_transform is not None:
+                img_strong = self.strong_transform(image)
+                return img, img_weak2, img_strong, label
+            return img, img_weak2, label
 
-        if weak2 is not None and strong is not None:
-            return weak1, weak2, strong, label
-        if weak2 is not None:
-            return weak1, weak2, label
-        if strong is not None:
-            return weak1, strong, label
-        return weak1, label
+        if self.strong_transform is not None:
+            img_strong = self.strong_transform(image)
+            return img, img_strong, label
+
+        return img, label

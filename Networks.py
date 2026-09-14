@@ -3,23 +3,13 @@ import torch
 from torchvision import models
 
 
-def build_backbone(name, pretrained):
-    """Keep legacy ImageNet V1 initialization and support both torchvision APIs."""
-    enums = {'mobilenet_v2': 'MobileNet_V2_Weights',
-             'resnet18': 'ResNet18_Weights', 'resnet50': 'ResNet50_Weights'}
-    builder = getattr(models, name)
-    weights_enum = getattr(models, enums[name], None)
-    if weights_enum is not None:
-        return builder(weights=weights_enum.IMAGENET1K_V1 if pretrained else None)
-    return builder(pretrained=pretrained)
-
-
 def compute_kernel_matrix(source, target, kernel_mul=2.0, kernel_num=5):
-    """Multi-kernel Gaussian matrix used by MK-MMD."""
+    """Multi-kernel Gaussian matrix used by MK-MMD (paper Eq. 9-12)."""
     n_samples = int(source.size(0)) + int(target.size(0))
     total = torch.cat([source, target], dim=0)
-    # Materialize only N x N distances, not an N x N x feature_dim tensor.
-    l2_distance = torch.cdist(total, total, p=2).pow(2)
+    total0 = total.unsqueeze(0).expand(total.size(0), total.size(0), total.size(1))
+    total1 = total.unsqueeze(1).expand(total.size(0), total.size(0), total.size(1))
+    l2_distance = ((total0 - total1) ** 2).sum(2)
 
     if n_samples <= 1:
         return torch.zeros_like(l2_distance)
@@ -33,11 +23,11 @@ def compute_kernel_matrix(source, target, kernel_mul=2.0, kernel_num=5):
 
 
 def mmd_loss(source_features, target_features):
-    """Unbiased MK-MMD estimator."""
+    """Unbiased MK-MMD estimator corresponding to paper Eq. (9)-(10)."""
     ns = source_features.size(0)
     nt = target_features.size(0)
     if ns < 2 or nt < 2:
-        return (source_features.sum() + target_features.sum()) * 0.0
+        return source_features.new_tensor(0.0)
 
     kernels = compute_kernel_matrix(source_features, target_features)
     xx = kernels[:ns, :ns]
@@ -59,66 +49,44 @@ def remove_element(features, index):
 
 
 class Model(nn.Module):
-    """Shared FER backbone plus CAST DDRL/CCDR feature constraints.
-
-    The improved branch keeps the original MK-MMD based DDRL and exposes
-    features to the training loop so the target prototype affinity loss can
-    be computed with reliable EMA-teacher pseudo labels.
-    """
-
-    def __init__(self, backbone='mobilenet_v2', num_classes=7, pretrained=True,
-                 drop_rate=0.5, density_bandwidth=0.2,
-                 class_weight_max=1.0, loss_clip=5.0):
+    def __init__(self, backbone='resnet50', num_classes=7, pretrained=True,
+                 drop_rate=0.5, density_bandwidth=0.2):
         super(Model, self).__init__()
         self.drop_rate = drop_rate
         self.num_classes = num_classes
         self.density_bandwidth = density_bandwidth
-        self.class_weight_max = class_weight_max
-        self.loss_clip = loss_clip
         self.bn = nn.BatchNorm1d(num_classes)
 
         if backbone == 'resnet18':
             self.feature = nn.Sequential(
-                *list(build_backbone('resnet18', pretrained).children())[:-1],
+                *list(models.resnet18(pretrained=pretrained).children())[:-1],
                 nn.Flatten(),
                 nn.Dropout(drop_rate)
             )
-            self.feature_dim = 512
-            self.fc = nn.Linear(self.feature_dim, num_classes, bias=False)
+            self.fc = nn.Linear(512, num_classes, bias=False)
 
         elif backbone == 'resnet50':
             self.feature = nn.Sequential(
-                *list(build_backbone('resnet50', pretrained).children())[:-1],
+                *list(models.resnet50(pretrained=pretrained).children())[:-1],
                 nn.Flatten(),
                 nn.Dropout(drop_rate),
                 nn.Linear(2048, 512)
             )
-            self.feature_dim = 512
-            self.fc = nn.Linear(self.feature_dim, num_classes, bias=False)
+            self.fc = nn.Linear(512, num_classes, bias=False)
 
         elif backbone == 'mobilenet_v2':
             self.feature = nn.Sequential(
-                *list(build_backbone('mobilenet_v2', pretrained).children())[:-1],
+                *list(models.mobilenet_v2(pretrained=pretrained).children())[:-1],
                 nn.AdaptiveAvgPool2d(1),
                 nn.Flatten(),
                 nn.Dropout(drop_rate),
                 nn.Linear(1280, 512),
                 nn.Dropout(drop_rate)
             )
-            self.feature_dim = 512
-            self.fc = nn.Linear(self.feature_dim, num_classes, bias=False)
+            self.fc = nn.Linear(512, num_classes, bias=False)
 
         else:
             raise ValueError('Backbone Error!')
-
-    def _stabilize_loss(self, loss):
-        loss = torch.nan_to_num(
-            loss,
-            nan=0.0,
-            posinf=self.loss_clip,
-            neginf=-self.loss_clip,
-        )
-        return torch.clamp(loss, min=-self.loss_clip, max=self.loss_clip)
 
     def forward(self, x, targets=None, idx=None, mode='train', task='target',
                 epoch=0, source_count=None):
@@ -126,8 +94,7 @@ class Model(nn.Module):
         out = self.bn(self.fc(fea))
 
         if mode != 'train':
-            # Teacher features stay on-device for prototype memory updates.
-            return out, fea
+            return out, fea.cpu()
 
         if task == 'source':
             features = self.split_feature_makeLD(fea, targets)
@@ -140,29 +107,24 @@ class Model(nn.Module):
                 if class_features.size(0) >= 2 and other_features.size(0) >= 2:
                     inter_loss += mmd_loss(class_features, other_features) * eta[i]
 
-            class_separation_loss = -inter_loss / self.num_classes
-            class_separation_loss = self._stabilize_loss(class_separation_loss)
-            return [out, class_separation_loss, fea]
+            # Paper Eq. (11)-(12): maximize inter-class discrepancy.
+            affinity_loss = -inter_loss / self.num_classes
+            return [out, affinity_loss]
 
         if task == 'target':
             if idx is None or source_count is None:
                 raise ValueError('Target training requires confidence mask idx and source_count.')
 
-            source_count = int(source_count)
-            if not 0 <= source_count <= fea.size(0):
-                raise ValueError('source_count must partition the original batch.')
-            source_mask = idx[:source_count] > 0
-            target_mask = idx[source_count:] > 0
-            source_fea = fea[:source_count][source_mask]
-            source_targets = targets[:source_count][source_mask]
-            target_fea = fea[source_count:][target_mask]
-            target_targets = targets[source_count:][target_mask]
-            if source_fea.size(0) + target_fea.size(0) == 0:
-                zero = fea.sum() * 0.0
-                return [out, zero, fea, zero, zero]
+            valid_idx = (idx == 1).nonzero(as_tuple=False).squeeze(1)
+            fea_selected = torch.index_select(fea, 0, valid_idx)
+            targets_selected = torch.index_select(targets, 0, valid_idx)
 
-            fea_selected = torch.cat((source_fea, target_fea), dim=0)
-            targets_selected = torch.cat((source_targets, target_targets), dim=0)
+            # Source samples are concatenated first and are always confident.
+            source_count = min(int(source_count), fea_selected.size(0))
+            source_fea = fea_selected[:source_count]
+            source_targets = targets_selected[:source_count]
+            target_fea = fea_selected[source_count:]
+            target_targets = targets_selected[source_count:]
 
             source_features = self.split_feature_makeLD(source_fea, source_targets)
             target_features = self.split_feature_makeLD(target_fea, target_targets)
@@ -171,36 +133,28 @@ class Model(nn.Module):
 
             intra_loss = fea.new_tensor(0.0)
             inter_loss = fea.new_tensor(0.0)
-            aligned_classes = separated_classes = 0
 
             for i in range(self.num_classes):
                 fea_s = source_features[i]
                 fea_t = target_features[i]
                 if fea_s.size(0) >= 2 and fea_t.size(0) >= 2:
                     intra_loss += mmd_loss(fea_s, fea_t) * eta[i]
-                    aligned_classes += 1
 
                 class_features = all_features[i]
                 other_features = remove_element(all_features, i)
                 if class_features.size(0) >= 2 and other_features.size(0) >= 2:
                     inter_loss += mmd_loss(class_features, other_features) * eta[i]
-                    separated_classes += 1
 
-            # Missing classes must not dilute the available constraints.
-            domain_alignment_loss = intra_loss / max(aligned_classes, 1)
-            class_enhancement_loss = -inter_loss / max(separated_classes, 1)
-
-            domain_alignment_loss = self._stabilize_loss(domain_alignment_loss)
-            class_enhancement_loss = self._stabilize_loss(class_enhancement_loss)
-            ddrl_loss = domain_alignment_loss + class_enhancement_loss
-            return [out, ddrl_loss, fea,
-                    domain_alignment_loss, class_enhancement_loss]
+            # Paper Eq. (12): intra-class domain alignment + inter-class separation.
+            affinity_loss = (intra_loss - inter_loss) / self.num_classes
+            return [out, affinity_loss]
 
         raise ValueError('Unknown task: %s' % task)
 
     def split_feature_makeLD(self, x, target):
         if x.size(0) == 0:
-            return [x.new_empty((0, self.feature_dim)) for _ in range(self.num_classes)]
+            feature_dim = self.fc.in_features
+            return [x.new_empty((0, feature_dim)) for _ in range(self.num_classes)]
 
         x_parts = []
         for c in range(self.num_classes):
@@ -209,10 +163,15 @@ class Model(nn.Module):
         return x_parts
 
     def volume(self, features):
-        """Stable class-level representation weights used by CCDR.
+        """CCDR class-level representation weights from paper Eq. (2)-(5).
 
-        Empty classes are assigned zero weight. The upper bound prevents an
-        unexpectedly sparse batch from producing a dominating class weight.
+        The paper defines rho_i = (1 / (N_c h)) * sum_j k((f_i-f_j)/h),
+        V_c = sum_i 1/rho_i, and eta_c = 1/V_c.  We therefore compute the
+        Gaussian kernel directly in representation space instead of using
+        sklearn KernelDensity's *normalized high-dimensional probability
+        density*.  The latter contains an h^{-d} normalization term; in a
+        512-D feature space it can make densities astronomically large and
+        eta_c explode to ~1e12, which is not the quantity in Eq. (2).
         """
         if not features:
             return []
@@ -233,8 +192,6 @@ class Model(nn.Module):
                 rho = rho.clamp_min(1e-12)
                 volume = torch.sum(1.0 / rho)
                 eta = 1.0 / volume.clamp_min(1e-12)
-                eta = torch.nan_to_num(eta, nan=0.0, posinf=self.class_weight_max)
-                eta = torch.clamp(eta, min=0.0, max=self.class_weight_max)
                 weights.append(float(eta.item()))
 
         return weights
