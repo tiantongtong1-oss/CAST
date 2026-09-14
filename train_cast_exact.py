@@ -22,8 +22,10 @@ Compatibility-only changes relative to the public repository:
 3) for a canonical FER2013 split, train + val are merged into the public
    repository's single target "train" set. This yields the paper Table-I
    FER2013 distribution [3586,4593,492,8110,5483,4462,5572] in CAST order;
-4) modern torchvision / torch.load compatibility;
-5) diagnostics are clearer, but do not alter optimization.
+4) old torchvision pretrained=True semantics are pinned to IMAGENET1K_V1
+   rather than modern DEFAULT weights;
+5) modern torch.load compatibility;
+6) diagnostics are clearer, but do not alter optimization.
 
 IMPORTANT PROTOCOL NOTE:
 The public repository evaluates the target TEST set after every source and
@@ -104,15 +106,32 @@ def seed_everything(seed: int):
 
 
 def _build_backbone(name: str, pretrained: bool):
-    """Same ImageNet initialization semantics as torchvision's old pretrained=True."""
+    """Match the legacy torchvision pretrained=True initialization.
+
+    The public CAST environment is PyTorch 1.8.1-era code and calls
+    models.<backbone>(pretrained=True). Modern torchvision maps DEFAULT to newer
+    recipes for some models (notably ResNet50 V2), so exact reproduction must
+    request IMAGENET1K_V1 explicitly.
+    """
     try:
         if name == "resnet18":
-            return models.resnet18(weights=models.ResNet18_Weights.DEFAULT if pretrained else None)
+            weights = models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
+            if pretrained:
+                print("[Init] resnet18 legacy pretrained=True -> IMAGENET1K_V1")
+            return models.resnet18(weights=weights)
         if name == "resnet50":
-            return models.resnet50(weights=models.ResNet50_Weights.DEFAULT if pretrained else None)
+            weights = models.ResNet50_Weights.IMAGENET1K_V1 if pretrained else None
+            if pretrained:
+                print("[Init] resnet50 legacy pretrained=True -> IMAGENET1K_V1")
+            return models.resnet50(weights=weights)
         if name == "mobilenet_v2":
-            return models.mobilenet_v2(weights=models.MobileNet_V2_Weights.DEFAULT if pretrained else None)
+            weights = models.MobileNet_V2_Weights.IMAGENET1K_V1 if pretrained else None
+            if pretrained:
+                print("[Init] mobilenet_v2 legacy pretrained=True -> IMAGENET1K_V1")
+            return models.mobilenet_v2(weights=weights)
     except AttributeError:
+        # Old torchvision path: pretrained=True already means the historical V1
+        # weights, which is exactly what the public CAST repository used.
         if name == "resnet18":
             return models.resnet18(pretrained=pretrained)
         if name == "resnet50":
@@ -683,8 +702,10 @@ def main():
 
     # ------------------------------------------------------------------
     # Phase 2: exact public-repo target self-training.
+    # Keep the source iterator lazy, as in public train.py: it is first created
+    # only after the first target batch has already been drawn.
     # ------------------------------------------------------------------
-    source_train_iter = iter(source_train_loader)
+    source_train_iter = None
     for epoch in range(args.epochs):
         cls_sum = 0.0
         aff_sum = 0.0
@@ -698,6 +719,8 @@ def main():
 
         for imgs, imgs_aug, gt_target in target_train_loader:
             try:
+                if source_train_iter is None:
+                    raise StopIteration
                 source_imgs, _, source_targets = next(source_train_iter)
             except StopIteration:
                 source_train_iter = iter(source_train_loader)
