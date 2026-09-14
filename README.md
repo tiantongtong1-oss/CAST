@@ -16,3 +16,7 @@ Ubuntu 16.04 LTS, python 3.8, pytorch 1.8.1
 ## MobileNetV2 dual-view EMA branch
 
 See [implementation changes and training commands](IMPROVEMENTS.md) and the behavioral tests in `tests/test_cast.py`.
+
+[Code-audited architecture and figure downloads](docs/ARCHITECTURE.md)
+
+![MobileNetV2 Dual-View EMA CAST](docs/cast_mobilenetv2_framework.png)
