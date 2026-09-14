@@ -117,7 +117,7 @@ def test_pseudo_bank_catm_and_agreement():
 
 def test_source_class_correction_only_uses_source_bias():
     # Class 1 is strongly under-predicted and should be boosted; class 0 is
-    # over-predicted and should not be boosted.  No target distribution enters.
+    # over-predicted and should not be boosted. No target distribution enters.
     corr = source_class_correction(
         class_total=[100, 100, 100],
         predicted_counts=[160, 20, 120],
@@ -129,3 +129,32 @@ def test_source_class_correction_only_uses_source_bias():
     assert corr[1] > 1.0
     assert corr[0] <= 1.0
     assert all(0.85 <= x <= 1.5 for x in corr)
+
+
+def test_source_correction_does_not_change_target_argmax_or_selection():
+    """v6.3 invariant: source correction is loss-side only."""
+    ds = TinyPseudoDataset()
+    loader = DataLoader(ds, batch_size=3, shuffle=False)
+
+    base = build_pseudo_bank(
+        IdentityTeacher(), loader, len(ds), 3, torch.device("cpu"),
+        epoch=0, total_epochs=10, phi=1.0, threshold_cap=0.99,
+        class_correction=[1.0, 1.0, 1.0],
+        debug_target_labels=True,
+    )
+    corrected = build_pseudo_bank(
+        IdentityTeacher(), loader, len(ds), 3, torch.device("cpu"),
+        epoch=0, total_epochs=10, phi=1.0, threshold_cap=0.99,
+        class_correction=[0.85, 1.5, 1.25],
+        class_balance_max=1.25,
+        class_weight_correction_gate=1.10,
+        debug_target_labels=True,
+    )
+
+    assert torch.equal(base.labels, corrected.labels)
+    assert torch.equal(base.selected, corrected.selected)
+    assert torch.allclose(base.confidence, corrected.confidence)
+    assert torch.allclose(base.thresholds, corrected.thresholds)
+    assert corrected.class_weights[0] == 1.0
+    assert corrected.class_weights[1] > 1.0
+    assert corrected.class_weights[2] > 1.0
