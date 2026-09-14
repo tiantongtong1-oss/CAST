@@ -12,6 +12,25 @@ from torchvision import models
 CLASS_NAMES = ("surprise", "fear", "disgust", "happy", "sad", "angry", "neutral")
 
 
+def _build_torchvision_backbone(backbone: str, pretrained: bool):
+    """Construct torchvision models with the post-0.13 weights API.
+
+    CAST v6 normally sets pretrained=False because it immediately restores the
+    source-domain checkpoint. Keeping the optional pretrained path here avoids
+    deprecated `pretrained=` warnings without changing model structure.
+    """
+    if backbone == "resnet18":
+        weights = models.ResNet18_Weights.DEFAULT if pretrained else None
+        return models.resnet18(weights=weights)
+    if backbone == "resnet50":
+        weights = models.ResNet50_Weights.DEFAULT if pretrained else None
+        return models.resnet50(weights=weights)
+    if backbone == "mobilenet_v2":
+        weights = models.MobileNet_V2_Weights.DEFAULT if pretrained else None
+        return models.mobilenet_v2(weights=weights)
+    raise ValueError("Unsupported backbone: %s" % backbone)
+
+
 class FERNet(nn.Module):
     """Shared FER backbone + classifier.
 
@@ -30,14 +49,13 @@ class FERNet(nn.Module):
         self.use_logit_bn = use_logit_bn
         self.bn = nn.BatchNorm1d(num_classes)
 
+        base = _build_torchvision_backbone(backbone, pretrained)
         if backbone == "resnet18":
-            base = models.resnet18(pretrained=pretrained)
             self.feature = nn.Sequential(
                 *list(base.children())[:-1], nn.Flatten(), nn.Dropout(drop_rate)
             )
             feat_dim = 512
         elif backbone == "resnet50":
-            base = models.resnet50(pretrained=pretrained)
             self.feature = nn.Sequential(
                 *list(base.children())[:-1],
                 nn.Flatten(),
@@ -46,7 +64,6 @@ class FERNet(nn.Module):
             )
             feat_dim = 512
         elif backbone == "mobilenet_v2":
-            base = models.mobilenet_v2(pretrained=pretrained)
             self.feature = nn.Sequential(
                 *list(base.children())[:-1],
                 nn.AdaptiveAvgPool2d(1),
@@ -87,7 +104,10 @@ def _strip_module_prefix(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tens
 
 def load_source_checkpoint(model: nn.Module, checkpoint_path: str, device: torch.device,
                            min_coverage: float = 0.90) -> Dict[str, object]:
-    raw = torch.load(checkpoint_path, map_location=device)
+    # This project loads a local, user-controlled CAST checkpoint. Passing the
+    # flag explicitly keeps the current behavior and removes PyTorch's future
+    # default-change warning.
+    raw = torch.load(checkpoint_path, map_location=device, weights_only=False)
     if isinstance(raw, dict) and "model" in raw:
         state = raw["model"]
     elif isinstance(raw, dict) and "state_dict" in raw:
