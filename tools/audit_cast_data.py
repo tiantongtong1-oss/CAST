@@ -73,9 +73,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--source-root", required=True)
     ap.add_argument("--target-root", required=True)
-    ap.add_argument("--fer-folder-order", default="cast", choices=["cast", "kaggle"])
+    ap.add_argument("--fer-folder-order", default="kaggle", choices=["cast", "kaggle"],
+                    help="Canonical FER2013 numeric folders are Kaggle order; use cast only for a physically pre-remapped copy.")
     ap.add_argument("--hash-duplicates", action="store_true")
     args = ap.parse_args()
+
+    print("[FER label map] canonical FER2013/Kaggle -> CAST internal order: "
+          "0:angry->5, 1:disgust->2, 2:fear->1, 3:happy->3, "
+          "4:sad->4, 5:surprise->0, 6:neutral->6")
 
     raf_train = build_rafdb(args.source_root, "train", mode="eval")
     raf_test = build_rafdb(args.source_root, "test", mode="eval")
@@ -102,9 +107,9 @@ def main():
         report["fer_train_test_duplicates"] = dup[:50]
 
     if fer_train.class_counts == FER_TRAIN_CAST_EXPECTED:
-        print("[Label-map] FER train count signature matches CAST order: surprise,fear,disgust,happy,sad,angry,neutral.")
+        print("[Label-map] FER train count signature matches CAST internal order: surprise,fear,disgust,happy,sad,angry,neutral.")
     else:
-        print("[Label-map][WARN] FER class count signature differs from the expected CAST-order FER2013 train split.")
+        print("[Label-map][WARN] FER class count signature differs from expected CAST-order FER2013 after mapping.")
 
     print("\nManual semantic check is still required: open several sample_paths from every class; counts cannot prove folder semantics.")
     print(json.dumps(report, ensure_ascii=False, indent=2)[:12000])
