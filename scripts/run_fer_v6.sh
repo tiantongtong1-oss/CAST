@@ -33,6 +33,7 @@ python train_v6.py \
   --affinity-warmup 5 \
   --affinity-mid-epochs 5 \
   --affinity-mid-weight 0.005 \
-  --bn-recalibrate-batches 0 \
+  --bn-recalibrate-batches 64 \
+  --bn-recalibrate-momentum 0.03 \
   --early-stop-patience 4 \
   --debug-target-labels
