@@ -1,11 +1,10 @@
 from torch import nn
 import torch
 from torchvision import models
-import numpy as np
-from sklearn.neighbors import KernelDensity
 
 
 def compute_kernel_matrix(source, target, kernel_mul=2.0, kernel_num=5):
+    """Multi-kernel Gaussian matrix used by MK-MMD (paper Eq. 9-12)."""
     n_samples = int(source.size(0)) + int(target.size(0))
     total = torch.cat([source, target], dim=0)
     total0 = total.unsqueeze(0).expand(total.size(0), total.size(0), total.size(1))
@@ -24,7 +23,7 @@ def compute_kernel_matrix(source, target, kernel_mul=2.0, kernel_num=5):
 
 
 def mmd_loss(source_features, target_features):
-    """Unbiased multi-kernel MMD matching Eq. (9)-(10) in the CAST paper."""
+    """Unbiased MK-MMD estimator corresponding to paper Eq. (9)-(10)."""
     ns = source_features.size(0)
     nt = target_features.size(0)
     if ns < 2 or nt < 2:
@@ -42,19 +41,21 @@ def mmd_loss(source_features, target_features):
 
 
 def remove_element(features, index):
-    others = [feature for i, feature in enumerate(features) if i != index and feature.size(0) > 0]
+    others = [feature for i, feature in enumerate(features)
+              if i != index and feature.size(0) > 0]
     if not others:
         return features[index].new_empty((0, features[index].size(1)))
     return torch.cat(others, dim=0)
 
 
 class Model(nn.Module):
-    def __init__(self, backbone='resnet50', num_classes=7, pretrained=True, drop_rate=0.5):
+    def __init__(self, backbone='resnet50', num_classes=7, pretrained=True,
+                 drop_rate=0.5, density_bandwidth=0.2):
         super(Model, self).__init__()
         self.drop_rate = drop_rate
         self.num_classes = num_classes
+        self.density_bandwidth = density_bandwidth
         self.bn = nn.BatchNorm1d(num_classes)
-        self.kde = KernelDensity(bandwidth=0.2, kernel='gaussian')
 
         if backbone == 'resnet18':
             self.feature = nn.Sequential(
@@ -87,7 +88,8 @@ class Model(nn.Module):
         else:
             raise ValueError('Backbone Error!')
 
-    def forward(self, x, targets=None, idx=None, mode='train', task='target', epoch=0, source_count=None):
+    def forward(self, x, targets=None, idx=None, mode='train', task='target',
+                epoch=0, source_count=None):
         fea = self.feature(x)
         out = self.bn(self.fc(fea))
 
@@ -105,7 +107,7 @@ class Model(nn.Module):
                 if class_features.size(0) >= 2 and other_features.size(0) >= 2:
                     inter_loss += mmd_loss(class_features, other_features) * eta[i]
 
-            # Eq. (11)-(12): enlarge inter-class discrepancy.
+            # Paper Eq. (11)-(12): maximize inter-class discrepancy.
             affinity_loss = -inter_loss / self.num_classes
             return [out, affinity_loss]
 
@@ -117,9 +119,8 @@ class Model(nn.Module):
             fea_selected = torch.index_select(fea, 0, valid_idx)
             targets_selected = torch.index_select(targets, 0, valid_idx)
 
-            # All source samples are placed first and are always marked confident.
-            source_count = int(source_count)
-            source_count = min(source_count, fea_selected.size(0))
+            # Source samples are concatenated first and are always confident.
+            source_count = min(int(source_count), fea_selected.size(0))
             source_fea = fea_selected[:source_count]
             source_targets = targets_selected[:source_count]
             target_fea = fea_selected[source_count:]
@@ -144,41 +145,53 @@ class Model(nn.Module):
                 if class_features.size(0) >= 2 and other_features.size(0) >= 2:
                     inter_loss += mmd_loss(class_features, other_features) * eta[i]
 
-            # Eq. (12): class-conditional alignment plus inter-class separation.
+            # Paper Eq. (12): intra-class domain alignment + inter-class separation.
             affinity_loss = (intra_loss - inter_loss) / self.num_classes
             return [out, affinity_loss]
 
         raise ValueError('Unknown task: %s' % task)
 
     def split_feature_makeLD(self, x, target):
-        x_parts = []
         if x.size(0) == 0:
             feature_dim = self.fc.in_features
             return [x.new_empty((0, feature_dim)) for _ in range(self.num_classes)]
 
+        x_parts = []
         for c in range(self.num_classes):
             ind = (target == c).nonzero(as_tuple=False).squeeze(1)
             x_parts.append(torch.index_select(x, 0, ind))
         return x_parts
 
     def volume(self, features):
-        """CCDR class-level representation modulation, Eq. (2)-(5).
+        """CCDR class-level representation weights from paper Eq. (2)-(5).
 
-        sklearn KernelDensity.score_samples returns log-density, so convert it
-        back to density before computing V_c = sum_i 1/rho_i and eta_c = 1/V_c.
+        The paper defines rho_i = (1 / (N_c h)) * sum_j k((f_i-f_j)/h),
+        V_c = sum_i 1/rho_i, and eta_c = 1/V_c.  We therefore compute the
+        Gaussian kernel directly in representation space instead of using
+        sklearn KernelDensity's *normalized high-dimensional probability
+        density*.  The latter contains an h^{-d} normalization term; in a
+        512-D feature space it can make densities astronomically large and
+        eta_c explode to ~1e12, which is not the quantity in Eq. (2).
         """
-        eta = np.zeros(len(features), dtype=np.float64)
-        for idx, feature in enumerate(features):
-            f = feature.detach().cpu().numpy()
-            if len(f) == 0:
-                eta[idx] = 0.0
+        if not features:
+            return []
+
+        h = float(self.density_bandwidth)
+        weights = []
+        for feature in features:
+            n = feature.size(0)
+            if n == 0:
+                weights.append(0.0)
                 continue
 
-            self.kde.fit(f)
-            log_density = self.kde.score_samples(f)
-            density = np.exp(log_density)
-            density = np.maximum(density, 1e-12)
-            volume = np.sum(1.0 / density)
-            eta[idx] = 1.0 / max(volume, 1e-12)
+            with torch.no_grad():
+                f = feature.detach()
+                distance_sq = torch.cdist(f, f, p=2).pow(2)
+                gaussian_kernel = torch.exp(-distance_sq / (2.0 * h * h))
+                rho = gaussian_kernel.sum(dim=1) / (float(n) * h)
+                rho = rho.clamp_min(1e-12)
+                volume = torch.sum(1.0 / rho)
+                eta = 1.0 / volume.clamp_min(1e-12)
+                weights.append(float(eta.item()))
 
-        return eta
+        return weights
