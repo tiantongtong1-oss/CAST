@@ -14,14 +14,17 @@ python train_v6.py \
   --target-lr 2e-4 \
   --backbone-lr-mult 0.25 \
   --target-lambda 0.35 \
+  --target-lambda-ramp 4 \
   --ema-decay 0.999 \
   --phi 1.4 \
   --threshold-cap 0.95 \
   --pseudo-keep-start 0.35 \
   --pseudo-keep-end 0.55 \
-  --distribution-align-alpha 0.35 \
-  --distribution-align-max 2.0 \
-  --pseudo-class-weight-max 2.0 \
+  --source-correction-alpha 0.5 \
+  --source-correction-min 0.85 \
+  --source-correction-max 1.5 \
+  --pseudo-class-weight-max 1.25 \
+  --class-weight-correction-gate 1.10 \
   --w1 4.0 \
   --w2 0.01 \
   --w3 0.1 \
