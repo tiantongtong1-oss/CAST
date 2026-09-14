@@ -6,7 +6,7 @@ python train_v6.py \
   --target-root /workspace/ttt/code/data/fer2013 \
   --checkpoint ./models/cast_resnet50_v4/resnet50_rafdb_fer_source_final.pth \
   --backbone resnet50 \
-  --fer-folder-order cast \
+  --fer-folder-order kaggle \
   --epochs 30 \
   --batch-size 64 \
   --eval-batch-size 128 \
