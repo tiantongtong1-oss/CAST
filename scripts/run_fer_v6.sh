@@ -7,7 +7,7 @@ python train_v6.py \
   --checkpoint ./models/cast_resnet50_v4/resnet50_rafdb_fer_source_final.pth \
   --backbone resnet50 \
   --fer-folder-order kaggle \
-  --epochs 30 \
+  --epochs 15 \
   --batch-size 64 \
   --eval-batch-size 128 \
   --workers 10 \
@@ -16,15 +16,21 @@ python train_v6.py \
   --target-lambda 0.35 \
   --ema-decay 0.999 \
   --phi 1.4 \
+  --threshold-cap 0.95 \
+  --pseudo-keep-start 0.35 \
+  --pseudo-keep-end 0.55 \
+  --distribution-align-alpha 0.35 \
+  --distribution-align-max 2.0 \
+  --pseudo-class-weight-max 2.0 \
   --w1 4.0 \
-  --w2 0.03 \
+  --w2 0.01 \
   --w3 0.1 \
   --ddrl-min-class-samples 2 \
   --ddrl-min-classes 3 \
   --affinity-warmup 5 \
   --affinity-mid-epochs 5 \
-  --affinity-mid-weight 0.01 \
-  --bn-recalibrate-batches 64 \
-  --bn-recalibrate-momentum 0.03 \
+  --affinity-mid-weight 0.005 \
+  --bn-recalibrate-batches 0 \
+  --early-stop-patience 4 \
   --debug-target-labels \
   --abort-on-collapse
