@@ -3,31 +3,20 @@ import torch
 from sklearn.neighbors import KernelDensity
 from torch import nn
 from torchvision import models
+from domain_bn import set_bn_domain
 
 
 def mmd_loss(source_features, target_features):
     """Multi-kernel MMD used by CAST DDRL."""
-    num_samples = min(source_features.size(0), target_features.size(0))
-    if num_samples == 0:
+    ns, nt = source_features.size(0), target_features.size(0)
+    if ns < 2 or nt < 2:
         return (source_features.sum() + target_features.sum()) * 0.0
-
-    device = source_features.device
-    matched_source = source_features[
-        torch.randperm(source_features.size(0), device=device)[:num_samples]
-    ]
-
-    loss = source_features.new_zeros(())
-    for _ in range(6):
-        matched_target = target_features[
-            torch.randperm(target_features.size(0), device=device)[:num_samples]
-        ]
-        kernels = compute_kernel_matrix(matched_source, matched_target)
-        xx = kernels[:num_samples, :num_samples]
-        yy = kernels[num_samples:, num_samples:]
-        xy = kernels[:num_samples, num_samples:]
-        yx = kernels[num_samples:, :num_samples]
-        loss = loss + torch.mean(xx + yy - xy - yx)
-    return loss / 6.0
+    # Paper Eq. (9): exclude self-pairs and retain unequal class sample counts.
+    kernels = compute_kernel_matrix(source_features, target_features)
+    xx, yy, xy = kernels[:ns, :ns], kernels[ns:, ns:], kernels[:ns, ns:]
+    return ((xx.sum() - xx.diagonal().sum()) / float(ns * (ns - 1))
+            + (yy.sum() - yy.diagonal().sum()) / float(nt * (nt - 1))
+            - 2.0 * xy.mean())
 
 
 def compute_kernel_matrix(source, target, kernel_mul=2.0, kernel_num=5):
@@ -108,8 +97,21 @@ class Model(nn.Module):
         source_count=None,
         compute_affinity=True,
     ):
-        fea = self.feature(x)
-        out = self.bn(self.fc(fea))
+        if getattr(self, "domain_bn", False) and mode == "train" and task == "target":
+            if source_count is None or not 0 < source_count < len(x):
+                raise ValueError("Domain-separated training needs a source_count")
+            set_bn_domain(self, "source")
+            source_fea = self.feature(x[:source_count])
+            source_out = self.bn(self.fc(source_fea))
+            set_bn_domain(self, "target")
+            target_fea = self.feature(x[source_count:])
+            target_out = self.bn(self.fc(target_fea))
+            fea = torch.cat((source_fea, target_fea), dim=0)
+            out = torch.cat((source_out, target_out), dim=0)
+        else:
+            set_bn_domain(self, task)
+            fea = self.feature(x)
+            out = self.bn(self.fc(fea))
 
         if mode != "train":
             return out, fea.cpu()
@@ -128,7 +130,7 @@ class Model(nn.Module):
                 if fea_c.shape[0] > 0 and fea_other.shape[0] > 0:
                     inter_loss = inter_loss + mmd_loss(fea_c, fea_other) * weight[c]
 
-            return [out, -inter_loss]
+            return [out, -inter_loss / float(self.num_classes)]
 
         if task == "target":
             if idx is None:
@@ -166,7 +168,7 @@ class Model(nn.Module):
                 if fea_c.shape[0] > 0 and fea_other.shape[0] > 0:
                     inter_loss = inter_loss + mmd_loss(fea_c, fea_other) * weight[c]
 
-            return [out, intra_loss - inter_loss]
+            return [out, (intra_loss - inter_loss) / float(self.num_classes)]
 
         raise ValueError("Unknown training task: %s" % task)
 

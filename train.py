@@ -15,6 +15,7 @@ from torchvision import transforms
 import Networks
 import image_utils as util
 from dataset import FER, RafDataSet
+from domain_bn import enable_domain_bn, inference_state_dict, refresh_target_bn
 from randaugment import RandAugmentMC
 
 warnings.filterwarnings("ignore")
@@ -180,37 +181,38 @@ def update_ema(student, teacher, decay):
     for teacher_param, student_param in zip(teacher.parameters(), student.parameters()):
         teacher_param.data.mul_(decay).add_(student_param.data, alpha=1.0 - decay)
     for teacher_buffer, student_buffer in zip(teacher.buffers(), student.buffers()):
-        if teacher_buffer.dtype.is_floating_point:
-            teacher_buffer.data.mul_(decay).add_(student_buffer.data, alpha=1.0 - decay)
-        else:
-            teacher_buffer.data.copy_(student_buffer.data)
+        # Running moments already use EMA. Smoothing them again with 0.999
+        # delays normalization by thousands of batches after feature updates.
+        teacher_buffer.data.copy_(student_buffer.data)
 
 
 @torch.no_grad()
-def evaluate(model, loader, num):
+def evaluate(model, loader, num, task="target", verbose=True):
     model.eval()
     correct = 0
     preds, labels = [], []
     for imgs, targets in loader:
         imgs = imgs.cuda(non_blocking=True)
         targets = targets.cuda(non_blocking=True)
-        logits, _ = model(imgs, targets, None, mode="test")
+        logits, _ = model(imgs, targets, None, mode="test", task=task)
         pred = logits.argmax(dim=1)
         correct += pred.eq(targets).sum().item()
         preds.append(pred.cpu())
         labels.append(targets.cpu())
-    util.make_confucion_matrix(preds, labels)
+    if verbose:
+        util.make_confucion_matrix(preds, labels)
     return float(np.around(correct / float(max(num, 1)), 4))
 
 
 def save_checkpoint(model, optimizer, path, epoch, accuracy, kind):
     torch.save(
         {
-            "model": model.state_dict(),
+            "model": inference_state_dict(model),
             "optimizer": optimizer.state_dict() if optimizer is not None else None,
             "epoch": epoch,
             "accuracy": accuracy,
             "model_kind": kind,
+            "training_domain_bn": getattr(model, "domain_bn", False),
         },
         path,
     )
@@ -263,9 +265,9 @@ def adapt_backbone_bn(model, target_loader, max_batches, momentum):
 
 
 @torch.no_grad()
-def build_source_prototypes(anchor, loader, class_num=7):
+def build_source_prototypes(anchor, loader, class_num=7, centers_per_class=3):
     anchor.eval()
-    sums = None
+    all_features, all_targets = [], []
     counts = torch.zeros(class_num, dtype=torch.long)
 
     for imgs, targets in loader:
@@ -274,21 +276,67 @@ def build_source_prototypes(anchor, loader, class_num=7):
         features = F.normalize(features.float(), dim=1)
         targets = targets.long().cpu()
 
-        if sums is None:
-            sums = torch.zeros(class_num, features.shape[1])
+        all_features.append(features)
+        all_targets.append(targets)
         for c in range(class_num):
             mask = targets.eq(c)
             if mask.any():
-                sums[c] += features[mask].sum(dim=0)
                 counts[c] += int(mask.sum().item())
 
-    if sums is None or (counts == 0).any():
+    if not all_features or (counts == 0).any():
         raise RuntimeError("Incomplete source prototypes: %s" % counts.tolist())
+    features = torch.cat(all_features)
+    targets = torch.cat(all_targets)
+    center = features.mean(dim=0, keepdim=True)
+    features = F.normalize(features - center, dim=1)
+    prototypes = []
+    for c in range(class_num):
+        class_features = features[targets == c]
+        # Deterministic spherical clustering covers multiple expression modes;
+        # centering removes common face components from cosine comparisons.
+        centers = [F.normalize(class_features.mean(0), dim=0)]
+        for _ in range(1, centers_per_class):
+            nearest = class_features.mm(torch.stack(centers).t()).max(1).values
+            centers.append(class_features[nearest.argmin()])
+        centers = torch.stack(centers)
+        for _ in range(10):
+            assignment = class_features.mm(centers.t()).argmax(1)
+            for k in range(centers_per_class):
+                members = class_features[assignment == k]
+                if len(members):
+                    centers[k] = F.normalize(members.mean(0), dim=0)
+        prototypes.append(centers)
+    return {"center": center, "centers": torch.stack(prototypes)}, counts
 
-    prototypes = F.normalize(
-        sums / counts.float().unsqueeze(1).clamp_min(1.0), dim=1
-    )
-    return prototypes, counts
+
+def prototype_similarity(features, bank):
+    centered = F.normalize(F.normalize(features.float(), dim=1) - bank["center"], dim=1)
+    centers = bank["centers"]
+    return centered.mm(centers.flatten(0, 1).t()).view(len(features), len(centers), -1).max(2).values
+
+
+def smoothed_cross_entropy(logits, targets, smoothing):
+    log_prob = F.log_softmax(logits, dim=1)
+    nll = -log_prob.gather(1, targets.unsqueeze(1)).squeeze(1)
+    return ((1.0 - smoothing) * nll - smoothing * log_prob.mean(dim=1)).mean()
+
+
+@torch.no_grad()
+def calibrate_temperature(model, source_val_loader):
+    """Select a scalar temperature by source-validation NLL, never target labels."""
+    model.eval()
+    logits, labels = [], []
+    for images, targets in source_val_loader:
+        out, _ = model(images.cuda(non_blocking=True), None, None, "test", "source")
+        logits.append(out.cpu())
+        labels.append(targets.long().cpu())
+    logits, labels = torch.cat(logits), torch.cat(labels)
+    temperatures = torch.logspace(0.0, np.log10(8.0), steps=41)
+    losses = torch.stack([F.cross_entropy(logits / t, labels) for t in temperatures])
+    temperature = float(temperatures[losses.argmin()])
+    print("Source-validation temperature %.4f NLL %.4f -> %.4f"
+          % (temperature, float(losses[0]), float(losses.min())))
+    return temperature
 
 
 def tempered_probability(logits, temperature):
@@ -401,6 +449,7 @@ def build_epoch_pseudo_bank(
     temporal_streak,
     args,
     epoch,
+    previous_counts=None,
 ):
     """Build a balanced bank and seed missing classes without requiring teacher top-1."""
     teacher.eval()
@@ -447,8 +496,7 @@ def build_epoch_pseudo_bank(
         anchor_conf, anchor_pred = anchor_prob.max(dim=1)
         anchor_match = anchor_pred.eq(target) & (anchor_conf >= args.anchor_min_confidence)
 
-        features = F.normalize(anchor_features.float(), dim=1)
-        similarity = features.mm(prototypes.t())
+        similarity = prototype_similarity(anchor_features, prototypes)
         proto_top2 = torch.topk(similarity, k=2, dim=1)
         proto_pred = proto_top2.indices[:, 0]
         proto_margin = proto_top2.values[:, 0] - proto_top2.values[:, 1]
@@ -466,7 +514,9 @@ def build_epoch_pseudo_bank(
         if strict_anchor:
             trusted_batch = base & anchor_cpu & proto_match
         else:
-            trusted_batch = base & (anchor_cpu | proto_match)
+            # The v4 OR gate can admit a confidently wrong class when
+            # teacher and anchor shared a bias. Geometry remains mandatory.
+            trusted_batch = base & proto_match
 
         proto_quality = ((proto_margin - args.prototype_min_margin) / 0.35).clamp(0.0, 1.0)
         quality = (
@@ -586,23 +636,23 @@ def build_epoch_pseudo_bank(
     for c in range(7):
         eligible_counts[c] = int((eligible & proposed_label.eq(c)).sum().item())
 
-    nonzero = eligible_counts[eligible_counts > 0].float()
-    if nonzero.numel():
-        median_count = float(nonzero.median().item())
-        class_cap = int(max(
-            args.class_balance_floor,
-            min(args.class_balance_max, median_count * args.class_balance_factor),
-        ))
-    else:
-        class_cap = args.class_balance_floor
+    # Source-feature geometric votes estimate relative class coverage without
+    # reading target labels. Do not force 1,200 samples into every class.
+    prototype_counts = torch.bincount(proto_pred_all, minlength=7)
+    class_caps = (prototype_counts.float() * args.pseudo_keep_fraction).long()
+    class_caps.clamp_(args.class_balance_floor, args.class_balance_max)
+    if previous_counts is not None and int(previous_counts.sum()) > 0:
+        growth_caps = (previous_counts.float() * args.class_growth_factor).long() + 32
+        class_caps = torch.minimum(class_caps, growth_caps)
+    class_cap = int(class_caps.max())
 
     selected = torch.zeros(n_samples, dtype=torch.bool)
     for c in range(7):
         class_idx = (eligible & proposed_label.eq(c)).nonzero(as_tuple=False).flatten()
         if class_idx.numel() == 0:
             continue
-        if class_idx.numel() > class_cap:
-            keep = torch.topk(proposed_score[class_idx], k=class_cap, largest=True).indices
+        if class_idx.numel() > int(class_caps[c]):
+            keep = torch.topk(proposed_score[class_idx], k=int(class_caps[c]), largest=True).indices
             class_idx = class_idx[keep]
         selected[class_idx] = True
 
@@ -614,9 +664,9 @@ def build_epoch_pseudo_bank(
     valid_counts = selected_counts > 0
     if valid_counts.any():
         mean_count = selected_counts[valid_counts].float().mean()
-        class_weight[valid_counts] = torch.sqrt(
+        class_weight[valid_counts] = (
             mean_count / selected_counts[valid_counts].float().clamp_min(1.0)
-        ).clamp(args.min_class_weight, args.max_class_weight)
+        ).pow(args.class_reweight_power).clamp(args.min_class_weight, args.max_class_weight)
 
     epoch_label = torch.full((n_samples,), -1, dtype=torch.long)
     epoch_label[selected] = proposed_label[selected]
@@ -637,6 +687,8 @@ def build_epoch_pseudo_bank(
 
     return {
         "label": epoch_label,
+        "soft_label": torch.where(proposed_recovery.unsqueeze(1),
+                                  F.one_hot(proposed_label.clamp_min(0), 7).float(), avg_prob_all),
         "weight": epoch_weight,
         "selected": selected,
         "align": epoch_align,
@@ -647,6 +699,8 @@ def build_epoch_pseudo_bank(
         "selected_counts": selected_counts,
         "align_counts": align_counts,
         "class_cap": class_cap,
+        "class_caps": class_caps,
+        "prototype_counts": prototype_counts,
         "ddrl_ready": ddrl_ready,
         "ddrl_classes": ddrl_classes,
     }
@@ -667,7 +721,8 @@ def parse_args():
     parser.add_argument("-c", "--checkpoint", default=None)
     parser.add_argument("--source_root", default="/workspace/ttt/code/test-upload-clean/datesets/raf-basic")
     parser.add_argument("--target_root", default="/workspace/ttt/code/data/fer2013")
-    parser.add_argument("--model_dir", default="./models/cast_resnet50_v4")
+    parser.add_argument("--model_dir", default="./models/cast_resnet50_v5")
+    parser.add_argument("--train_source", action="store_true", help="explicitly train a new source model")
     parser.add_argument("--workers", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--augmentation", choices=["face", "legacy"], default="face")
@@ -676,6 +731,7 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--source_backbone_lr_mult", type=float, default=0.1)
+    parser.add_argument("--source_label_smoothing", type=float, default=0.1)
     parser.add_argument("--grad_clip", type=float, default=5.0)
     parser.add_argument("--source_lr_gamma", type=float, default=0.95)
     parser.add_argument("--w1", type=float, default=4.0)
@@ -691,25 +747,28 @@ def parse_args():
 
     parser.add_argument("--bn_adapt_batches", type=int, default=64)
     parser.add_argument("--bn_adapt_momentum", type=float, default=0.03)
+    parser.add_argument("--bn_mode", choices=["domain", "frozen"], default="domain")
 
     parser.add_argument("--phi", type=float, default=1.4)
-    parser.add_argument("--teacher_temperature", type=float, default=1.0)
+    parser.add_argument("--teacher_temperature", type=float, default=0.0,
+                        help="0: calibrate on source validation; positive: fixed temperature")
     parser.add_argument("--threshold_mode", choices=["quantile", "cast"], default="quantile")
     parser.add_argument("--threshold_momentum", type=float, default=0.8)
     parser.add_argument("--pseudo_min_threshold", type=float, default=0.52)
-    parser.add_argument("--pseudo_max_threshold", type=float, default=0.90)
+    parser.add_argument("--pseudo_max_threshold", type=float, default=0.995)
     parser.add_argument("--threshold_quantile", type=float, default=0.60)
     parser.add_argument("--min_margin", type=float, default=0.08)
     parser.add_argument("--max_entropy", type=float, default=0.78)
     parser.add_argument("--anchor_min_confidence", type=float, default=0.38)
     parser.add_argument("--prototype_min_margin", type=float, default=0.01)
+    parser.add_argument("--prototype_centers", type=int, default=3)
     parser.add_argument("--anchor_guard_epochs", type=int, default=3)
     parser.add_argument("--temporal_min_streak", type=int, default=2)
     parser.add_argument("--temporal_full_streak", type=int, default=3)
 
     parser.add_argument("--starvation_support", type=int, default=64)
     parser.add_argument("--recovery_trigger_count", type=int, default=96)
-    parser.add_argument("--recovery_topk_per_class", type=int, default=128)
+    parser.add_argument("--recovery_topk_per_class", type=int, default=0)
     parser.add_argument("--recovery_teacher_topk", type=int, default=2)
     parser.add_argument("--recovery_teacher_min_prob", type=float, default=0.12)
     parser.add_argument("--recovery_proto_min_similarity", type=float, default=0.45)
@@ -717,13 +776,17 @@ def parse_args():
     parser.add_argument("--recovery_weight_scale", type=float, default=0.70)
     parser.add_argument("--min_pseudo_batch", type=int, default=8)
 
-    parser.add_argument("--class_balance_floor", type=int, default=256)
-    parser.add_argument("--class_balance_max", type=int, default=1200)
-    parser.add_argument("--class_balance_factor", type=float, default=3.0)
+    parser.add_argument("--class_balance_floor", type=int, default=32)
+    parser.add_argument("--class_balance_max", type=int, default=4000)
+    parser.add_argument("--class_balance_factor", type=float, default=None,
+                        help="deprecated; use pseudo_keep_fraction and class_growth_factor")
+    parser.add_argument("--pseudo_keep_fraction", type=float, default=0.4)
+    parser.add_argument("--class_growth_factor", type=float, default=1.3)
+    parser.add_argument("--class_reweight_power", type=float, default=0.0)
     parser.add_argument("--min_class_weight", type=float, default=0.65)
     parser.add_argument("--max_class_weight", type=float, default=1.50)
 
-    parser.add_argument("--target_w2", type=float, default=0.05)
+    parser.add_argument("--target_w2", type=float, default=0.0)
     parser.add_argument("--affinity_warmup", type=int, default=6)
     parser.add_argument("--affinity_ramp", type=int, default=6)
     parser.add_argument("--align_min_weight", type=float, default=0.30)
@@ -731,7 +794,9 @@ def parse_args():
     parser.add_argument("--ddrl_min_class_samples", type=int, default=12)
 
     args = parser.parse_args()
-    if not 0.0 <= args.pseudo_min_threshold <= args.pseudo_max_threshold <= 0.99:
+    if args.class_balance_factor is not None:
+        print("class_balance_factor is deprecated and ignored; using geometric class quotas")
+    if not 0.0 <= args.pseudo_min_threshold <= args.pseudo_max_threshold < 1.0:
         parser.error("invalid pseudo-label threshold range")
     if args.temporal_min_streak < 1 or args.temporal_full_streak < args.temporal_min_streak:
         parser.error("invalid temporal streak configuration")
@@ -741,23 +806,38 @@ def parse_args():
         parser.error("invalid class balance cap")
     if not 0 <= args.threshold_momentum < 1 or not 0 <= args.threshold_quantile <= 1:
         parser.error("invalid threshold quantile/momentum")
-    if args.teacher_temperature <= 0 or args.min_pseudo_batch < 1:
-        parser.error("temperature and min_pseudo_batch must be positive")
+    if args.teacher_temperature < 0 or args.min_pseudo_batch < 1:
+        parser.error("temperature must be nonnegative; min_pseudo_batch must be positive")
     if args.batch_size < 2 or args.epochs < 1:
         parser.error("batch_size must be >= 2 and epochs must be positive")
     if not 0 < args.bn_adapt_momentum <= 1 or args.grad_clip <= 0:
         parser.error("invalid BN momentum or gradient clip")
     if args.source_backbone_lr_mult <= 0:
         parser.error("source_backbone_lr_mult must be positive")
+    if not args.checkpoint and not args.train_source:
+        parser.error("provide --checkpoint SOURCE.pth, or explicitly pass --train_source")
+    if args.checkpoint and args.train_source:
+        parser.error("choose checkpoint initialization OR training a new source model")
+    if args.train_source and args.source_epochs < 1:
+        parser.error("source_epochs must be positive")
+    if args.checkpoint and not os.path.isfile(args.checkpoint):
+        parser.error("source checkpoint not found: %s" % args.checkpoint)
+    if not 0 <= args.source_label_smoothing < 1 or args.prototype_centers < 1:
+        parser.error("invalid label smoothing or prototype_centers")
+    if not 0 < args.pseudo_keep_fraction <= 1 or args.class_growth_factor < 1:
+        parser.error("invalid pseudo-label keep fraction or class growth factor")
+    if args.recovery_topk_per_class < 0 or args.class_reweight_power < 0:
+        parser.error("recovery count and class_reweight_power must be nonnegative")
     return args
 
 
-def train_source(model, loader, args, source_path):
-    criterion = torch.nn.CrossEntropyLoss(reduction="none")
+def train_source(model, loader, val_loader, args, source_path):
     optimizer = torch.optim.Adam(
         optimizer_groups(model, args.lr, args.source_backbone_lr_mult), weight_decay=1e-4
     )
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=args.source_lr_gamma)
+    source_best_path = source_path.replace("_source_final.pth", "_source_best.pth")
+    best_source = -1.0
 
     for epoch in range(args.source_epochs):
         model.train()
@@ -773,7 +853,7 @@ def train_source(model, loader, args, source_path):
             output = model(
                 imgs, targets, None, "train", "source", compute_affinity=args.w2 > 0
             )
-            cls_loss = criterion(output[0], targets).mean()
+            cls_loss = smoothed_cross_entropy(output[0], targets, args.source_label_smoothing)
             aff_loss = output[1]
             loss = (
                 args.w1 * cls_loss
@@ -805,9 +885,16 @@ def train_source(model, loader, args, source_path):
                 optimizer.param_groups[0]["lr"],
             )
         )
+        val_acc = evaluate(model, val_loader, len(val_loader.dataset), task="source", verbose=False)
+        print("[Source %d] source_validation_accuracy %.4f" % (epoch, val_acc))
+        if val_acc > best_source:
+            best_source = val_acc
+            save_checkpoint(model, optimizer, source_best_path, epoch, val_acc, "source_best")
 
-    save_checkpoint(model, optimizer, source_path, args.source_epochs - 1, 0.0, "source")
+    save_checkpoint(model, optimizer, source_path, args.source_epochs - 1, val_acc, "source")
     print("Source checkpoint saved:", source_path)
+    model.load_state_dict(torch.load(source_best_path, map_location="cuda")["model"], strict=True)
+    print("Use source-validation checkpoint:", source_best_path)
 
 
 def main():
@@ -815,6 +902,7 @@ def main():
     os.makedirs(args.model_dir, exist_ok=True)
     with open(os.path.join(args.model_dir, "config.json"), "w", encoding="utf-8") as handle:
         json.dump(vars(args), handle, ensure_ascii=False, indent=2)
+    print("CAST v5 configuration:", json.dumps(vars(args), sort_keys=True))
     tx = make_transforms(args.augmentation)
 
     source_train = RafDataSet(
@@ -823,6 +911,7 @@ def main():
     source_proto = RafDataSet(
         args.source_root, "train", transform=tx["test"], strong_transform=None, basic_aug=False
     )
+    source_val = RafDataSet(args.source_root, "test", transform=tx["test"], strong_transform=None)
     target_base = FER(
         args.target_root, "train", transform=tx["weak"], strong_transform=tx["strong"], basic_aug=False
     )
@@ -842,7 +931,8 @@ def main():
     target_loader = make_loader(target_train, args.batch_size, args.workers, True, True, 3)
     target_scan_loader = make_loader(target_scan, args.batch_size, args.workers, False, False, 4)
     test_loader = make_loader(target_test, args.batch_size, args.workers, False, False, 5)
-    if len(source_loader) == 0 or len(target_loader) == 0 or len(target_test) == 0:
+    source_val_loader = make_loader(source_val, args.batch_size, args.workers, False, False, 6)
+    if len(source_loader) == 0 or len(target_loader) == 0 or len(target_test) == 0 or len(source_val) == 0:
         raise RuntimeError("Empty loader: check dataset paths, split and batch_size")
 
     model = Networks.Model(backbone=args.backbone, num_classes=7,
@@ -860,7 +950,12 @@ def main():
         model.load_state_dict(checkpoint["model"], strict=True)
         print("Loaded source checkpoint:", args.checkpoint)
     else:
-        train_source(model, source_loader, args, source_path)
+        train_source(model, source_loader, source_val_loader, args, source_path)
+
+    if args.teacher_temperature == 0.0:
+        args.teacher_temperature = calibrate_temperature(model, source_val_loader)
+    with open(os.path.join(args.model_dir, "config.json"), "w", encoding="utf-8") as handle:
+        json.dump(vars(args), handle, ensure_ascii=False, indent=2)
 
     source_target_acc = evaluate(model, test_loader, len(target_test))
     print("[Source -> Target] accuracy %.4f" % source_target_acc)
@@ -868,8 +963,13 @@ def main():
     anchor = copy.deepcopy(model).cuda().eval()
     for parameter in anchor.parameters():
         parameter.requires_grad = False
-    prototypes, prototype_counts = build_source_prototypes(anchor, proto_loader)
+    prototypes, prototype_counts = build_source_prototypes(
+        anchor, proto_loader, centers_per_class=args.prototype_centers
+    )
     print("Source prototype counts:", prototype_counts.tolist())
+
+    if args.bn_mode == "domain":
+        enable_domain_bn(model, momentum=args.bn_adapt_momentum)
 
     adapt_backbone_bn(
         model,
@@ -889,12 +989,11 @@ def main():
         weight_decay=1e-4,
     )
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=args.target_lr_gamma)
-    source_criterion = torch.nn.CrossEntropyLoss(reduction="none")
-    target_criterion = torch.nn.CrossEntropyLoss(reduction="none")
 
     temporal_label = torch.full((len(target_train),), -1, dtype=torch.long)
     temporal_streak = torch.zeros(len(target_train), dtype=torch.long)
     previous_thresholds = None
+    previous_selected_counts = None
 
     best_student = target_start_acc
     best_ema = target_start_acc
@@ -932,7 +1031,11 @@ def main():
             temporal_streak,
             args,
             epoch,
+            previous_selected_counts,
         )
+        previous_selected_counts = pseudo_bank["selected_counts"].clone()
+        print("[Epoch %d] prototype_votes %s class_caps %s" % (
+            epoch, pseudo_bank["prototype_counts"].tolist(), pseudo_bank["class_caps"].tolist()))
 
         pseudo_scale = min(1.0, float(epoch + 1) / float(max(args.pseudo_ramp, 1)))
         scheduled_w2 = scheduled_affinity_weight(epoch, args)
@@ -971,7 +1074,7 @@ def main():
         applied_w2_sum = 0.0
         steps = 0
 
-        for _, _, strong, gt_target, sample_idx in target_loader:
+        for weak1, _, strong, gt_target, sample_idx in target_loader:
             try:
                 source_imgs, source_targets = next(source_iter)
             except StopIteration:
@@ -996,11 +1099,15 @@ def main():
                         class_total[c] += n
                         class_correct[c] += int(pseudo_targets[cm].eq(gt_cpu[cm]).sum().item())
 
+            if args.bn_mode == "domain":
+                refresh_target_bn(model, weak1.cuda(non_blocking=True))
             model.train()
             if freeze_backbone:
                 model.feature.eval()
-            # Preserve the target-domain BN calibration while still updating convolutional weights.
-            freeze_backbone_bn_stats(model)
+            # Domain mode refreshes target moments on weak images each step;
+            # frozen mode retains the v4 fixed-statistics behavior for ablation.
+            if args.bn_mode == "frozen":
+                freeze_backbone_bn_stats(model)
 
             source_imgs = source_imgs.cuda(non_blocking=True)
             source_targets = source_targets.long().cuda(non_blocking=True)
@@ -1032,11 +1139,17 @@ def main():
                 compute_affinity=batch_w2 > 0,
             )
 
-            source_loss = source_criterion(output[0][:n_source], source_targets).mean()
+            source_loss = smoothed_cross_entropy(
+                output[0][:n_source], source_targets, args.source_label_smoothing
+            )
             if selected_n > 0:
                 target_logits = output[0][n_source:][selected_cuda]
-                target_labels = safe_target[selected_cuda]
-                per_target = target_criterion(target_logits, target_labels)
+                soft_labels = pseudo_bank["soft_label"][idx][selected].cuda(non_blocking=True)
+                temperature = args.teacher_temperature
+                per_target = F.kl_div(
+                    F.log_softmax(target_logits / temperature, dim=1),
+                    soft_labels, reduction="none"
+                ).sum(dim=1) * temperature ** 2
                 selected_weight = weight_cuda[selected_cuda]
                 # Keep absolute reliability: dividing by sum(weights) cancels
                 # the recovery discount when a batch contains only recovery
@@ -1075,7 +1188,7 @@ def main():
         ]
         print(
             "[Epoch %d] selected %d pseudo_acc %.4f class_acc %s class_num %s "
-            "source_ce %.4f target_ce %.4f applied_w2 %.4f"
+            "source_ce %.4f target_kl %.4f applied_w2 %.4f"
             % (
                 epoch,
                 selected_total,

@@ -12,43 +12,84 @@ Ubuntu 16.04 LTS, python 3.8, pytorch 1.8.1
 [SFEW](https://paperswithcode.com/dataset/sfew),
 [FER2013](https://paperswithcode.com/dataset/fer2013)
 
-## `new` 分支：可靠性约束的目标域适配
+## `new` 分支 v5：按运行退化日志修复
 
-本轮修改入口为 **`train.py`**；`train_v3.py` 保留为旧版本，不包含本轮修复。
-保持网络参数名称和维度，可加载同一 backbone 的已有源域 checkpoint。
-加载 checkpoint 后直接开始目标适配，不重新训练源模型，也不额外下载 ImageNet 权重。
+运行入口仍是 **`train.py`**。上一版 v4 的实际最佳结果为 50.71%，最终 EMA 为 46.61%；
+本轮未运行测试、训练或准确率评估，不声明已达到 65%。
+
+### 复用本次日志中已保存的源域模型
+
+在仓库目录运行：
 
 ```bash
-python -u train.py --backbone resnet50 \
-  --checkpoint /path/to/source_checkpoint.pth \
-  --model_dir ./models/cast_resnet50_v4
+git switch new
+git pull --ff-only origin new
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_fer_v5.sh
 ```
 
-请将 checkpoint 替换为实际源模型路径。数据目录仍使用原默认值，可用
-`--source_root` 和 `--target_root` 指定。省略 checkpoint 会先训练源模型。
-本次改动没有运行测试、训练或准确率评估；65% 是目标，不是已获得的结果。
+脚本读取日志中明确保存的
+`./models/cast_resnet50_v4/resnet50_rafdb_fer_source_final.pth`。
+它必须是 **ResNet50 源域模型**，而不是已经退化的目标域 final 模型。
+路径不同可以这样运行：
 
-本轮修复与改进：
+```bash
+CAST_SOURCE_CHECKPOINT=/actual/path/source.pth bash scripts/run_fer_v5.sh
+```
 
-- 修正类别概率排名方向，最高概率现在为 rank 1；恢复候选默认限制在教师前 2 类。
-- 默认采用两视图最低置信度的分类别分位数阈值，并跨轮平滑；保留 `--threshold_mode cast`
-  用于对照旧阈值策略（该选项并不复原全部旧代码）。
-- 用固定原图/水平翻转对扫描目标训练集，减少随机视图造成的时序筛选波动。
-- 恢复类别需源分类器或相对原型间隔支持；改写教师第一预测时两者都须支持。
-  恢复标签暂不参与 DDRL，只有后续成为可信标签后才有资格参与特征对齐。
-- 目标损失按选中数量归一化，保留置信度和恢复折扣的绝对作用；小批次支持下限为 8。
-- 分两阶段校准骨干与分类头 BN，目标训练冻结全部 BN 统计量；只使用目标训练图像校准。
-- 使用较温和的人脸增强、源域骨干较小学习率、梯度裁剪；MMD 距离计算移除三维大临时张量。
+每次在 `models/cast_resnet50_v5/日期时间_进程号/` 新建输出目录，保存 `train.log`、
+`config.json` 和 checkpoint；不会覆盖 v4。可追加 `--batch_size 32` 降低显存需求。
+数据目录可通过 `CAST_SOURCE_ROOT`、`CAST_TARGET_ROOT` 修改。
+本次新增源域验证集读取，需要 RAF 的 `test_*` 标注和对应 aligned 图片。
 
-默认输出到新的 `cast_resnet50_v4` 目录，并记录 `config.json`。
-`--augmentation legacy` 可单独恢复旧增强，`--bn_adapt_batches 0` 可关闭 BN 校准，
-`--recovery_topk_per_class 0` 可关闭类别恢复，用于之后的消融实验。
+如需重新训练源模型，必须明确执行：
 
-评估沿用原分支流程：每轮在 `test/` 中选择最佳 checkpoint。因此 `*_best.pth` 对应的是
-该集合上选模后的验证分数；`*_final.pth` 保存预设轮数的最终模型。
-正式论文需说明此协议，不能把选模分数称为独立测试分数。
+```bash
+python -u train.py --backbone resnet50 --train_source --model_dir ./models/cast_v5_from_source
+```
 
-对照来源：[CAST 论文页面](https://ieeexplore.ieee.org/document/10843182)、
-[论文对应公开实现](https://github.com/smwanghhh/CAST)。本轮核对了公开实现；
-论文全文未能读取，不能据此声称完成逐节原文核验或证明方法首创。
+省略 checkpoint 不再悄悄触发 30 轮源域训练。新源域训练使用标签平滑，并按 RAF 源域验证
+准确率保存 `*_source_best.pth` 作为适配起点；同时保留最后一轮源模型。
 
+### 根据日志修改了什么
+
+| 日志现象 | v5 改动 |
+| --- | --- |
+| 七类阈值始终等于 0.9 | 用源域验证集 NLL 自动选择温度；分位数阈值上界改为 0.995，保留类别间差异 |
+| EMA 与源模型共享偏差，disgust 伪标签后期准确率约 12.8% | 使用去中心化的每类 3 个原型；不再通过源分类器同意来绕过原型检查 |
+| 多个类别都被截为 1,200 个样本，低质量类别快速扩张 | 配额取决于目标训练图像的原型投票；跨轮增长上限默认 1.3 倍加 32；默认不进行逆频率加权 |
+| 源域交叉熵后期由约 0.03 反弹到超过 2 | 源域和目标域各自维护 BN 统计；每步用弱增强目标图像更新目标统计，强增强不更新统计 |
+| 硬伪标签可能强化过度自信 | 改为温度一致的软标签 KL，保留样本可靠性权重 |
+| 使用不可靠类别补样、后续开启目标 DDRL | 默认关闭类别恢复和目标 DDRL；保留单项开启选项供消融 |
+| 旧 MMD 包含自配对、随机丢弃较大类别的样本 | 按论文 Eq. (9) 排除对角线，保留不等长样本；类别损失加入 Eq. (12) 的 1/C 因子 |
+
+这些是针对日志的实现与策略修改，日志不能证明每一项是退化的独立原因。
+BN 每步统计更新会增加一次弱视图前向，运行时间取决于硬件；源原型仅初始化一次。
+
+### 消融与兼容性
+
+- `--bn_mode frozen`：使用 v4 的固定 BN 统计路径。
+- `--teacher_temperature 1`：关闭自动温度校准；默认 `0` 表示自动校准。
+- `--prototype_centers 1`：每类仅使用一个去中心化原型。
+- `--target_w2 0.03`：打开按可信样本筛选的目标 DDRL，默认值为 0。
+- `--recovery_topk_per_class 64`：打开类别恢复，默认值为 0。
+- `--class_reweight_power 0.5`：打开平方根逆频率重加权，默认值为 0。
+
+上述选项各自只改变一项，并不完整复原旧版。
+`--class_balance_factor` 已弃用，以 `--pseudo_keep_fraction` 和 `--class_growth_factor` 控制配额。
+`train_v3.py` 是旧训练入口，不包含 v5 的训练流程。
+
+checkpoint 的 `model` 字段导出普通 CAST 权重和目标 BN 统计，可用原 `Networks.Model`
+严格加载进行目标域推理；源域专用 BN 缓冲区仅用于训练，不写入该推理字段。
+`--checkpoint` 初始化一个新的适配实验，未实现精确断点续训。
+
+温度校准仅用源域验证标签；伪标签、配额、BN 更新和训练损失不使用目标真实标签。
+目标训练标签只用于既有诊断打印。目标评估沿用此前每轮在 `test/` 上选最佳模型的流程，
+`*_best.pth` 的分数应称为该集合上的验证选模分数；`*_final.pth` 是预设轮数的最终模型。
+
+本轮已根据用户提供的论文全文核对 Eq. (9)、Eq. (12) 和训练设置。
+原 CAST 已有类别自适应阈值及类条件对齐；分域 BN、温度校准、软标签训练也都有既有研究。
+本项目的改动不等同于证明这些机制首创，方法有效性需要同一起点的消融实验。
+
+参考：[CAST 论文](https://ieeexplore.ieee.org/document/10843182)、
+[原作者实现](https://github.com/smwanghhh/CAST)、
+[Domain-Specific Batch Normalization, CVPR 2019](https://openaccess.thecvf.com/content_CVPR_2019/html/Chang_Domain-Specific_Batch_Normalization_for_Unsupervised_Domain_Adaptation_CVPR_2019_paper.html)。
