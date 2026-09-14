@@ -1,0 +1,81 @@
+---------------------------------------------------------------------------------------
+Training resnet50 with source data rafdb and target data fer, idx 3:
+w1:4        w2:0.0      w3:0.0
+---------------------------------------------------------------------------------------
+The dataset distribute: 1290, 281, 717, 4772, 1982, 705, 2524
+The dataset distribute: 329, 74, 160, 1185, 478, 162, 680
+FER train path: /workspace/ttt/code/data/fer2013
+FER train found images: 28709
+The dataset distribute: 3171, 4097, 436, 7215, 4830, 3995, 4965
+FER test images: 3589
+FER test path: /workspace/ttt/code/data/fer2013
+FER test found images: 3589
+The dataset distribute: 416, 528, 55, 879, 594, 491, 626
+[Epoch 0] Training accuracy: 55.6250.   Classification Loss: 128.755   Affinity Loss: -238.667  Weight Loss: 48.807  LR: 0.001000
+[Epoch 0] Target Validation accuracy:0.2666.  Loss:2.606
+best_acc 0.2666 
+[Epoch 1] Training accuracy: 66.1328.   Classification Loss: 100.748   Affinity Loss: -299.223  Weight Loss: 48.661  LR: 0.000950
+[Epoch 1] Target Validation accuracy:0.3441.  Loss:1.831
+best_acc 0.3441 
+[Epoch 2] Training accuracy: 69.4844.   Classification Loss: 89.737   Affinity Loss: -276.681  Weight Loss: 48.355  LR: 0.000902
+[Epoch 2] Target Validation accuracy:0.4700.  Loss:1.484
+best_acc 0.47 
+[Epoch 3] Training accuracy: 71.4375.   Classification Loss: 81.471   Affinity Loss: -277.047  Weight Loss: 47.914  LR: 0.000857
+[Epoch 3] Target Validation accuracy:0.4101.  Loss:1.626
+[Epoch 4] Training accuracy: 73.4062.   Classification Loss: 75.906   Affinity Loss: -284.366  Weight Loss: 47.536  LR: 0.000815
+[Epoch 4] Target Validation accuracy:0.3970.  Loss:1.709
+[Epoch 5] Training accuracy: 74.8906.   Classification Loss: 70.506   Affinity Loss: -310.474  Weight Loss: 47.163  LR: 0.000774
+[Epoch 5] Target Validation accuracy:0.4324.  Loss:1.687
+[Epoch 6] Training accuracy: 75.8047.   Classification Loss: 66.327   Affinity Loss: -304.353  Weight Loss: 46.776  LR: 0.000735
+[Epoch 6] Target Validation accuracy:0.4486.  Loss:1.579
+[Epoch 7] Training accuracy: 76.7500.   Classification Loss: 63.405   Affinity Loss: -275.461  Weight Loss: 46.445  LR: 0.000698
+[Epoch 7] Target Validation accuracy:0.4430.  Loss:1.572
+[Epoch 8] Training accuracy: 77.9688.   Classification Loss: 59.455   Affinity Loss: -275.297  Weight Loss: 46.239  LR: 0.000663
+[Epoch 8] Target Validation accuracy:0.4361.  Loss:1.722
+[Epoch 9] Training accuracy: 79.2422.   Classification Loss: 55.388   Affinity Loss: -317.508  Weight Loss: 46.081  LR: 0.000630
+[Epoch 9] Target Validation accuracy:0.4692.  Loss:1.518
+[Epoch 10] Training accuracy: 79.9609.   Classification Loss: 52.928   Affinity Loss: -301.713  Weight Loss: 45.903  LR: 0.000599
+[Epoch 10] Target Validation accuracy:0.4695.  Loss:1.571
+[Epoch 11] Training accuracy: 80.7734.   Classification Loss: 50.290   Affinity Loss: -316.049  Weight Loss: 45.731  LR: 0.000569
+[Epoch 11] Target Validation accuracy:0.4614.  Loss:1.616
+[Epoch 12] Training accuracy: 81.4766.   Classification Loss: 48.007   Affinity Loss: -315.459  Weight Loss: 45.492  LR: 0.000540
+[Epoch 12] Target Validation accuracy:0.4656.  Loss:1.673
+[Epoch 13] Training accuracy: 81.6719.   Classification Loss: 46.579   Affinity Loss: -299.197  Weight Loss: 45.438  LR: 0.000513
+[Epoch 13] Target Validation accuracy:0.4695.  Loss:1.592
+[Epoch 14] Training accuracy: 83.0938.   Classification Loss: 43.516   Affinity Loss: -313.108  Weight Loss: 45.235  LR: 0.000488
+[Epoch 14] Target Validation accuracy:0.4926.  Loss:1.589
+best_acc 0.4926 
+[Epoch 15] Training accuracy: 83.4922.   Classification Loss: 41.423   Affinity Loss: -320.398  Weight Loss: 45.160  LR: 0.000463
+[Epoch 15] Target Validation accuracy:0.4859.  Loss:1.641
+[Epoch 16] Training accuracy: 84.0703.   Classification Loss: 39.506   Affinity Loss: -290.140  Weight Loss: 45.071  LR: 0.000440
+[Epoch 16] Target Validation accuracy:0.4845.  Loss:1.642
+[Epoch 17] Training accuracy: 84.9062.   Classification Loss: 37.242   Affinity Loss: -311.523  Weight Loss: 45.020  LR: 0.000418
+[Epoch 17] Target Validation accuracy:0.4843.  Loss:1.695
+[Epoch 18] Training accuracy: 85.6172.   Classification Loss: 35.683   Affinity Loss: -344.705  Weight Loss: 44.986  LR: 0.000397
+[Epoch 18] Target Validation accuracy:0.4765.  Loss:1.654
+[Epoch 19] Training accuracy: 85.9609.   Classification Loss: 34.047   Affinity Loss: -317.340  Weight Loss: 44.927  LR: 0.000377
+[Epoch 19] Target Validation accuracy:0.4720.  Loss:1.742
+[Epoch 20] Training accuracy: 87.0234.   Classification Loss: 31.634   Affinity Loss: -331.674  Weight Loss: 44.853  LR: 0.000358
+[Epoch 20] Target Validation accuracy:0.4884.  Loss:1.852
+[Epoch 21] Training accuracy: 86.7734.   Classification Loss: 31.194   Affinity Loss: -340.462  Weight Loss: 44.789  LR: 0.000341
+[Epoch 21] Target Validation accuracy:0.4798.  Loss:1.722
+[Epoch 22] Training accuracy: 87.7109.   Classification Loss: 28.642   Affinity Loss: -356.978  Weight Loss: 44.800  LR: 0.000324
+[Epoch 22] Target Validation accuracy:0.4987.  Loss:1.693
+best_acc 0.4987 
+[Epoch 23] Training accuracy: 87.9766.   Classification Loss: 28.186   Affinity Loss: -346.434  Weight Loss: 44.836  LR: 0.000307
+[Epoch 23] Target Validation accuracy:0.4960.  Loss:1.677
+[Epoch 24] Training accuracy: 88.4766.   Classification Loss: 26.987   Affinity Loss: -345.263  Weight Loss: 44.768  LR: 0.000292
+[Epoch 24] Target Validation accuracy:0.4948.  Loss:1.690
+[Epoch 25] Training accuracy: 88.9766.   Classification Loss: 25.120   Affinity Loss: -328.049  Weight Loss: 44.737  LR: 0.000277
+[Epoch 25] Target Validation accuracy:0.4965.  Loss:1.739
+[Epoch 26] Training accuracy: 89.5703.   Classification Loss: 23.700   Affinity Loss: -357.205  Weight Loss: 44.757  LR: 0.000264
+[Epoch 26] Target Validation accuracy:0.4901.  Loss:1.702
+[Epoch 27] Training accuracy: 89.8516.   Classification Loss: 22.564   Affinity Loss: -334.143  Weight Loss: 44.777  LR: 0.000250
+[Epoch 27] Target Validation accuracy:0.5038.  Loss:1.690
+best_acc 0.5038 
+[Epoch 28] Training accuracy: 89.7734.   Classification Loss: 22.218   Affinity Loss: -342.314  Weight Loss: 44.753  LR: 0.000238
+[Epoch 28] Target Validation accuracy:0.5118.  Loss:1.704
+best_acc 0.5118 
+[Epoch 29] Training accuracy: 90.5000.   Classification Loss: 20.247   Affinity Loss: -374.372  Weight Loss: 44.747  LR: 0.000226
+[Epoch 29] Target Validation accuracy:0.4937.  Loss:1.807
+best_acc 0.5118 

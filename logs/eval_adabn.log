@@ -1,0 +1,12 @@
+Loaded checkpoint (strict=True): models/rafdb_fer/fast_r50/final_teacher.pth
+Calibration directory: /workspace/ttt/code/data/fer2013/train
+Found 28709 images; processing 28672, omitting 37 from the incomplete batch.
+Calibration: 50/224 batches | 6400 images | 4.3s
+Calibration: 100/224 batches | 12800 images | 7.5s
+Calibration: 150/224 batches | 19200 images | 10.8s
+Calibration: 200/224 batches | 25600 images | 14.0s
+Calibration: 224/224 batches | 28672 images | 15.5s
+Recalibrated 54 BN layers from 28672 unlabelled training images.
+Saved calibrated checkpoint: models/rafdb_fer/fast_r50/final_teacher_adabn.pth
+Calibrated evaluation | HFlip TTA accuracy: 0.5483 (1968/3589)
+Class recall: {'surprise': 0.7404, 'fear': 0.0473, 'disgust': 0.2, 'happy': 0.8271, 'sad': 0.5051, 'angry': 0.387, 'neutral': 0.6502}

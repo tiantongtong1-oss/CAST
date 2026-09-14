@@ -1,0 +1,4 @@
+Device: cuda
+Loaded checkpoint (strict=True): ./models/rafdb_fer/fast_r50/final_teacher.pth
+Evaluation | HFlip TTA accuracy: 0.5514 (1979/3589)
+Class recall: {'surprise': 0.7692, 'fear': 0.036, 'disgust': 0.0727, 'happy': 0.7304, 'sad': 0.5657, 'angry': 0.4094, 'neutral': 0.73}

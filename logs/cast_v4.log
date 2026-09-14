@@ -1,0 +1,139 @@
+The dataset distribute: 1290, 281, 717, 4772, 1982, 705, 2524
+The dataset distribute: 1290, 281, 717, 4772, 1982, 705, 2524
+FER train path: /workspace/ttt/code/data/fer2013
+FER train found images: 28709
+The dataset distribute: 3171, 4097, 436, 7215, 4830, 3995, 4965
+FER train path: /workspace/ttt/code/data/fer2013
+FER train found images: 28709
+The dataset distribute: 3171, 4097, 436, 7215, 4830, 3995, 4965
+FER test images: 3589
+FER test path: /workspace/ttt/code/data/fer2013
+FER test found images: 3589
+The dataset distribute: 416, 528, 55, 879, 594, 491, 626
+[Source 0] acc 0.6221 cls 1.2249 aff -3.8074 lr 0.000095
+[Source 1] acc 0.7475 cls 0.8685 aff -4.1432 lr 0.000090
+[Source 2] acc 0.7862 cls 0.7305 aff -4.0224 lr 0.000086
+[Source 3] acc 0.8166 cls 0.6402 aff -4.3370 lr 0.000081
+[Source 4] acc 0.8418 cls 0.5589 aff -4.3754 lr 0.000077
+[Source 5] acc 0.8483 cls 0.5137 aff -4.4748 lr 0.000074
+[Source 6] acc 0.8693 cls 0.4618 aff -4.5039 lr 0.000070
+[Source 7] acc 0.8784 cls 0.4205 aff -4.6062 lr 0.000066
+[Source 8] acc 0.8967 cls 0.3735 aff -4.6682 lr 0.000063
+[Source 9] acc 0.9024 cls 0.3528 aff -4.7383 lr 0.000060
+[Source 10] acc 0.9049 cls 0.3316 aff -4.8079 lr 0.000057
+[Source 11] acc 0.9234 cls 0.2856 aff -4.9430 lr 0.000054
+[Source 12] acc 0.9240 cls 0.2722 aff -5.0389 lr 0.000051
+[Source 13] acc 0.9330 cls 0.2492 aff -5.0331 lr 0.000049
+[Source 14] acc 0.9430 cls 0.2182 aff -5.1416 lr 0.000046
+[Source 15] acc 0.9467 cls 0.2094 aff -5.1834 lr 0.000044
+[Source 16] acc 0.9525 cls 0.1923 aff -5.1418 lr 0.000042
+[Source 17] acc 0.9556 cls 0.1790 aff -5.2673 lr 0.000040
+[Source 18] acc 0.9625 cls 0.1591 aff -5.2945 lr 0.000038
+[Source 19] acc 0.9655 cls 0.1498 aff -5.3299 lr 0.000036
+[Source 20] acc 0.9674 cls 0.1417 aff -5.3537 lr 0.000034
+[Source 21] acc 0.9670 cls 0.1365 aff -5.4206 lr 0.000032
+[Source 22] acc 0.9724 cls 0.1243 aff -5.4132 lr 0.000031
+[Source 23] acc 0.9737 cls 0.1159 aff -5.4725 lr 0.000029
+[Source 24] acc 0.9777 cls 0.1028 aff -5.4527 lr 0.000028
+[Source 25] acc 0.9772 cls 0.0989 aff -5.4874 lr 0.000026
+[Source 26] acc 0.9805 cls 0.0930 aff -5.4767 lr 0.000025
+[Source 27] acc 0.9816 cls 0.0839 aff -5.6367 lr 0.000024
+[Source 28] acc 0.9804 cls 0.0894 aff -5.5037 lr 0.000023
+[Source 29] acc 0.9848 cls 0.0773 aff -5.5688 lr 0.000021
+Source checkpoint saved: ./models/cast_resnet50_v4/resnet50_rafdb_fer_source_final.pth
+[Source -> Target] accuracy 0.4884
+Source prototype counts: [1290, 281, 717, 4772, 1982, 705, 2524]
+Target BN recalibration batches: backbone=64 head=64
+[Target start after BN] accuracy 0.5024
+[Epoch 0] CATM [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9] support [3272, 90, 964, 6918, 3004, 749, 3731] predicted [3956, 326, 1789, 9665, 5459, 1429, 6085] weak_agree 0.7902 anchor_agree 0.6523 trusted [0, 0, 0, 2885, 870, 0, 1121] recovery [128, 102, 128, 0, 0, 128, 0] need_recovery [1, 1, 1, 0, 0, 1, 0] cap 256 eligible [0, 0, 0, 0, 0, 0, 0] selected [0, 0, 0, 0, 0, 0, 0] align [0, 0, 0, 0, 0, 0, 0] ddrl_classes 0 w2 0.0000 pseudo_scale 0.125
+[Epoch 0] selected 0 pseudo_acc 0.0000 class_acc [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] class_num [0, 0, 0, 0, 0, 0, 0] source_ce 0.1889 target_ce 0.0000 applied_w2 0.0000
+[Epoch 0] Student accuracy: 0.4946 | EMA accuracy: 0.5018
+[Epoch 1] CATM [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9] support [3392, 97, 1048, 6840, 2955, 836, 3586] predicted [4097, 376, 2028, 9413, 5324, 1694, 5777] weak_agree 0.7840 anchor_agree 0.6532 trusted [0, 0, 0, 2886, 869, 0, 1103] recovery [128, 118, 128, 0, 0, 128, 0] need_recovery [1, 1, 1, 0, 0, 1, 0] cap 375 eligible [125, 102, 121, 2885, 867, 114, 1103] selected [125, 102, 121, 375, 375, 114, 375] align [0, 0, 0, 375, 375, 0, 375] ddrl_classes 3 w2 0.0000 pseudo_scale 0.250
+[Epoch 1] selected 1587 pseudo_acc 0.7335 class_acc [0.832, 0.7451, 0.3223, 0.9173, 0.6507, 0.7807, 0.7147] class_num [125, 102, 121, 375, 375, 114, 375] source_ce 0.1832 target_ce 0.0283 applied_w2 0.0000
+[Epoch 1] Student accuracy: 0.4976 | EMA accuracy: 0.5007
+[Epoch 2] CATM [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9] support [3487, 101, 1105, 6800, 2944, 887, 3433] predicted [4231, 416, 2186, 9262, 5283, 1884, 5447] weak_agree 0.7814 anchor_agree 0.6533 trusted [0, 0, 0, 2889, 877, 0, 1045] recovery [128, 123, 128, 0, 0, 128, 0] need_recovery [1, 1, 1, 0, 0, 1, 0] cap 372 eligible [123, 118, 124, 2885, 865, 122, 1045] selected [123, 118, 124, 372, 372, 122, 372] align [0, 0, 0, 372, 372, 0, 372] ddrl_classes 3 w2 0.0000 pseudo_scale 0.375
+[Epoch 2] selected 1602 pseudo_acc 0.7372 class_acc [0.8537, 0.7373, 0.3387, 0.9191, 0.6505, 0.7951, 0.7177] class_num [123, 118, 124, 371, 372, 122, 372] source_ce 0.0694 target_ce 0.0552 applied_w2 0.0000
+[Epoch 2] Student accuracy: 0.4999 | EMA accuracy: 0.5071
+Best checkpoint: ./models/cast_resnet50_v4/resnet50_rafdb_fer_best.pth acc 0.5071
+[Epoch 3] CATM [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9] support [3955, 130, 1229, 6797, 3012, 965, 3800] predicted [4742, 529, 2244, 8646, 4932, 1901, 5715] weak_agree 0.7927 anchor_agree 0.6927 trusted [2980, 109, 712, 6038, 2213, 730, 2559] recovery [0, 0, 0, 0, 0, 0, 0] need_recovery [0, 0, 0, 0, 0, 0, 0] cap 384 eligible [128, 105, 128, 2883, 854, 128, 1035] selected [128, 105, 128, 384, 384, 128, 384] align [128, 105, 128, 384, 384, 128, 384] ddrl_classes 7 w2 0.0000 pseudo_scale 0.500
+[Epoch 3] selected 1640 pseudo_acc 0.7378 class_acc [0.8438, 0.8, 0.3386, 0.9167, 0.6536, 0.7969, 0.7031] class_num [128, 105, 127, 384, 384, 128, 384] source_ce 0.0466 target_ce 0.0590 applied_w2 0.0000
+[Epoch 3] Student accuracy: 0.4962 | EMA accuracy: 0.5049
+[Epoch 4] CATM [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9] support [4168, 137, 1359, 6730, 3057, 998, 4042] predicted [5006, 625, 2374, 8158, 4817, 1900, 5829] weak_agree 0.8007 anchor_agree 0.7137 trusted [3318, 128, 841, 6057, 2360, 798, 2859] recovery [0, 0, 0, 0, 0, 0, 0] need_recovery [0, 0, 0, 0, 0, 0, 0] cap 1200 eligible [2915, 109, 674, 5896, 2119, 710, 2473] selected [1200, 109, 674, 1200, 1200, 710, 1200] align [1200, 109, 674, 1200, 1200, 710, 1200] ddrl_classes 7 w2 0.0000 pseudo_scale 0.625
+[Epoch 4] selected 6282 pseudo_acc 0.6770 class_acc [0.7846, 0.787, 0.1709, 0.9133, 0.6172, 0.7028, 0.6519] class_num [1198, 108, 673, 1199, 1199, 710, 1195] source_ce 0.0386 target_ce 0.1194 applied_w2 0.0000
+[Epoch 4] Student accuracy: 0.4859 | EMA accuracy: 0.5038
+[Epoch 5] CATM [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9] support [4256, 140, 1506, 6471, 3065, 1067, 4076] predicted [5055, 621, 2721, 7644, 4691, 2204, 5773] weak_agree 0.8033 anchor_agree 0.7169 trusted [3411, 130, 993, 5830, 2386, 888, 2969] recovery [0, 0, 0, 0, 0, 0, 0] need_recovery [0, 0, 0, 0, 0, 0, 0] cap 1200 eligible [3238, 126, 821, 5795, 2251, 793, 2711] selected [1200, 126, 821, 1200, 1200, 793, 1200] align [1200, 126, 821, 1200, 1200, 793, 1200] ddrl_classes 7 w2 0.0000 pseudo_scale 0.750
+[Epoch 5] selected 6531 pseudo_acc 0.6674 class_acc [0.7942, 0.776, 0.1575, 0.9174, 0.628, 0.6898, 0.6525] class_num [1200, 125, 819, 1198, 1199, 793, 1197] source_ce 0.0348 target_ce 0.1184 applied_w2 0.0000
+[Epoch 5] Student accuracy: 0.4862 | EMA accuracy: 0.4957
+[Epoch 6] CATM [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9] support [4305, 139, 1695, 6165, 3011, 1103, 4092] predicted [5087, 636, 3161, 7085, 4508, 2417, 5815] weak_agree 0.8082 anchor_agree 0.7144 trusted [3457, 130, 1202, 5547, 2393, 943, 3080] recovery [0, 0, 0, 0, 0, 0, 0] need_recovery [0, 0, 0, 0, 0, 0, 0] cap 1200 eligible [3333, 129, 980, 5536, 2283, 875, 2873] selected [1200, 129, 980, 1200, 1200, 875, 1200] align [1200, 129, 980, 1200, 1200, 875, 1200] ddrl_classes 7 w2 0.0083 pseudo_scale 0.875
+[Epoch 6] selected 6775 pseudo_acc 0.6521 class_acc [0.7938, 0.7734, 0.1442, 0.9208, 0.6297, 0.6796, 0.6455] class_num [1198, 128, 978, 1199, 1199, 874, 1199] source_ce 0.0342 target_ce 0.1170 applied_w2 0.0083
+[Epoch 6] Student accuracy: 0.4823 | EMA accuracy: 0.4915
+[Epoch 7] CATM [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9] support [4242, 142, 1807, 5925, 2962, 1130, 4010] predicted [4980, 691, 3580, 6675, 4383, 2646, 5754] weak_agree 0.8154 anchor_agree 0.7042 trusted [3517, 135, 1362, 5341, 2394, 1001, 3174] recovery [0, 0, 0, 0, 0, 0, 0] need_recovery [0, 0, 0, 0, 0, 0, 0] cap 1200 eligible [3373, 130, 1192, 5323, 2293, 934, 2988] selected [1200, 130, 1192, 1200, 1200, 934, 1200] align [1200, 130, 1192, 1200, 1200, 934, 1200] ddrl_classes 7 w2 0.0167 pseudo_scale 1.000
+[Epoch 7] selected 7045 pseudo_acc 0.6331 class_acc [0.7937, 0.7769, 0.13, 0.9172, 0.6364, 0.6635, 0.6472] class_num [1197, 130, 1192, 1195, 1199, 933, 1199] source_ce 0.0363 target_ce 0.1097 applied_w2 0.0166
+[Epoch 7] Student accuracy: 0.4854 | EMA accuracy: 0.4890
+[Epoch 8] CATM [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9] support [4083, 141, 1895, 5673, 2894, 1159, 3985] predicted [4781, 714, 4068, 6352, 4253, 2908, 5633] weak_agree 0.8196 anchor_agree 0.6907 trusted [3475, 133, 1499, 5124, 2381, 1035, 3176] recovery [0, 0, 0, 0, 0, 0, 0] need_recovery [0, 0, 0, 0, 0, 0, 0] cap 1200 eligible [3392, 131, 1345, 5108, 2296, 993, 3051] selected [1200, 131, 1200, 1200, 1200, 993, 1200] align [1200, 131, 1200, 1200, 1200, 993, 1200] ddrl_classes 7 w2 0.0250 pseudo_scale 1.000
+[Epoch 8] selected 7116 pseudo_acc 0.6289 class_acc [0.788, 0.7863, 0.1284, 0.9208, 0.6272, 0.6495, 0.6458] class_num [1198, 131, 1199, 1199, 1199, 990, 1200] source_ce 0.0380 target_ce 0.1413 applied_w2 0.0248
+[Epoch 8] Student accuracy: 0.4714 | EMA accuracy: 0.4854
+[Epoch 9] CATM [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9] support [4029, 140, 1975, 5525, 2794, 1161, 3947] predicted [4693, 742, 4439, 6149, 4035, 3059, 5592] weak_agree 0.8261 anchor_agree 0.6817 trusted [3452, 135, 1631, 5019, 2294, 1061, 3163] recovery [0, 0, 0, 0, 0, 0, 0] need_recovery [0, 0, 0, 0, 0, 0, 0] cap 1200 eligible [3366, 133, 1491, 4990, 2256, 1028, 3058] selected [1200, 133, 1200, 1200, 1200, 1028, 1200] align [1200, 133, 1200, 1200, 1200, 1028, 1200] ddrl_classes 7 w2 0.0333 pseudo_scale 1.000
+[Epoch 9] selected 7153 pseudo_acc 0.6280 class_acc [0.7871, 0.782, 0.1319, 0.9192, 0.628, 0.644, 0.6424] class_num [1198, 133, 1198, 1200, 1199, 1028, 1197] source_ce 0.0451 target_ce 0.1257 applied_w2 0.0332
+[Epoch 9] Student accuracy: 0.4845 | EMA accuracy: 0.4790
+[Epoch 10] CATM [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9] support [4027, 140, 2041, 5405, 2688, 1162, 3899] predicted [4677, 770, 4813, 6003, 3851, 3155, 5440] weak_agree 0.8324 anchor_agree 0.6744 trusted [3490, 137, 1739, 4945, 2222, 1084, 3158] recovery [0, 0, 0, 0, 0, 0, 0] need_recovery [0, 0, 0, 0, 0, 0, 0] cap 1200 eligible [3394, 135, 1623, 4916, 2187, 1056, 3062] selected [1200, 135, 1200, 1200, 1200, 1056, 1200] align [1200, 135, 1200, 1200, 1200, 1056, 1200] ddrl_classes 7 w2 0.0417 pseudo_scale 1.000
+[Epoch 10] selected 7180 pseudo_acc 0.6276 class_acc [0.7846, 0.7778, 0.128, 0.9217, 0.6277, 0.6383, 0.6477] class_num [1198, 135, 1195, 1200, 1198, 1056, 1198] source_ce 0.0608 target_ce 0.1466 applied_w2 0.0416
+[Epoch 10] Student accuracy: 0.4678 | EMA accuracy: 0.4765
+[Epoch 11] CATM [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9] support [3980, 139, 2052, 5291, 2677, 1173, 3794] predicted [4638, 801, 5006, 5838, 3814, 3311, 5301] weak_agree 0.8364 anchor_agree 0.6655 trusted [3491, 138, 1799, 4844, 2218, 1104, 3133] recovery [0, 0, 0, 0, 0, 0, 0] need_recovery [0, 0, 0, 0, 0, 0, 0] cap 1200 eligible [3417, 137, 1724, 4828, 2167, 1079, 3055] selected [1200, 137, 1200, 1200, 1200, 1079, 1200] align [1200, 137, 1200, 1200, 1200, 1079, 1200] ddrl_classes 7 w2 0.0500 pseudo_scale 1.000
+[Epoch 11] selected 7205 pseudo_acc 0.6261 class_acc [0.7836, 0.7737, 0.1267, 0.9215, 0.6289, 0.6366, 0.6444] class_num [1197, 137, 1200, 1198, 1199, 1076, 1198] source_ce 0.0739 target_ce 0.1639 applied_w2 0.0500
+[Epoch 11] Student accuracy: 0.4611 | EMA accuracy: 0.4742
+[Epoch 12] CATM [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9] support [3949, 139, 2079, 5207, 2667, 1182, 3738] predicted [4568, 786, 5144, 5769, 3855, 3405, 5182] weak_agree 0.8385 anchor_agree 0.6605 trusted [3458, 137, 1829, 4798, 2236, 1114, 3095] recovery [0, 0, 0, 0, 0, 0, 0] need_recovery [0, 0, 0, 0, 0, 0, 0] cap 1200 eligible [3402, 137, 1776, 4759, 2173, 1100, 3033] selected [1200, 137, 1200, 1200, 1200, 1100, 1200] align [1200, 137, 1200, 1200, 1200, 1100, 1200] ddrl_classes 7 w2 0.0500 pseudo_scale 1.000
+[Epoch 12] selected 7230 pseudo_acc 0.6266 class_acc [0.7807, 0.7737, 0.1242, 0.9216, 0.6344, 0.636, 0.6469] class_num [1199, 137, 1200, 1199, 1198, 1099, 1198] source_ce 0.0878 target_ce 0.2329 applied_w2 0.0499
+[Epoch 12] Student accuracy: 0.4748 | EMA accuracy: 0.4726
+[Epoch 13] CATM [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9] support [3911, 135, 2076, 5176, 2641, 1188, 3748] predicted [4553, 766, 5136, 5739, 3809, 3532, 5174] weak_agree 0.8403 anchor_agree 0.6575 trusted [3491, 134, 1844, 4786, 2222, 1137, 3101] recovery [0, 0, 0, 0, 0, 0, 0] need_recovery [0, 0, 0, 0, 0, 0, 0] cap 1200 eligible [3410, 134, 1803, 4737, 2175, 1110, 3027] selected [1200, 134, 1200, 1200, 1200, 1110, 1200] align [1200, 134, 1200, 1200, 1200, 1110, 1200] ddrl_classes 7 w2 0.0500 pseudo_scale 1.000
+[Epoch 13] selected 7236 pseudo_acc 0.6238 class_acc [0.7765, 0.7836, 0.1251, 0.9224, 0.6279, 0.6306, 0.6433] class_num [1199, 134, 1199, 1198, 1196, 1110, 1200] source_ce 0.0770 target_ce 0.2062 applied_w2 0.0498
+[Epoch 13] Student accuracy: 0.4642 | EMA accuracy: 0.4742
+[Epoch 14] CATM [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9] support [3916, 136, 2078, 5105, 2627, 1198, 3713] predicted [4578, 733, 5204, 5632, 3818, 3588, 5156] weak_agree 0.8421 anchor_agree 0.6539 trusted [3494, 134, 1878, 4710, 2241, 1149, 3077] recovery [0, 0, 0, 0, 0, 0, 0] need_recovery [0, 0, 0, 0, 0, 0, 0] cap 1200 eligible [3435, 133, 1823, 4692, 2179, 1132, 3024] selected [1200, 133, 1200, 1200, 1200, 1132, 1200] align [1200, 133, 1200, 1200, 1200, 1132, 1200] ddrl_classes 7 w2 0.0500 pseudo_scale 1.000
+[Epoch 14] selected 7254 pseudo_acc 0.6230 class_acc [0.7774, 0.7895, 0.126, 0.9233, 0.6241, 0.6242, 0.6442] class_num [1195, 133, 1198, 1200, 1197, 1131, 1200] source_ce 0.1474 target_ce 0.1902 applied_w2 0.0498
+[Epoch 14] Student accuracy: 0.4667 | EMA accuracy: 0.4737
+[Epoch 15] CATM [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9] support [3882, 135, 2086, 5071, 2624, 1202, 3690] predicted [4544, 724, 5234, 5545, 3828, 3668, 5166] weak_agree 0.8440 anchor_agree 0.6510 trusted [3477, 134, 1862, 4662, 2274, 1157, 3088] recovery [0, 0, 0, 0, 0, 0, 0] need_recovery [0, 0, 0, 0, 0, 0, 0] cap 1200 eligible [3436, 134, 1834, 4627, 2204, 1146, 3009] selected [1200, 134, 1200, 1200, 1200, 1146, 1200] align [1200, 134, 1200, 1200, 1200, 1146, 1200] ddrl_classes 7 w2 0.0500 pseudo_scale 1.000
+[Epoch 15] selected 7269 pseudo_acc 0.6233 class_acc [0.7803, 0.791, 0.1244, 0.9231, 0.628, 0.6224, 0.6433] class_num [1197, 134, 1198, 1197, 1199, 1144, 1200] source_ce 0.2074 target_ce 0.1833 applied_w2 0.0497
+[Epoch 15] Student accuracy: 0.4851 | EMA accuracy: 0.4726
+[Epoch 16] CATM [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9] support [3869, 134, 2085, 5051, 2618, 1213, 3687] predicted [4521, 714, 5302, 5511, 3799, 3694, 5168] weak_agree 0.8455 anchor_agree 0.6499 trusted [3469, 134, 1857, 4640, 2258, 1169, 3074] recovery [0, 0, 0, 0, 0, 0, 0] need_recovery [0, 0, 0, 0, 0, 0, 0] cap 1200 eligible [3424, 134, 1824, 4601, 2212, 1154, 3012] selected [1200, 134, 1200, 1200, 1200, 1154, 1200] align [1200, 134, 1200, 1200, 1200, 1154, 1200] ddrl_classes 7 w2 0.0500 pseudo_scale 1.000
+[Epoch 16] selected 7276 pseudo_acc 0.6233 class_acc [0.7796, 0.791, 0.1244, 0.9273, 0.6255, 0.6212, 0.6433] class_num [1198, 134, 1198, 1196, 1199, 1151, 1200] source_ce 0.1746 target_ce 0.2506 applied_w2 0.0499
+[Epoch 16] Student accuracy: 0.4703 | EMA accuracy: 0.4737
+[Epoch 17] CATM [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9] support [3884, 134, 2057, 4984, 2594, 1214, 3679] predicted [4510, 731, 5261, 5452, 3785, 3744, 5226] weak_agree 0.8441 anchor_agree 0.6460 trusted [3479, 134, 1845, 4603, 2251, 1167, 3096] recovery [0, 0, 0, 0, 0, 0, 0] need_recovery [0, 0, 0, 0, 0, 0, 0] cap 1200 eligible [3431, 134, 1821, 4573, 2209, 1162, 3017] selected [1200, 134, 1200, 1200, 1200, 1162, 1200] align [1200, 134, 1200, 1200, 1200, 1162, 1200] ddrl_classes 7 w2 0.0500 pseudo_scale 1.000
+[Epoch 17] selected 7288 pseudo_acc 0.6235 class_acc [0.7828, 0.791, 0.125, 0.9265, 0.6232, 0.6205, 0.645] class_num [1197, 134, 1200, 1198, 1197, 1162, 1200] source_ce 0.3210 target_ce 0.2688 applied_w2 0.0499
+[Epoch 17] Student accuracy: 0.4553 | EMA accuracy: 0.4739
+[Epoch 18] CATM [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9] support [3917, 134, 2060, 5004, 2557, 1211, 3699] predicted [4538, 707, 5226, 5470, 3753, 3740, 5275] weak_agree 0.8467 anchor_agree 0.6473 trusted [3561, 134, 1874, 4625, 2231, 1170, 3151] recovery [0, 0, 0, 0, 0, 0, 0] need_recovery [0, 0, 0, 0, 0, 0, 0] cap 1200 eligible [3451, 134, 1831, 4562, 2197, 1162, 3064] selected [1200, 134, 1200, 1200, 1200, 1162, 1200] align [1200, 134, 1200, 1200, 1200, 1162, 1200] ddrl_classes 7 w2 0.0500 pseudo_scale 1.000
+[Epoch 18] selected 7284 pseudo_acc 0.6223 class_acc [0.7763, 0.791, 0.126, 0.9241, 0.6235, 0.6198, 0.6449] class_num [1198, 134, 1198, 1199, 1198, 1160, 1197] source_ce 0.2362 target_ce 0.2341 applied_w2 0.0498
+[Epoch 18] Student accuracy: 0.4734 | EMA accuracy: 0.4681
+[Epoch 19] CATM [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9] support [3874, 134, 2063, 4991, 2517, 1219, 3663] predicted [4514, 729, 5252, 5461, 3706, 3836, 5211] weak_agree 0.8458 anchor_agree 0.6430 trusted [3538, 134, 1893, 4618, 2223, 1173, 3140] recovery [0, 0, 0, 0, 0, 0, 0] need_recovery [0, 0, 0, 0, 0, 0, 0] cap 1200 eligible [3496, 133, 1851, 4579, 2191, 1168, 3083] selected [1200, 133, 1200, 1200, 1200, 1168, 1200] align [1200, 133, 1200, 1200, 1200, 1168, 1200] ddrl_classes 7 w2 0.0500 pseudo_scale 1.000
+[Epoch 19] selected 7290 pseudo_acc 0.6222 class_acc [0.7742, 0.7879, 0.126, 0.9249, 0.6255, 0.6186, 0.6455] class_num [1200, 132, 1198, 1198, 1199, 1164, 1199] source_ce 0.3327 target_ce 0.2935 applied_w2 0.0499
+[Epoch 19] Student accuracy: 0.4826 | EMA accuracy: 0.4681
+[Epoch 20] CATM [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9] support [3870, 135, 2060, 4995, 2519, 1212, 3643] predicted [4493, 717, 5262, 5461, 3717, 3893, 5166] weak_agree 0.8466 anchor_agree 0.6421 trusted [3504, 135, 1892, 4610, 2220, 1174, 3103] recovery [0, 0, 0, 0, 0, 0, 0] need_recovery [0, 0, 0, 0, 0, 0, 0] cap 1200 eligible [3478, 134, 1873, 4567, 2188, 1166, 3060] selected [1200, 134, 1200, 1200, 1200, 1166, 1200] align [1200, 134, 1200, 1200, 1200, 1166, 1200] ddrl_classes 7 w2 0.0500 pseudo_scale 1.000
+[Epoch 20] selected 7287 pseudo_acc 0.6217 class_acc [0.7755, 0.782, 0.1264, 0.9233, 0.6232, 0.6163, 0.6458] class_num [1198, 133, 1195, 1199, 1197, 1165, 1200] source_ce 0.4944 target_ce 0.4323 applied_w2 0.0500
+[Epoch 20] Student accuracy: 0.4712 | EMA accuracy: 0.4673
+[Epoch 21] CATM [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9] support [3809, 135, 2068, 5006, 2498, 1214, 3617] predicted [4398, 751, 5339, 5467, 3658, 3960, 5136] weak_agree 0.8478 anchor_agree 0.6391 trusted [3436, 135, 1894, 4636, 2204, 1179, 3080] recovery [0, 0, 0, 0, 0, 0, 0] need_recovery [0, 0, 0, 0, 0, 0, 0] cap 1200 eligible [3410, 135, 1865, 4574, 2170, 1171, 3040] selected [1200, 135, 1200, 1200, 1200, 1171, 1200] align [1200, 135, 1200, 1200, 1200, 1171, 1200] ddrl_classes 7 w2 0.0500 pseudo_scale 1.000
+[Epoch 21] selected 7301 pseudo_acc 0.6216 class_acc [0.7758, 0.7778, 0.1277, 0.9258, 0.6233, 0.614, 0.6441] class_num [1200, 135, 1198, 1200, 1200, 1171, 1197] source_ce 0.7949 target_ce 0.4768 applied_w2 0.0499
+[Epoch 21] Student accuracy: 0.4734 | EMA accuracy: 0.4659
+[Epoch 22] CATM [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9] support [3816, 135, 2056, 5016, 2505, 1217, 3626] predicted [4394, 770, 5278, 5454, 3678, 3980, 5155] weak_agree 0.8486 anchor_agree 0.6399 trusted [3426, 135, 1890, 4627, 2211, 1185, 3076] recovery [0, 0, 0, 0, 0, 0, 0] need_recovery [0, 0, 0, 0, 0, 0, 0] cap 1200 eligible [3385, 135, 1866, 4594, 2169, 1178, 3023] selected [1200, 135, 1200, 1200, 1200, 1178, 1200] align [1200, 135, 1200, 1200, 1200, 1178, 1200] ddrl_classes 7 w2 0.0500 pseudo_scale 1.000
+[Epoch 22] selected 7301 pseudo_acc 0.6224 class_acc [0.7828, 0.7761, 0.1276, 0.9274, 0.6224, 0.6131, 0.6442] class_num [1197, 134, 1199, 1198, 1197, 1176, 1200] source_ce 0.5499 target_ce 1.1691 applied_w2 0.0499
+[Epoch 22] Student accuracy: 0.4556 | EMA accuracy: 0.4656
+[Epoch 23] CATM [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9] support [3843, 135, 2068, 4974, 2505, 1215, 3610] predicted [4426, 794, 5336, 5427, 3663, 3930, 5133] weak_agree 0.8484 anchor_agree 0.6392 trusted [3462, 135, 1898, 4615, 2215, 1190, 3073] recovery [0, 0, 0, 0, 0, 0, 0] need_recovery [0, 0, 0, 0, 0, 0, 0] cap 1200 eligible [3390, 135, 1869, 4584, 2170, 1183, 3020] selected [1200, 135, 1200, 1200, 1200, 1183, 1200] align [1200, 135, 1200, 1200, 1200, 1183, 1200] ddrl_classes 7 w2 0.0500 pseudo_scale 1.000
+[Epoch 23] selected 7309 pseudo_acc 0.6207 class_acc [0.7817, 0.7778, 0.1276, 0.925, 0.6184, 0.6105, 0.643] class_num [1200, 135, 1199, 1200, 1195, 1181, 1199] source_ce 0.7041 target_ce 0.8713 applied_w2 0.0498
+[Epoch 23] Student accuracy: 0.4592 | EMA accuracy: 0.4648
+[Epoch 24] CATM [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9] support [3805, 135, 2067, 4930, 2486, 1216, 3602] predicted [4366, 808, 5450, 5370, 3629, 3982, 5104] weak_agree 0.8490 anchor_agree 0.6354 trusted [3431, 135, 1909, 4571, 2199, 1189, 3069] recovery [0, 0, 0, 0, 0, 0, 0] need_recovery [0, 0, 0, 0, 0, 0, 0] cap 1200 eligible [3400, 135, 1882, 4547, 2170, 1186, 3020] selected [1200, 135, 1200, 1200, 1200, 1186, 1200] align [1200, 135, 1200, 1200, 1200, 1186, 1200] ddrl_classes 7 w2 0.0500 pseudo_scale 1.000
+[Epoch 24] selected 7315 pseudo_acc 0.6206 class_acc [0.784, 0.7778, 0.126, 0.9258, 0.6183, 0.6106, 0.6405] class_num [1199, 135, 1198, 1200, 1200, 1184, 1199] source_ce 0.9801 target_ce 1.4983 applied_w2 0.0499
+[Epoch 24] Student accuracy: 0.4600 | EMA accuracy: 0.4670
+[Epoch 25] CATM [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9] support [3824, 136, 2070, 4935, 2499, 1218, 3570] predicted [4367, 796, 5515, 5367, 3650, 4010, 5004] weak_agree 0.8502 anchor_agree 0.6358 trusted [3448, 136, 1910, 4553, 2208, 1193, 3038] recovery [0, 0, 0, 0, 0, 0, 0] need_recovery [0, 0, 0, 0, 0, 0, 0] cap 1200 eligible [3395, 135, 1889, 4516, 2170, 1188, 2991] selected [1200, 135, 1200, 1200, 1200, 1188, 1200] align [1200, 135, 1200, 1200, 1200, 1188, 1200] ddrl_classes 7 w2 0.0500 pseudo_scale 1.000
+[Epoch 25] selected 7314 pseudo_acc 0.6211 class_acc [0.7815, 0.7761, 0.1261, 0.9258, 0.6205, 0.6111, 0.6433] class_num [1199, 134, 1197, 1200, 1199, 1188, 1197] source_ce 1.8937 target_ce 0.8301 applied_w2 0.0499
+[Epoch 25] Student accuracy: 0.4843 | EMA accuracy: 0.4684
+[Epoch 26] CATM [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9] support [3733, 136, 2050, 4946, 2487, 1221, 3563] predicted [4265, 821, 5457, 5385, 3602, 4150, 5029] weak_agree 0.8490 anchor_agree 0.6317 trusted [3383, 136, 1911, 4588, 2220, 1194, 3058] recovery [0, 0, 0, 0, 0, 0, 0] need_recovery [0, 0, 0, 0, 0, 0, 0] cap 1200 eligible [3364, 136, 1886, 4521, 2177, 1190, 2993] selected [1200, 136, 1200, 1200, 1200, 1190, 1200] align [1200, 136, 1200, 1200, 1200, 1190, 1200] ddrl_classes 7 w2 0.0500 pseudo_scale 1.000
+[Epoch 26] selected 7319 pseudo_acc 0.6198 class_acc [0.779, 0.7721, 0.1258, 0.9249, 0.6194, 0.6077, 0.6447] class_num [1199, 136, 1200, 1199, 1198, 1188, 1199] source_ce 1.2834 target_ce 0.5808 applied_w2 0.0499
+[Epoch 26] Student accuracy: 0.4366 | EMA accuracy: 0.4700
+[Epoch 27] CATM [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9] support [3730, 135, 2043, 4946, 2500, 1226, 3594] predicted [4283, 826, 5336, 5404, 3639, 4134, 5087] weak_agree 0.8481 anchor_agree 0.6330 trusted [3413, 135, 1899, 4598, 2240, 1201, 3105] recovery [0, 0, 0, 0, 0, 0, 0] need_recovery [0, 0, 0, 0, 0, 0, 0] cap 1200 eligible [3366, 135, 1883, 4552, 2185, 1194, 3028] selected [1200, 135, 1200, 1200, 1200, 1194, 1200] align [1200, 135, 1200, 1200, 1200, 1194, 1200] ddrl_classes 7 w2 0.0500 pseudo_scale 1.000
+[Epoch 27] selected 7322 pseudo_acc 0.6191 class_acc [0.7765, 0.7687, 0.1267, 0.9233, 0.6217, 0.6074, 0.6427] class_num [1199, 134, 1200, 1199, 1200, 1192, 1198] source_ce 1.3914 target_ce 1.2118 applied_w2 0.0499
+[Epoch 27] Student accuracy: 0.4759 | EMA accuracy: 0.4700
+[Epoch 28] CATM [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9] support [3800, 135, 2029, 4934, 2492, 1223, 3583] predicted [4367, 823, 5290, 5391, 3612, 4167, 5059] weak_agree 0.8481 anchor_agree 0.6338 trusted [3462, 135, 1898, 4591, 2227, 1202, 3122] recovery [0, 0, 0, 0, 0, 0, 0] need_recovery [0, 0, 0, 0, 0, 0, 0] cap 1200 eligible [3396, 134, 1877, 4553, 2202, 1197, 3063] selected [1200, 134, 1200, 1200, 1200, 1197, 1200] align [1200, 134, 1200, 1200, 1200, 1197, 1200] ddrl_classes 7 w2 0.0500 pseudo_scale 1.000
+[Epoch 28] selected 7319 pseudo_acc 0.6189 class_acc [0.7756, 0.7687, 0.1269, 0.9231, 0.6255, 0.6064, 0.6397] class_num [1199, 134, 1198, 1196, 1199, 1194, 1199] source_ce 2.2240 target_ce 1.2670 applied_w2 0.0499
+[Epoch 28] Student accuracy: 0.4661 | EMA accuracy: 0.4673
+[Epoch 29] CATM [0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9] support [3817, 135, 2040, 4922, 2520, 1218, 3610] predicted [4377, 818, 5309, 5380, 3662, 4064, 5099] weak_agree 0.8493 anchor_agree 0.6361 trusted [3487, 135, 1904, 4583, 2246, 1206, 3123] recovery [0, 0, 0, 0, 0, 0, 0] need_recovery [0, 0, 0, 0, 0, 0, 0] cap 1200 eligible [3437, 135, 1881, 4544, 2200, 1200, 3074] selected [1200, 135, 1200, 1200, 1200, 1200, 1200] align [1200, 135, 1200, 1200, 1200, 1200, 1200] ddrl_classes 7 w2 0.0500 pseudo_scale 1.000
+[Epoch 29] selected 7325 pseudo_acc 0.6191 class_acc [0.775, 0.7704, 0.1278, 0.9231, 0.6269, 0.6055, 0.6389] class_num [1200, 135, 1197, 1197, 1198, 1199, 1199] source_ce 1.8109 target_ce 1.0451 applied_w2 0.0499
+[Epoch 29] Student accuracy: 0.4823 | EMA accuracy: 0.4661
+best_student 0.5024 best_ema 0.5071 best_overall 0.5071 final_student 0.4823 final_ema 0.4661

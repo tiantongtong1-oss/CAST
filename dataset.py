@@ -96,9 +96,27 @@ class FER(data.Dataset):
             np.random.shuffle(files)
         else:
             files = glob.glob(os.path.join(path, 'test/*/*.jpg'))
+
+        # FER2013 -> CAST label mapping映射
+        fer_to_cast = {
+            0: 5,  # angry -> angry
+            1: 2,  # disgust -> disgust
+            2: 1,  # fear -> fear
+            3: 3,  # happy -> happy
+            4: 4,  # sad -> sad
+            5: 0,  # surprise -> surprise
+            6: 6,  # neutral -> neutral
+        }
+
         for file in files:
             self.file_paths.append(file)
-            self.label.append(int(file.split('/')[-2]))
+
+            original_label = int(os.path.basename(os.path.dirname(file)))
+            mapped_label = fer_to_cast[original_label]
+
+            self.label.append(mapped_label)
+
+
         distribute = np.array(self.label)
         self.label_dis = [ np.sum(distribute == 0),  np.sum(distribute == 1),  np.sum(distribute == 2),  np.sum(distribute == 3),  \
                       np.sum(distribute == 4),  np.sum(distribute == 5),  np.sum(distribute == 6)]
