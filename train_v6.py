@@ -22,16 +22,21 @@ from cast_v6.model import (
     load_source_checkpoint,
     recalibrate_backbone_bn,
 )
-from cast_v6.pseudo import build_pseudo_bank
+from cast_v6.pseudo import build_pseudo_bank, source_class_correction
+
+
+CLASS_NAMES = ("surprise", "fear", "disgust", "happy", "sad", "angry", "neutral")
 
 
 def parse_args():
-    p = argparse.ArgumentParser("CAST v6.1 - balanced dual-view EMA + normalized DDRL + CCDR")
+    p = argparse.ArgumentParser("CAST v6.2 - source-calibrated dual-view EMA + normalized DDRL + CCDR")
     p.add_argument("--source-root", required=True)
     p.add_argument("--target-root", required=True)
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--backbone", default="resnet50", choices=["resnet18", "resnet50", "mobilenet_v2"])
-    p.add_argument("--fer-folder-order", default="cast", choices=["cast", "kaggle"])
+    # The canonical FER2013 numeric folders use Kaggle order. CAST internally
+    # uses RAF order, so canonical FER must be explicitly remapped.
+    p.add_argument("--fer-folder-order", default="kaggle", choices=["cast", "kaggle"])
     p.add_argument("--epochs", type=int, default=15)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--eval-batch-size", type=int, default=128)
@@ -45,10 +50,11 @@ def parse_args():
     p.add_argument("--grad-clip", type=float, default=5.0)
 
     p.add_argument("--w1", type=float, default=4.0)
-    p.add_argument("--w2", type=float, default=0.01,
-                   help="Stable DDRL weight after warmup. v6.1 keeps this conservative because MK-MMD is now scale-normalized.")
+    p.add_argument("--w2", type=float, default=0.01)
     p.add_argument("--w3", type=float, default=0.1)
     p.add_argument("--target-lambda", type=float, default=0.35)
+    p.add_argument("--target-lambda-ramp", type=int, default=4,
+                   help="Linearly ramp target pseudo CE over the first N epochs.")
     p.add_argument("--ddrl-min-class-samples", type=int, default=2)
     p.add_argument("--ddrl-min-classes", type=int, default=3)
     p.add_argument("--affinity-warmup", type=int, default=5)
@@ -65,16 +71,21 @@ def parse_args():
     p.add_argument("--pseudo-confidence-floor", type=float, default=0.0)
     p.add_argument("--pseudo-keep-start", type=float, default=0.35)
     p.add_argument("--pseudo-keep-end", type=float, default=0.55)
-    p.add_argument("--distribution-align-alpha", type=float, default=0.35)
-    p.add_argument("--distribution-align-max", type=float, default=2.0)
-    p.add_argument("--pseudo-class-weight-max", type=float, default=2.0)
 
-    p.add_argument("--bn-recalibrate-batches", type=int, default=0,
-                   help="0 disables target BN recalibration. The audited RAF->FER run degraded slightly with BN recalibration.")
+    # Source-only calibration: no target label prior is assumed. This replaces
+    # v6.1's uniform target distribution alignment, which is invalid for the
+    # highly imbalanced canonical FER2013 class distribution.
+    p.add_argument("--source-correction-alpha", type=float, default=0.5)
+    p.add_argument("--source-correction-min", type=float, default=0.85)
+    p.add_argument("--source-correction-max", type=float, default=1.5)
+    p.add_argument("--pseudo-class-weight-max", type=float, default=1.25)
+    p.add_argument("--class-weight-correction-gate", type=float, default=1.10)
+
+    p.add_argument("--bn-recalibrate-batches", type=int, default=0)
     p.add_argument("--bn-recalibrate-momentum", type=float, default=0.03)
     p.add_argument("--early-stop-patience", type=int, default=4)
     p.add_argument("--debug-target-labels", action="store_true",
-                   help="Log pseudo accuracy / per-epoch target metrics. Never used in optimization.")
+                   help="Diagnostics only; target labels never affect optimization.")
     p.add_argument("--abort-on-collapse", action="store_true")
     p.add_argument("--model-dir", default="")
     return p.parse_args()
@@ -140,6 +151,13 @@ def target_ce(logits, pseudo, weights, selected):
     return (ce * w).sum() / w.sum()
 
 
+def target_lambda_for_epoch(args, epoch: int) -> float:
+    if args.target_lambda_ramp <= 0:
+        return float(args.target_lambda)
+    scale = min(1.0, float(epoch + 1) / float(args.target_lambda_ramp))
+    return float(args.target_lambda) * scale
+
+
 def ddrl_weight_for_epoch(args, epoch, active_classes, health):
     if active_classes < args.ddrl_min_classes:
         return 0.0
@@ -158,12 +176,18 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     stamp = time.strftime("%Y%m%d_%H%M%S")
     if not args.model_dir:
-        args.model_dir = os.path.join("models", "cast_resnet50_v6_1", stamp)
+        args.model_dir = os.path.join("models", "cast_resnet50_v6_2", stamp)
     os.makedirs(args.model_dir, exist_ok=True)
     logger = JsonlLogger(os.path.join(args.model_dir, "metrics.jsonl"))
 
-    print("CAST v6.1 configuration:", json.dumps(vars(args), sort_keys=True))
+    print("CAST v6.2 configuration:", json.dumps(vars(args), sort_keys=True))
     print("Device:", device)
+    if args.fer_folder_order == "kaggle":
+        print("[FER label map] canonical FER2013/Kaggle -> CAST internal order: "
+              "0:angry->5, 1:disgust->2, 2:fear->1, 3:happy->3, "
+              "4:sad->4, 5:surprise->0, 6:neutral->6")
+    else:
+        print("[FER label map] folder labels are assumed to already be in CAST order")
 
     source_train = build_rafdb(args.source_root, "train", mode="train")
     source_eval = build_rafdb(args.source_root, "test", mode="eval")
@@ -198,11 +222,19 @@ def main():
         len(load_info["missing"]), len(load_info["unexpected"])
     ))
 
-    # Source diagnostics are mandatory in v6.1 because target class starvation
-    # can originate in the source checkpoint itself.
     source_metrics = evaluate(student, source_eval_loader, device)
     print("[Source][RAF test] accuracy %.4f class_acc=%s predicted=%s" % (
         source_metrics["acc"], [round(x, 4) for x in source_metrics["class_acc"]], source_metrics["predicted"]
+    ))
+    source_correction = source_class_correction(
+        source_metrics["class_total"],
+        source_metrics["predicted"],
+        alpha=args.source_correction_alpha,
+        min_correction=args.source_correction_min,
+        max_correction=args.source_correction_max,
+    )
+    print("[Source][ClassCorrection] names=%s correction=%s" % (
+        list(CLASS_NAMES), [round(x, 4) for x in source_correction]
     ))
 
     if args.temperature <= 0:
@@ -259,9 +291,9 @@ def main():
             confidence_floor=args.pseudo_confidence_floor,
             keep_ratio_start=args.pseudo_keep_start,
             keep_ratio_end=args.pseudo_keep_end,
-            distribution_align_alpha=args.distribution_align_alpha,
-            distribution_align_max=args.distribution_align_max,
+            class_correction=source_correction,
             class_balance_max=args.pseudo_class_weight_max,
+            class_weight_correction_gate=args.class_weight_correction_gate,
             debug_target_labels=args.debug_target_labels,
         )
         print_pseudo_log(epoch, bank)
@@ -272,6 +304,12 @@ def main():
             [round(x, 4) for x in bank.correction],
             [round(x, 4) for x in bank.class_weights],
         ))
+        if bank.pseudo_precision is not None:
+            print("[Epoch %d][PseudoQuality] precision=%s recall=%s" % (
+                epoch,
+                [round(x, 4) for x in bank.pseudo_precision],
+                [round(x, 4) for x in bank.pseudo_recall],
+            ))
 
         health = prediction_health(bank.predicted_counts, bank.selected_counts, len(target_pseudo))
         print("[Epoch %d][Health] max_pred_ratio=%.4f pred_entropy=%.4f selected_classes=%d "
@@ -294,7 +332,8 @@ def main():
 
         sums = {"src_ce": 0.0, "tgt_ce": 0.0, "cls": 0.0, "ddrl": 0.0,
                 "ddrl_intra": 0.0, "ddrl_inter": 0.0, "cscm": 0.0,
-                "cscm_cos": 0.0, "total": 0.0, "grad": 0.0, "w2": 0.0}
+                "cscm_cos": 0.0, "total": 0.0, "grad": 0.0, "w2": 0.0,
+                "target_lambda": 0.0}
         batches = 0
         last_ddrl = {"intra": 0.0, "inter": 0.0, "raw_loss": 0.0, "loss": 0.0,
                      "intra_classes": [], "inter_classes": [], "active_classes": 0}
@@ -302,6 +341,7 @@ def main():
         eta_batches = 0
         last_volume = None
         ema_decay_used = 0.0
+        target_lambda_eff = target_lambda_for_epoch(args, epoch)
 
         for target_batch in target_train_loader:
             try:
@@ -325,7 +365,7 @@ def main():
 
             src_ce = F.cross_entropy(slogits, sy)
             tgt_ce_value = target_ce(tlogits, py, pw, pm)
-            cls_loss = src_ce + args.target_lambda * tgt_ce_value
+            cls_loss = src_ce + target_lambda_eff * tgt_ce_value
 
             cscm_loss, mean_cos = classifier_modulation_loss(student.fc.weight)
 
@@ -368,6 +408,7 @@ def main():
             sums["total"] += float(loss.detach().item())
             sums["grad"] += grad_norm
             sums["w2"] += w2_eff
+            sums["target_lambda"] += target_lambda_eff
             batches += 1
             last_ddrl = ddrl_info
 
@@ -385,11 +426,11 @@ def main():
             epoch, avg["ddrl_intra"], avg["ddrl_inter"], avg["ddrl"],
             last_ddrl["intra_classes"], avg["w2"]
         ))
-        print("[Epoch %d][Train] source_ce=%.4f target_ce=%.4f cls=%.4f ddrl=%.4f cscm=%.4f "
-              "total=%.4f grad_norm=%.4f lr_backbone=%.7f lr_head=%.7f ema_decay=%.6f" % (
-                  epoch, avg["src_ce"], avg["tgt_ce"], avg["cls"], avg["ddrl"], avg["cscm"],
-                  avg["total"], avg["grad"], optimizer.param_groups[0]["lr"],
-                  optimizer.param_groups[1]["lr"], ema_decay_used
+        print("[Epoch %d][Train] source_ce=%.4f target_ce=%.4f target_lambda=%.4f cls=%.4f "
+              "ddrl=%.4f cscm=%.4f total=%.4f grad_norm=%.4f lr_backbone=%.7f lr_head=%.7f ema_decay=%.6f" % (
+                  epoch, avg["src_ce"], avg["tgt_ce"], avg["target_lambda"], avg["cls"],
+                  avg["ddrl"], avg["cscm"], avg["total"], avg["grad"],
+                  optimizer.param_groups[0]["lr"], optimizer.param_groups[1]["lr"], ema_decay_used
               ))
 
         student_test = evaluate(student, target_test_loader, device)
@@ -414,10 +455,13 @@ def main():
                 "correction": bank.correction,
                 "class_weights": bank.class_weights,
                 "pseudo_acc": bank.pseudo_accuracy,
-                "pseudo_class_acc": bank.pseudo_class_accuracy,
+                "pseudo_precision": bank.pseudo_precision,
+                "pseudo_recall": bank.pseudo_recall,
+                "pseudo_confusion": bank.pseudo_confusion,
             },
             "health": health,
             "source_test": source_metrics,
+            "source_correction": source_correction,
             "train": avg,
             "ddrl_last": last_ddrl,
             "ccdr_eta": avg_eta,
@@ -432,6 +476,7 @@ def main():
             "optimizer": optimizer.state_dict(),
             "epoch": epoch,
             "temperature": temperature,
+            "source_correction": source_correction,
             "config": vars(args),
         }
         torch.save(save, os.path.join(args.model_dir, "last.pth"))
