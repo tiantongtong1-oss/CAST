@@ -13,6 +13,7 @@ from torchvision import transforms
 import Networks
 from dataset import RafDataSet, FER
 from ema_utils import create_ema_teacher, select_dual_view_pseudo_labels, update_ema_teacher
+from prototype_utils import FeatureHook, PrototypeBank, prototype_weight_for_epoch
 import image_utils as util
 from randaugment import RandAugmentMC
 
@@ -69,6 +70,22 @@ def parse_args():
                         help='minimum class-adaptive threshold')
     parser.add_argument('--threshold_max', type=float, default=0.95,
                         help='maximum class-adaptive threshold')
+
+    # Prototype-consistency v1. The defaults intentionally keep this
+    # regularizer weaker than the main CAST classification objective.
+    parser.add_argument('--proto_weight', type=float, default=0.10,
+                        help='maximum prototype-consistency loss weight')
+    parser.add_argument('--proto_temperature', type=float, default=0.20,
+                        help='temperature for prototype cosine logits')
+    parser.add_argument('--proto_momentum', type=float, default=0.99,
+                        help='EMA momentum of target class prototypes')
+    parser.add_argument('--proto_source_anchor', type=float, default=0.50,
+                        help='source-prototype fraction in the blended prototype')
+    parser.add_argument('--proto_warmup_epochs', type=int, default=3,
+                        help='epochs that only update prototype memory, without its loss')
+    parser.add_argument('--proto_ramp_epochs', type=int, default=5,
+                        help='epochs used to linearly ramp prototype loss to full weight')
+
     args = parser.parse_args()
     if not (0.0 <= args.threshold_min <= args.threshold_max <= 1.0):
         parser.error('require 0 <= threshold_min <= threshold_max <= 1')
@@ -80,6 +97,16 @@ def parse_args():
         parser.error('--threshold_margin must be nonnegative')
     if not (0.0 <= args.ema_decay < 1.0):
         parser.error('--ema_decay must be in [0, 1)')
+    if args.proto_weight < 0.0:
+        parser.error('--proto_weight must be nonnegative')
+    if args.proto_temperature <= 0.0:
+        parser.error('--proto_temperature must be positive')
+    if not (0.0 <= args.proto_momentum < 1.0):
+        parser.error('--proto_momentum must be in [0, 1)')
+    if not (0.0 <= args.proto_source_anchor <= 1.0):
+        parser.error('--proto_source_anchor must be in [0, 1]')
+    if args.proto_warmup_epochs < 0 or args.proto_ramp_epochs < 0:
+        parser.error('prototype warmup/ramp epochs must be nonnegative')
     return args
 
 
@@ -131,18 +158,7 @@ def classifier_modulation_loss(model):
 def calculate_target_thresholds(model, loader, class_num, threshold_base,
                                 threshold_beta, threshold_margin,
                                 threshold_min, threshold_max):
-    """Global-confidence-aware relative class-adaptive thresholds.
-
-    For class c with teacher mean confidence mu_c and unweighted valid-class
-    mean mu_bar:
-
-        center = max(threshold_base, mu_bar + threshold_margin)
-        tau_c = clip(center + beta * (mu_c - mu_bar), tau_min, tau_max)
-
-    This preserves relative class difficulty while making the whole threshold
-    schedule stricter when the EMA teacher becomes globally more confident.
-    Target ground-truth labels are never used.
-    """
+    """Global-confidence-aware relative class-adaptive thresholds."""
     class_sum = torch.zeros(class_num, dtype=torch.float64)
     class_count = torch.zeros(class_num, dtype=torch.float64)
 
@@ -215,7 +231,7 @@ def evaluate(model, loader, criterion, num_samples, epoch, split_name):
 
 
 def save_checkpoint(path, model, optimizer, scheduler, epoch, best_val_acc, args,
-                    teacher=None):
+                    teacher=None, prototype_bank=None):
     state = {
         'model': model.state_dict(),
         'optimizer': optimizer.state_dict(),
@@ -226,7 +242,21 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch, best_val_acc, args
     }
     if teacher is not None:
         state['ema_teacher'] = teacher.state_dict()
+    if prototype_bank is not None:
+        state['prototype_bank'] = prototype_bank.state_dict()
     torch.save(state, path)
+
+
+def initialize_source_prototypes(teacher, feature_hook, loader, prototype_bank):
+    """Build deterministic source semantic anchors from labeled RAF-DB."""
+    teacher.eval()
+    with torch.no_grad():
+        for imgs, targets in loader:
+            imgs = imgs.cuda(non_blocking=True)
+            targets = targets.cuda(non_blocking=True)
+            teacher(imgs, None, None, mode='test', task='source')
+            prototype_bank.accumulate_source(feature_hook.output, targets)
+    prototype_bank.finalize_source()
 
 
 def run_training():
@@ -237,22 +267,25 @@ def run_training():
     source_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_ema_dualview_stable_source_best.pth'
+        + '_prototype_consistency_v1_source_best.pth'
     )
     target_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_ema_dualview_stable_target_best.pth'
+        + '_prototype_consistency_v1_target_best.pth'
     )
 
     print('---------------------------------------------------------------------------------------')
-    print('EMA + Dual View + Stable CAT: %s with source %s and target %s' %
+    print('EMA + Dual View + Stable CAT + Prototype Consistency v1: %s with source %s and target %s' %
           (args.backbone, args.data1, args.data2))
     print('alpha(w1):%s beta(w2):%s gamma(w3):%s ema:%s '
           'tau0:%s threshold_beta:%s margin:%s threshold_range:[%s,%s]' %
           (args.w1, args.w2, args.w3, args.ema_decay,
            args.threshold_base, args.threshold_beta, args.threshold_margin,
            args.threshold_min, args.threshold_max))
+    print('prototype weight:%s temp:%s momentum:%s source_anchor:%s warmup:%s ramp:%s' %
+          (args.proto_weight, args.proto_temperature, args.proto_momentum,
+           args.proto_source_anchor, args.proto_warmup_epochs, args.proto_ramp_epochs))
     print('---------------------------------------------------------------------------------------')
 
     if args.backbone == 'resnet18':
@@ -271,6 +304,11 @@ def run_training():
 
     source_train = RafDataSet(
         args.source_path, phase='train', transform=weak_transform,
+        strong_transform=None, basic_aug=False
+    )
+    # Deterministic source view for semantic prototype initialization.
+    source_prototype = RafDataSet(
+        args.source_path, phase='train', transform=test_transform,
         strong_transform=None, basic_aug=False
     )
 
@@ -297,6 +335,10 @@ def run_training():
     train_loader_source = torch.utils.data.DataLoader(
         source_train, batch_size=train_batch, num_workers=args.workers,
         shuffle=True, pin_memory=True, worker_init_fn=_init_fn,
+    )
+    prototype_loader_source = torch.utils.data.DataLoader(
+        source_prototype, batch_size=test_batch, num_workers=args.workers,
+        shuffle=False, pin_memory=True, worker_init_fn=_init_fn,
     )
     train_loader_target = torch.utils.data.DataLoader(
         target_train, batch_size=train_batch, num_workers=args.workers,
@@ -381,6 +423,21 @@ def run_training():
     scheduler.load_state_dict(checkpoint['scheduler'])
 
     teacher = create_ema_teacher(model).cuda()
+    teacher_feature_hook = FeatureHook(teacher.feature)
+    student_feature_hook = FeatureHook(model.feature)
+
+    prototype_bank = PrototypeBank(
+        class_num,
+        model.fc.in_features,
+        momentum=args.proto_momentum,
+        source_anchor=args.proto_source_anchor,
+    ).cuda()
+    initialize_source_prototypes(
+        teacher, teacher_feature_hook, prototype_loader_source, prototype_bank
+    )
+    print('source prototype counts: %s' %
+          np.array2string(prototype_bank.source_counts.cpu().numpy(), separator=', '))
+
     best_target_val_acc = -1.0
     global_step = 0
 
@@ -395,6 +452,10 @@ def run_training():
             args.threshold_min,
             args.threshold_max,
         )
+        current_proto_weight = prototype_weight_for_epoch(
+            i, args.proto_weight, args.proto_warmup_epochs, args.proto_ramp_epochs
+        )
+
         print('[Target Epoch %d] class mean confidence: %s global_mean: %.4f '
               'threshold_center: %.4f' %
               (i, np.array2string(class_mean.numpy(), precision=4),
@@ -407,9 +468,13 @@ def run_training():
         train_loss1 = 0.0
         train_loss2 = 0.0
         train_loss3 = 0.0
+        train_proto_loss = 0.0
         batch_count = 0
         confident_num = 0
         agreement_num = 0
+        prototype_agree_num = 0
+        prototype_checked_num = 0
+        prototype_similarity_sum = 0.0
         pseudo_distribution = np.zeros(class_num, dtype=np.int64)
 
         for weak1, weak2, strong, _ in train_loader_target:
@@ -426,13 +491,28 @@ def run_training():
             teacher.eval()
             with torch.no_grad():
                 logits1, _ = teacher(weak1, None, None, 'test', 'target')
+                teacher_features1 = teacher_feature_hook.output.detach()
                 logits2, _ = teacher(weak2, None, None, 'test', 'target')
+                teacher_features2 = teacher_feature_hook.output.detach()
                 pseudo_targets, con_idx, agree_count = select_dual_view_pseudo_labels(
                     logits1, logits2, thresholds
+                )
+                teacher_mean_features = F.normalize(
+                    F.normalize(teacher_features1, dim=1)
+                    + F.normalize(teacher_features2, dim=1),
+                    dim=1,
+                )
+                proto_agree, proto_checked, proto_similarity = (
+                    prototype_bank.agreement_stats(
+                        teacher_mean_features, pseudo_targets, con_idx
+                    )
                 )
 
             agreement_num += agree_count
             confident_num += int(con_idx.sum().item())
+            prototype_agree_num += proto_agree
+            prototype_checked_num += proto_checked
+            prototype_similarity_sum += proto_similarity * proto_checked
             reliable = pseudo_targets[con_idx.bool()].cpu().numpy()
             for c in range(class_num):
                 pseudo_distribution[c] += int(np.sum(reliable == c))
@@ -453,29 +533,62 @@ def run_training():
             cls_loss = per_sample_loss.sum() / train_con_idx.sum().clamp_min(1.0)
             aff_loss = output[1]
             weight_loss = classifier_modulation_loss(model)
-            loss = cls_loss * args.w1 + aff_loss * args.w2 + weight_loss * args.w3
+
+            target_student_features = student_feature_hook.output[source_imgs.shape[0]:]
+            proto_loss = prototype_bank.consistency_loss(
+                target_student_features,
+                pseudo_targets,
+                con_idx,
+                temperature=args.proto_temperature,
+            )
+
+            loss = (
+                cls_loss * args.w1
+                + aff_loss * args.w2
+                + weight_loss * args.w3
+                + proto_loss * current_proto_weight
+            )
             loss.backward()
             optimizer.step()
 
             global_step += 1
             update_ema_teacher(teacher, model, args.ema_decay, global_step)
+            prototype_bank.update_target(
+                teacher_mean_features, pseudo_targets, con_idx
+            )
 
             train_loss1 += cls_loss.item()
             train_loss2 += aff_loss.item()
             train_loss3 += weight_loss.item()
+            train_proto_loss += proto_loss.item()
             batch_count += 1
 
         scheduler.step()
+        proto_agreement_rate = (
+            float(prototype_agree_num) / float(prototype_checked_num)
+            if prototype_checked_num > 0 else 0.0
+        )
+        proto_mean_similarity = (
+            prototype_similarity_sum / float(prototype_checked_num)
+            if prototype_checked_num > 0 else 0.0
+        )
         print('[Target Epoch %d] Agreement_Num: %d Confident_Num: %d '
               'Pseudo_Distribution: %s' %
               (i, agreement_num, confident_num,
                np.array2string(pseudo_distribution, separator=', ')))
+        print('[Target Epoch %d] Prototype_Agreement: %d/%d (%.4f) '
+              'Mean_Assigned_Cosine: %.4f Target_Prototype_Counts: %s' %
+              (i, prototype_agree_num, prototype_checked_num,
+               proto_agreement_rate, proto_mean_similarity,
+               np.array2string(prototype_bank.target_counts.cpu().numpy(), separator=', ')))
         print('[Target Epoch %d] Classification Loss: %.3f Affinity Loss: %.3f '
-              'Weight Loss: %.3f LR: %.6f' %
+              'Weight Loss: %.3f Prototype Loss: %.3f ProtoWeight: %.4f LR: %.6f' %
               (i,
                train_loss1 / max(batch_count, 1),
                train_loss2 / max(batch_count, 1),
                train_loss3 / max(batch_count, 1),
+               train_proto_loss / max(batch_count, 1),
+               current_proto_weight,
                optimizer.param_groups[0]['lr']))
 
         val_acc = evaluate(
@@ -483,8 +596,11 @@ def run_training():
         )
         if val_acc > best_target_val_acc:
             best_target_val_acc = val_acc
-            save_checkpoint(target_best_path, model, optimizer, scheduler, i,
-                            best_target_val_acc, args, teacher=teacher)
+            save_checkpoint(
+                target_best_path, model, optimizer, scheduler, i,
+                best_target_val_acc, args, teacher=teacher,
+                prototype_bank=prototype_bank,
+            )
             print('best target-stage validation accuracy %.4f' % best_target_val_acc)
 
     if args.epochs > 0:
@@ -495,6 +611,9 @@ def run_training():
         checkpoint = torch.load(source_best_path, map_location='cuda')
         model.load_state_dict(checkpoint['model'])
         selected_val_acc = best_source_val_acc
+
+    teacher_feature_hook.close()
+    student_feature_hook.close()
 
     test_acc = evaluate(
         model, test_loader_target, criterion, len(target_test), args.epochs, 'Test'
