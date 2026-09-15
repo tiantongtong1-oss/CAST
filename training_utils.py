@@ -95,14 +95,14 @@ def balance_source_losses(per_sample_loss, labels, class_weights):
 
 
 def target_pseudo_class_weights(counts, power=0.0, max_ratio=2.0):
-    """Bounded inverse-frequency weights from ACCEPTED target pseudo labels.
+    """Bounded inverse-frequency weights from accepted target pseudo labels.
 
-    This uses no target ground-truth labels. Counts should come from the
-    previous target epoch so every batch in the current epoch sees fixed class
-    weights. The weighted mean under the observed pseudo-label distribution is
-    normalized to one, keeping the target CE scale close to the unweighted
-    objective. Unseen classes receive the maximum raw weight so that a newly
-    recovered minority class is not immediately suppressed.
+    This uses no target ground-truth labels. Counts may represent an epoch or a
+    mini-batch; recovery v4 intentionally uses the current accepted pseudo-label
+    mini-batch with a small power and a tight cap. The weighted mean under the
+    observed pseudo-label distribution is normalized to one so target CE scale
+    stays close to the unweighted objective. Unseen classes receive the maximum
+    raw weight, ready for a newly recovered minority pseudo class.
     """
     if not math.isfinite(power) or power < 0:
         raise ValueError('target balance power must be finite and nonnegative')
@@ -146,30 +146,3 @@ def balance_target_losses(per_sample_loss, labels, class_weights):
     if not torch.isfinite(sample_weights).all() or torch.any(sample_weights <= 0):
         raise ValueError('target class weights must be finite and positive')
     return per_sample_loss * sample_weights
-
-
-def select_target_candidate(best_student_acc, best_ema_acc=None, ema_tolerance=0.0):
-    """Choose the target checkpoint without consulting target test labels.
-
-    With zero tolerance this preserves the historical rule: EMA must strictly
-    beat the student. With a positive tolerance, EMA is preferred when its best
-    validation accuracy is within that absolute accuracy margin of the best
-    student. This is useful when the difference is only a handful of validation
-    samples and the EMA is intended as the lower-variance estimator.
-    """
-    if not math.isfinite(float(best_student_acc)):
-        raise ValueError('student validation accuracy must be finite')
-    if not math.isfinite(float(ema_tolerance)) or ema_tolerance < 0:
-        raise ValueError('EMA selection tolerance must be finite and nonnegative')
-    if best_ema_acc is None:
-        return 'student', float(best_student_acc)
-    if not math.isfinite(float(best_ema_acc)):
-        raise ValueError('EMA validation accuracy must be finite')
-
-    student_acc = float(best_student_acc)
-    ema_acc = float(best_ema_acc)
-    if ema_tolerance == 0.0:
-        prefer_ema = ema_acc > student_acc
-    else:
-        prefer_ema = ema_acc + float(ema_tolerance) >= student_acc
-    return ('ema_teacher', ema_acc) if prefer_ema else ('student', student_acc)
