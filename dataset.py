@@ -79,8 +79,8 @@ class FER(data.Dataset):
     """FER2013 loader using the CAST/RAF-DB class order.
 
     For target training this class can return two independently sampled weak
-    views plus one strong view. The extra weak view is the only data-pipeline
-    change required by the EMA + Dual View ablation.
+    views plus one strong view. ``return_index`` appends a stable sample index
+    for temporal memory; existing callers retain their original tuple shape.
     """
 
     FER_TO_CAST = {
@@ -94,8 +94,9 @@ class FER(data.Dataset):
     }
 
     def __init__(self, path, phase, transform=None, weak2_transform=None,
-                 strong_transform=None, basic_aug=False):
+                 strong_transform=None, basic_aug=False, return_index=False):
         self.phase = phase
+        self.return_index = return_index
         self.transform = transform
         self.weak2_transform = weak2_transform
         self.strong_transform = strong_transform
@@ -117,7 +118,9 @@ class FER(data.Dataset):
         for split_name in split_candidates:
             candidate = glob.glob(os.path.join(path, split_name, '*', '*.jpg'))
             if candidate:
-                files = candidate
+                # Glob order is filesystem-dependent. Sort before the seeded
+                # shuffle so indices also agree across dataset instances.
+                files = sorted(candidate)
                 used_split = split_name
                 break
 
@@ -167,11 +170,12 @@ class FER(data.Dataset):
             img_weak2 = self.weak2_transform(image)
             if self.strong_transform is not None:
                 img_strong = self.strong_transform(image)
-                return img, img_weak2, img_strong, label
-            return img, img_weak2, label
-
-        if self.strong_transform is not None:
+                result = (img, img_weak2, img_strong, label)
+            else:
+                result = (img, img_weak2, label)
+        elif self.strong_transform is not None:
             img_strong = self.strong_transform(image)
-            return img, img_strong, label
-
-        return img, label
+            result = (img, img_strong, label)
+        else:
+            result = (img, label)
+        return result + (idx,) if self.return_index else result

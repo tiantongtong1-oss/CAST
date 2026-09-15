@@ -14,6 +14,7 @@ import Networks
 from dataset import RafDataSet, FER
 from ema_utils import create_ema_teacher, select_dual_view_pseudo_labels, update_ema_teacher
 from prototype_utils import FeatureHook, PrototypeBank, prototype_weight_for_epoch
+from temporal_utils import TemporalPredictionBank, mixed_target_cross_entropy
 import image_utils as util
 from randaugment import RandAugmentMC
 
@@ -86,6 +87,22 @@ def parse_args():
     parser.add_argument('--proto_ramp_epochs', type=int, default=5,
                         help='epochs used to linearly ramp prototype loss to full weight')
 
+    parser.add_argument('--disable_temporal', action='store_true',
+                        help='disable temporal filtering and memory for ablation')
+    parser.add_argument('--temporal_momentum', type=float, default=0.7,
+                        help='EMA momentum of each target sample probability history')
+    parser.add_argument('--temporal_min_streak', type=int, default=2,
+                        help='consecutive dual-view-confident epochs with the same label')
+    parser.add_argument('--temporal_warmup_epochs', type=int, default=2,
+                        help='collect history while retaining the dual-view mask')
+    parser.add_argument('--target_soft_weight', type=float, default=0.5,
+                        help='soft-label fraction of target CE after temporal warmup; '
+                             'uses current dual-view probabilities if temporal is disabled')
+    parser.add_argument('--eval_ema', action='store_true',
+                        help='also validate the EMA teacher and allow it to be selected')
+    parser.add_argument('--run_name', type=str, default='temporal_consistency_v1',
+                        help='checkpoint filename tag; use a distinct tag for each ablation')
+
     args = parser.parse_args()
     if not (0.0 <= args.threshold_min <= args.threshold_max <= 1.0):
         parser.error('require 0 <= threshold_min <= threshold_max <= 1')
@@ -107,6 +124,19 @@ def parse_args():
         parser.error('--proto_source_anchor must be in [0, 1]')
     if args.proto_warmup_epochs < 0 or args.proto_ramp_epochs < 0:
         parser.error('prototype warmup/ramp epochs must be nonnegative')
+    if not 0.0 <= args.temporal_momentum < 1.0:
+        parser.error('--temporal_momentum must be in [0, 1)')
+    if args.temporal_min_streak < 1 or args.temporal_warmup_epochs < 0:
+        parser.error('require positive temporal_min_streak and nonnegative warmup')
+    if not 0.0 <= args.target_soft_weight <= 1.0:
+        parser.error('--target_soft_weight must be in [0, 1]')
+    if args.pre_epochs < 0 or args.epochs < 0:
+        parser.error('epoch counts must be nonnegative')
+    if args.pre_epochs == 0 and not args.checkpoint:
+        parser.error('--pre_epochs 0 requires an explicit --checkpoint source model')
+    valid_tag_chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-'
+    if not args.run_name or any(c not in valid_tag_chars for c in args.run_name):
+        parser.error('--run_name must contain only letters, digits, underscores or hyphens')
     return args
 
 
@@ -203,7 +233,7 @@ def calculate_target_thresholds(model, loader, class_num, threshold_base,
 
 def evaluate(model, loader, criterion, num_samples, epoch, split_name):
     val_loss = 0.0
-    iter_cnt = 0
+    sample_count = 0
     bingo_cnt = 0
     preds, labels = [], []
 
@@ -213,25 +243,31 @@ def evaluate(model, loader, criterion, num_samples, epoch, split_name):
             imgs = imgs.cuda(non_blocking=True)
             targets = targets.cuda(non_blocking=True)
             out, _ = model(imgs, targets, None, mode='test')
-            loss = torch.mean(criterion(out, targets))
-            val_loss += loss.item()
-            iter_cnt += 1
+            val_loss += criterion(out, targets).sum().item()
+            sample_count += targets.numel()
 
             predicts = torch.argmax(out, dim=1)
             bingo_cnt += torch.eq(predicts, targets).sum().item()
             preds.append(predicts.cpu())
             labels.append(targets.cpu())
 
-    avg_loss = val_loss / max(iter_cnt, 1)
-    acc = float(bingo_cnt) / float(num_samples)
+    if sample_count != num_samples or sample_count == 0:
+        raise ValueError('evaluation must visit the full nonempty split exactly once')
+    avg_loss = val_loss / sample_count
+    acc = float(bingo_cnt) / sample_count
     print('[Epoch %d] Target %s accuracy: %.4f. Loss: %.3f' %
           (epoch, split_name, acc, avg_loss))
-    util.make_confucion_matrix(preds, labels)
+    recalls, _ = util.make_confucion_matrix(preds, labels)
+    print('[Epoch %d] Target %s recall [surprise, fear, disgust, happy, sad, angry, neutral]: %s '
+          'Macro Recall: %.4f' %
+          (epoch, split_name, np.array2string(np.asarray(recalls), precision=4),
+           float(np.mean(recalls))))
     return acc
 
 
 def save_checkpoint(path, model, optimizer, scheduler, epoch, best_val_acc, args,
-                    teacher=None, prototype_bank=None):
+                    teacher=None, prototype_bank=None, temporal_bank=None,
+                    target_sample_paths=None, selected_model='student'):
     state = {
         'model': model.state_dict(),
         'optimizer': optimizer.state_dict(),
@@ -239,11 +275,15 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch, best_val_acc, args
         'epoch': epoch,
         'best_val_acc': best_val_acc,
         'args': vars(args),
+        'selected_model': selected_model,
     }
     if teacher is not None:
         state['ema_teacher'] = teacher.state_dict()
     if prototype_bank is not None:
         state['prototype_bank'] = prototype_bank.state_dict()
+    if temporal_bank is not None:
+        state['temporal_bank'] = temporal_bank.state_dict()
+        state['target_sample_paths'] = target_sample_paths
     torch.save(state, path)
 
 
@@ -267,16 +307,16 @@ def run_training():
     source_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_prototype_consistency_v1_source_best.pth'
+        + '_' + args.run_name + '_source_best.pth'
     )
     target_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_prototype_consistency_v1_target_best.pth'
+        + '_' + args.run_name + '_target_best.pth'
     )
 
     print('---------------------------------------------------------------------------------------')
-    print('EMA + Dual View + Stable CAT + Prototype Consistency v1: %s with source %s and target %s' %
+    print('EMA + Dual View + Stable CAT + Prototype + Temporal Consistency v1: %s with source %s and target %s' %
           (args.backbone, args.data1, args.data2))
     print('alpha(w1):%s beta(w2):%s gamma(w3):%s ema:%s '
           'tau0:%s threshold_beta:%s margin:%s threshold_range:[%s,%s]' %
@@ -286,6 +326,10 @@ def run_training():
     print('prototype weight:%s temp:%s momentum:%s source_anchor:%s warmup:%s ramp:%s' %
           (args.proto_weight, args.proto_temperature, args.proto_momentum,
            args.proto_source_anchor, args.proto_warmup_epochs, args.proto_ramp_epochs))
+    print('temporal enabled:%s momentum:%s min_streak:%s warmup:%s '
+          'target_soft_weight:%s eval_ema:%s run_name:%s' %
+          (not args.disable_temporal, args.temporal_momentum, args.temporal_min_streak,
+           args.temporal_warmup_epochs, args.target_soft_weight, args.eval_ema, args.run_name))
     print('---------------------------------------------------------------------------------------')
 
     if args.backbone == 'resnet18':
@@ -315,7 +359,7 @@ def run_training():
     target_train = FER(
         args.target_path, phase='train', transform=weak_transform,
         weak2_transform=weak_transform, strong_transform=strong_transform,
-        basic_aug=False
+        basic_aug=False, return_index=True
     )
     target_threshold = FER(
         args.target_path, phase='train', transform=weak_transform,
@@ -362,12 +406,26 @@ def run_training():
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
     criterion = torch.nn.CrossEntropyLoss(reduction='none')
 
+    best_source_val_acc = -1.0
     if args.checkpoint:
         print('Loading pretrained weights...', args.checkpoint)
         checkpoint = torch.load(args.checkpoint, map_location='cuda')
         model.load_state_dict(checkpoint['model'], strict=True)
+        if args.pre_epochs == 0:
+            if 'ema_teacher' in checkpoint:
+                raise ValueError('--pre_epochs 0 expects a SOURCE checkpoint, not a target-stage resume')
+            # Explicitly selected source checkpoints can skip the expensive
+            # source stage. Retain its optimizer/scheduler if available.
+            if 'optimizer' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer'])
+            if 'scheduler' in checkpoint:
+                scheduler.load_state_dict(checkpoint['scheduler'])
+            best_source_val_acc = evaluate(
+                model, val_loader_target, criterion, len(target_val), -1, 'Validation Source'
+            )
+            save_checkpoint(source_best_path, model, optimizer, scheduler, -1,
+                            best_source_val_acc, args)
 
-    best_source_val_acc = -1.0
     for i in range(args.pre_epochs):
         model.train()
         train_loss1 = 0.0
@@ -438,6 +496,13 @@ def run_training():
     print('source prototype counts: %s' %
           np.array2string(prototype_bank.source_counts.cpu().numpy(), separator=', '))
 
+    temporal_bank = None if args.disable_temporal else TemporalPredictionBank(
+        len(target_train), class_num, momentum=args.temporal_momentum,
+        min_streak=args.temporal_min_streak,
+    ).cuda()
+    target_sample_paths = [os.path.relpath(path, args.target_path)
+                           for path in target_train.file_paths]
+
     best_target_val_acc = -1.0
     global_step = 0
 
@@ -454,6 +519,9 @@ def run_training():
         )
         current_proto_weight = prototype_weight_for_epoch(
             i, args.proto_weight, args.proto_warmup_epochs, args.proto_ramp_epochs
+        )
+        current_soft_weight = (
+            args.target_soft_weight if i >= args.temporal_warmup_epochs else 0.0
         )
 
         print('[Target Epoch %d] class mean confidence: %s global_mean: %.4f '
@@ -476,8 +544,12 @@ def run_training():
         prototype_checked_num = 0
         prototype_similarity_sum = 0.0
         pseudo_distribution = np.zeros(class_num, dtype=np.int64)
+        dual_distribution = np.zeros(class_num, dtype=np.int64)
+        temporal_stats = dict(dual_accepted=0, stable_accepted=0,
+                              history_disagrees=0, label_flips=0)
 
-        for weak1, weak2, strong, _ in train_loader_target:
+        # FER ground-truth labels are deliberately ignored here.
+        for weak1, weak2, strong, _, sample_indices in train_loader_target:
             try:
                 source_imgs, source_targets = next(source_train_iter)
             except StopIteration:
@@ -497,6 +569,19 @@ def run_training():
                 pseudo_targets, con_idx, agree_count = select_dual_view_pseudo_labels(
                     logits1, logits2, thresholds
                 )
+                dual_distribution += torch.bincount(
+                    pseudo_targets[con_idx.bool()].cpu(), minlength=class_num
+                ).numpy()
+                if temporal_bank is not None:
+                    con_idx, soft_targets, batch_stats = temporal_bank.update_and_select(
+                        sample_indices, logits1, logits2, pseudo_targets, con_idx,
+                        i, warmup_epochs=args.temporal_warmup_epochs,
+                    )
+                    for key, value in batch_stats.items():
+                        temporal_stats[key] += value
+                else:
+                    soft_targets = 0.5 * (F.softmax(logits1, dim=1)
+                                          + F.softmax(logits2, dim=1))
                 teacher_mean_features = F.normalize(
                     F.normalize(teacher_features1, dim=1)
                     + F.normalize(teacher_features2, dim=1),
@@ -529,7 +614,13 @@ def run_training():
                 source_count=source_imgs.shape[0],
             )
 
-            per_sample_loss = criterion(output[0], train_targets) * train_con_idx
+            source_count = source_imgs.shape[0]
+            source_ce = criterion(output[0][:source_count], train_targets[:source_count])
+            target_ce = mixed_target_cross_entropy(
+                output[0][source_count:], pseudo_targets, soft_targets,
+                soft_weight=current_soft_weight,
+            )
+            per_sample_loss = torch.cat((source_ce, target_ce)) * train_con_idx
             cls_loss = per_sample_loss.sum() / train_con_idx.sum().clamp_min(1.0)
             aff_loss = output[1]
             weight_loss = classifier_modulation_loss(model)
@@ -576,6 +667,16 @@ def run_training():
               'Pseudo_Distribution: %s' %
               (i, agreement_num, confident_num,
                np.array2string(pseudo_distribution, separator=', ')))
+        print('[Target Epoch %d] Dual_Pseudo_Distribution: %s SoftWeight: %.4f' %
+              (i, np.array2string(dual_distribution, separator=', '), current_soft_weight))
+        if temporal_bank is not None:
+            retention = pseudo_distribution / np.maximum(dual_distribution, 1)
+            print('[Target Epoch %d] Temporal_Stable: %d/%d History_Disagrees: %d '
+                  'Label_Flips: %d Retention_By_Class: %s Warmup: %s' %
+                  (i, temporal_stats['stable_accepted'], temporal_stats['dual_accepted'],
+                   temporal_stats['history_disagrees'], temporal_stats['label_flips'],
+                   np.array2string(retention, precision=4),
+                   i < args.temporal_warmup_epochs))
         print('[Target Epoch %d] Prototype_Agreement: %d/%d (%.4f) '
               'Mean_Assigned_Cosine: %.4f Target_Prototype_Counts: %s' %
               (i, prototype_agree_num, prototype_checked_num,
@@ -592,25 +693,43 @@ def run_training():
                optimizer.param_groups[0]['lr']))
 
         val_acc = evaluate(
-            model, val_loader_target, criterion, len(target_val), i, 'Validation'
+            model, val_loader_target, criterion, len(target_val), i, 'Validation Student'
         )
+        selected_model = 'student'
+        if args.eval_ema:
+            # Even an unshuffled validation DataLoader draws a CPU base seed.
+            # Keep this optional evaluation from changing later training RNG.
+            with torch.random.fork_rng(devices=[]):
+                teacher_val_acc = evaluate(
+                    teacher, val_loader_target, criterion, len(target_val), i, 'Validation EMA'
+                )
+            if teacher_val_acc > val_acc:
+                val_acc = teacher_val_acc
+                selected_model = 'ema_teacher'
         if val_acc > best_target_val_acc:
             best_target_val_acc = val_acc
             save_checkpoint(
                 target_best_path, model, optimizer, scheduler, i,
                 best_target_val_acc, args, teacher=teacher,
-                prototype_bank=prototype_bank,
+                prototype_bank=prototype_bank, temporal_bank=temporal_bank,
+                target_sample_paths=target_sample_paths, selected_model=selected_model,
             )
-            print('best target-stage validation accuracy %.4f' % best_target_val_acc)
+            print('best target-stage validation accuracy %.4f (%s)' %
+                  (best_target_val_acc, selected_model))
 
-    if args.epochs > 0:
+    # Keep the source checkpoint if adaptation never exceeds its validation
+    # score. Test labels are never used to choose stage, epoch, or model.
+    if args.epochs > 0 and best_target_val_acc > best_source_val_acc:
         checkpoint = torch.load(target_best_path, map_location='cuda')
-        model.load_state_dict(checkpoint['model'])
+        selected_model = checkpoint.get('selected_model', 'student')
+        model.load_state_dict(checkpoint['ema_teacher'] if selected_model == 'ema_teacher'
+                              else checkpoint['model'])
         selected_val_acc = best_target_val_acc
     else:
         checkpoint = torch.load(source_best_path, map_location='cuda')
         model.load_state_dict(checkpoint['model'])
         selected_val_acc = best_source_val_acc
+        selected_model = 'source_student'
 
     teacher_feature_hook.close()
     student_feature_hook.close()
@@ -622,6 +741,7 @@ def run_training():
     if args.epochs > 0:
         print('best target-stage validation accuracy %.4f' % best_target_val_acc)
     print('selected validation accuracy %.4f' % selected_val_acc)
+    print('selected model %s' % selected_model)
     print('final target test accuracy %.4f' % test_acc)
     return test_acc
 

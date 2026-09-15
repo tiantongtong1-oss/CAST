@@ -13,9 +13,20 @@ Ubuntu 16.04 LTS, python 3.8, pytorch 1.8.1
 [FER2013](https://paperswithcode.com/dataset/fer2013)
 
 
-## MobileNetV2 dual-view EMA branch
+## Current experiment: temporal consistency
 
-See [implementation changes and training commands](IMPROVEMENTS.md) and the behavioral tests in `tests/test_cast.py`.
+See [log diagnosis, implementation, run commands and ablations](EXPERIMENT_TEMPORAL_CONSISTENCY.md).
+
+```bash
+bash scripts/run_temporal_consistency.sh
+```
+
+Behavioral tests: `python -m unittest discover -s tests -v`.
+
+## MobileNetV2 dual-view EMA baseline
+
+See [baseline implementation changes and training commands](IMPROVEMENTS.md).
+The architecture figure below describes that baseline; the temporal additions are documented above.
 
 [Code-audited architecture and figure downloads](docs/ARCHITECTURE.md)
 
