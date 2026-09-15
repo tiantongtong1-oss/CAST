@@ -2,8 +2,8 @@ import warnings
 warnings.filterwarnings('ignore')
 
 import argparse
+import math
 import os
-import random
 
 import numpy as np
 import torch
@@ -15,22 +15,11 @@ from dataset import RafDataSet, FER
 from ema_utils import create_ema_teacher, select_dual_view_pseudo_labels, update_ema_teacher
 from prototype_utils import FeatureHook, PrototypeBank, prototype_weight_for_epoch
 from temporal_utils import TemporalPredictionBank, mixed_target_cross_entropy
+from training_utils import (balance_source_losses, file_sha256, make_loader_generators,
+                            path_order_sha256, reset_target_rng, seed_everything,
+                            seed_worker, source_class_weights)
 import image_utils as util
 from randaugment import RandAugmentMC
-
-
-seed = 1314
-np.random.seed(seed)
-torch.manual_seed(seed)
-torch.cuda.manual_seed(seed)
-torch.cuda.manual_seed_all(seed)
-random.seed(seed)
-torch.backends.cudnn.benchmark = False
-torch.backends.cudnn.deterministic = True
-
-
-def _init_fn(worker_id):
-    np.random.seed(seed + worker_id)
 
 
 def parse_args():
@@ -46,6 +35,8 @@ def parse_args():
                         help='mobilenet_v2, resnet18 or resnet50')
     parser.add_argument('--lr', type=float, default=0.001)
     parser.add_argument('--workers', default=10, type=int)
+    parser.add_argument('--seed', default=1314, type=int,
+                        help='reproducible seed; reset independently at target-stage start')
     parser.add_argument('--pre_epochs', type=int, default=30,
                         help='source-domain pre-training epochs')
     parser.add_argument('--epochs', type=int, default=30,
@@ -87,23 +78,38 @@ def parse_args():
     parser.add_argument('--proto_ramp_epochs', type=int, default=5,
                         help='epochs used to linearly ramp prototype loss to full weight')
 
-    parser.add_argument('--disable_temporal', action='store_true',
-                        help='disable temporal filtering and memory for ablation')
+    temporal = parser.add_mutually_exclusive_group()
+    temporal.add_argument('--temporal_mode', choices=['off', 'observe', 'filter'],
+                          default='observe',
+                          help='observe records history without excluding dual-view candidates; '
+                               'filter explicitly enables experimental hard filtering')
+    temporal.add_argument('--disable_temporal', dest='temporal_mode', action='store_const',
+                          const='off', help='compatibility alias for --temporal_mode off')
     parser.add_argument('--temporal_momentum', type=float, default=0.7,
                         help='EMA momentum of each target sample probability history')
     parser.add_argument('--temporal_min_streak', type=int, default=2,
                         help='consecutive dual-view-confident epochs with the same label')
     parser.add_argument('--temporal_warmup_epochs', type=int, default=2,
                         help='collect history while retaining the dual-view mask')
-    parser.add_argument('--target_soft_weight', type=float, default=0.5,
+    parser.add_argument('--target_soft_weight', type=float, default=0.0,
                         help='soft-label fraction of target CE after temporal warmup; '
                              'uses current dual-view probabilities if temporal is disabled')
     parser.add_argument('--eval_ema', action='store_true',
                         help='also validate the EMA teacher and allow it to be selected')
-    parser.add_argument('--run_name', type=str, default='temporal_consistency_v1',
+    parser.add_argument('--source_balance_power', type=float, default=0.0,
+                        help='optional target-stage source CE balancing; 0 preserves baseline')
+    parser.add_argument('--source_balance_max_ratio', type=float, default=2.0,
+                        help='maximum relative class-weight ratio for labeled source CE')
+    parser.add_argument('--run_name', type=str, default='prototype_recovery_v2',
                         help='checkpoint filename tag; use a distinct tag for each ablation')
 
     args = parser.parse_args()
+    if not 0 <= args.seed < 2 ** 32:
+        parser.error('--seed must be in [0, 2**32)')
+    if not math.isfinite(args.source_balance_power) or args.source_balance_power < 0:
+        parser.error('--source_balance_power must be finite and nonnegative')
+    if not math.isfinite(args.source_balance_max_ratio) or args.source_balance_max_ratio < 1:
+        parser.error('--source_balance_max_ratio must be finite and >= 1')
     if not (0.0 <= args.threshold_min <= args.threshold_max <= 1.0):
         parser.error('require 0 <= threshold_min <= threshold_max <= 1')
     if not (0.0 <= args.threshold_base <= args.threshold_max):
@@ -301,6 +307,7 @@ def initialize_source_prototypes(teacher, feature_hook, loader, prototype_bank):
 
 def run_training():
     args = parse_args()
+    seed_everything(args.seed)
     model_path = os.path.join('./models', args.data1 + '_' + args.data2)
     os.makedirs(model_path, exist_ok=True)
 
@@ -316,7 +323,7 @@ def run_training():
     )
 
     print('---------------------------------------------------------------------------------------')
-    print('EMA + Dual View + Stable CAT + Prototype + Temporal Consistency v1: %s with source %s and target %s' %
+    print('CAST Prototype Recovery v2: %s with source %s and target %s' %
           (args.backbone, args.data1, args.data2))
     print('alpha(w1):%s beta(w2):%s gamma(w3):%s ema:%s '
           'tau0:%s threshold_beta:%s margin:%s threshold_range:[%s,%s]' %
@@ -326,10 +333,12 @@ def run_training():
     print('prototype weight:%s temp:%s momentum:%s source_anchor:%s warmup:%s ramp:%s' %
           (args.proto_weight, args.proto_temperature, args.proto_momentum,
            args.proto_source_anchor, args.proto_warmup_epochs, args.proto_ramp_epochs))
-    print('temporal enabled:%s momentum:%s min_streak:%s warmup:%s '
+    print('temporal mode:%s momentum:%s min_streak:%s warmup:%s '
           'target_soft_weight:%s eval_ema:%s run_name:%s' %
-          (not args.disable_temporal, args.temporal_momentum, args.temporal_min_streak,
+          (args.temporal_mode, args.temporal_momentum, args.temporal_min_streak,
            args.temporal_warmup_epochs, args.target_soft_weight, args.eval_ema, args.run_name))
+    print('seed:%s source_balance_power:%s source_balance_max_ratio:%s' %
+          (args.seed, args.source_balance_power, args.source_balance_max_ratio))
     print('---------------------------------------------------------------------------------------')
 
     if args.backbone == 'resnet18':
@@ -375,30 +384,37 @@ def run_training():
     )
 
     class_num = 7
+    generators = make_loader_generators(args.seed)
 
     train_loader_source = torch.utils.data.DataLoader(
         source_train, batch_size=train_batch, num_workers=args.workers,
-        shuffle=True, pin_memory=True, worker_init_fn=_init_fn,
+        shuffle=True, pin_memory=True, worker_init_fn=seed_worker,
+        generator=generators['source'],
     )
     prototype_loader_source = torch.utils.data.DataLoader(
         source_prototype, batch_size=test_batch, num_workers=args.workers,
-        shuffle=False, pin_memory=True, worker_init_fn=_init_fn,
+        shuffle=False, pin_memory=True, worker_init_fn=seed_worker,
+        generator=generators['prototype'],
     )
     train_loader_target = torch.utils.data.DataLoader(
         target_train, batch_size=train_batch, num_workers=args.workers,
-        shuffle=True, pin_memory=True, worker_init_fn=_init_fn,
+        shuffle=True, pin_memory=True, worker_init_fn=seed_worker,
+        generator=generators['target'],
     )
     threshold_loader_target = torch.utils.data.DataLoader(
         target_threshold, batch_size=test_batch, num_workers=args.workers,
-        shuffle=False, pin_memory=True, worker_init_fn=_init_fn,
+        shuffle=False, pin_memory=True, worker_init_fn=seed_worker,
+        generator=generators['threshold'],
     )
     val_loader_target = torch.utils.data.DataLoader(
         target_val, batch_size=test_batch, num_workers=args.workers,
         shuffle=False, pin_memory=True,
+        worker_init_fn=seed_worker, generator=generators['validation'],
     )
     test_loader_target = torch.utils.data.DataLoader(
         target_test, batch_size=test_batch, num_workers=args.workers,
         shuffle=False, pin_memory=True,
+        worker_init_fn=seed_worker, generator=generators['test'],
     )
 
     model = Networks.Model(backbone=args.backbone, num_classes=class_num).cuda()
@@ -409,6 +425,7 @@ def run_training():
     best_source_val_acc = -1.0
     if args.checkpoint:
         print('Loading pretrained weights...', args.checkpoint)
+        print('Input checkpoint SHA256: %s' % file_sha256(args.checkpoint))
         checkpoint = torch.load(args.checkpoint, map_location='cuda')
         model.load_state_dict(checkpoint['model'], strict=True)
         if args.pre_epochs == 0:
@@ -480,6 +497,14 @@ def run_training():
     optimizer.load_state_dict(checkpoint['optimizer'])
     scheduler.load_state_dict(checkpoint['scheduler'])
 
+    # A shared source checkpoint is insufficient for a paired ablation unless
+    # augmentation, batch order and student dropout also start from the same RNG.
+    reset_target_rng(args.seed, generators)
+    print('Target RNG reset to seed %d; source/target/threshold loaders use independent streams' % args.seed)
+    print('Target train path-order SHA256: %s' %
+          path_order_sha256(target_train.file_paths, args.target_path))
+    print('Target initial LR: %.8f' % optimizer.param_groups[0]['lr'])
+
     teacher = create_ema_teacher(model).cuda()
     teacher_feature_hook = FeatureHook(teacher.feature)
     student_feature_hook = FeatureHook(model.feature)
@@ -496,7 +521,14 @@ def run_training():
     print('source prototype counts: %s' %
           np.array2string(prototype_bank.source_counts.cpu().numpy(), separator=', '))
 
-    temporal_bank = None if args.disable_temporal else TemporalPredictionBank(
+    source_weights = source_class_weights(
+        prototype_bank.source_counts, args.source_balance_power,
+        args.source_balance_max_ratio,
+    )
+    print('Target-stage labeled-source class weights: %s' %
+          np.array2string(source_weights.cpu().numpy(), precision=4))
+
+    temporal_bank = None if args.temporal_mode == 'off' else TemporalPredictionBank(
         len(target_train), class_num, momentum=args.temporal_momentum,
         min_streak=args.temporal_min_streak,
     ).cuda()
@@ -537,6 +569,8 @@ def run_training():
         train_loss2 = 0.0
         train_loss3 = 0.0
         train_proto_loss = 0.0
+        source_ce_sum = target_ce_sum = 0.0
+        source_ce_count = target_ce_count = 0
         batch_count = 0
         confident_num = 0
         agreement_num = 0
@@ -573,10 +607,13 @@ def run_training():
                     pseudo_targets[con_idx.bool()].cpu(), minlength=class_num
                 ).numpy()
                 if temporal_bank is not None:
-                    con_idx, soft_targets, batch_stats = temporal_bank.update_and_select(
+                    temporal_mask, soft_targets, batch_stats = temporal_bank.update_and_select(
                         sample_indices, logits1, logits2, pseudo_targets, con_idx,
                         i, warmup_epochs=args.temporal_warmup_epochs,
                     )
+                    # Observation mode never alters the original dual-view mask.
+                    if args.temporal_mode == 'filter':
+                        con_idx = temporal_mask
                     for key, value in batch_stats.items():
                         temporal_stats[key] += value
                 else:
@@ -616,11 +653,19 @@ def run_training():
 
             source_count = source_imgs.shape[0]
             source_ce = criterion(output[0][:source_count], train_targets[:source_count])
+            if args.source_balance_power > 0:
+                source_ce = balance_source_losses(
+                    source_ce, train_targets[:source_count], source_weights
+                )
             target_ce = mixed_target_cross_entropy(
                 output[0][source_count:], pseudo_targets, soft_targets,
                 soft_weight=current_soft_weight,
             )
             per_sample_loss = torch.cat((source_ce, target_ce)) * train_con_idx
+            source_ce_sum += source_ce.detach().sum().item()
+            source_ce_count += source_count
+            target_ce_sum += (target_ce.detach() * con_idx).sum().item()
+            target_ce_count += int(con_idx.sum().item())
             cls_loss = per_sample_loss.sum() / train_con_idx.sum().clamp_min(1.0)
             aff_loss = output[1]
             weight_loss = classifier_modulation_loss(model)
@@ -677,6 +722,12 @@ def run_training():
                    temporal_stats['history_disagrees'], temporal_stats['label_flips'],
                    np.array2string(retention, precision=4),
                    i < args.temporal_warmup_epochs))
+            print('[Target Epoch %d] Temporal_Mode: %s Rejected_By_Class: %s' %
+                  (i, args.temporal_mode,
+                   np.array2string(dual_distribution - pseudo_distribution, separator=', ')))
+        print('[Target Epoch %d] Source CE: %.4f Target CE: %.4f Accepted_Targets: %d' %
+              (i, source_ce_sum / max(source_ce_count, 1),
+               target_ce_sum / max(target_ce_count, 1), target_ce_count))
         print('[Target Epoch %d] Prototype_Agreement: %d/%d (%.4f) '
               'Mean_Assigned_Cosine: %.4f Target_Prototype_Counts: %s' %
               (i, prototype_agree_num, prototype_checked_num,

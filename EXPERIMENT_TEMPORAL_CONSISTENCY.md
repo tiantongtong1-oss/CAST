@@ -1,5 +1,10 @@
 # Temporal Consistency v1：日志诊断与本地实验
 
+> 历史实验说明（`6177e63`）。新日志显示该组合未超过之前的原型实验，
+> 当前默认设置和推荐命令已更新，见 [Prototype Recovery v2](RECOVERY_V2.md)。
+> 本文下列旧命令和默认值请按历史记录阅读；如今只有显式
+> `--temporal_mode filter` 才开启硬筛选，soft weight 默认也已改为 0。
+
 目标分支：`experiment/temporal-consistency-v1`。本次修改基于
 `3b4c5d6825cca022564c77bcfaf3f65757f507b6`；该提交虽然处于 temporal 分支，
 实际仍是 Prototype Consistency v1，没有按样本保存跨 epoch 预测。

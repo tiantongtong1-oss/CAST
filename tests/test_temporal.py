@@ -161,7 +161,7 @@ class TrainingIntegrationTests(unittest.TestCase):
     """
 
     def run_case(self, source_score, student_score, ema_score, extra_args=(),
-                 checkpoint=False, eval_ema=True):
+                 checkpoint=False, eval_ema=True, source_state=None, return_source=False):
         import train
 
         class TinyModel(train.Networks.Model):
@@ -195,6 +195,7 @@ class TrainingIntegrationTests(unittest.TestCase):
                 return image, (999 if self.phase == 'train' else label)
 
         test_states = []
+        student_trace = []
         original_load = torch.load
 
         def cpu_load(path, **kwargs):
@@ -207,6 +208,7 @@ class TrainingIntegrationTests(unittest.TestCase):
             if split == 'Validation EMA':
                 return ema_score
             if split == 'Validation Student':
+                student_trace.append({key: value.clone() for key, value in model.state_dict().items()})
                 return student_score
             return source_score
 
@@ -221,11 +223,15 @@ class TrainingIntegrationTests(unittest.TestCase):
                 if eval_ema:
                     args += ['--eval_ema']
                 if checkpoint:
-                    model = TinyModel()
-                    optimizer = torch.optim.Adam(model.parameters(), lr=0.0004, weight_decay=1e-4)
-                    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
-                    torch.save({'model': model.state_dict(), 'optimizer': optimizer.state_dict(),
-                                'scheduler': scheduler.state_dict()}, 'source.pth')
+                    if source_state is None:
+                        model = TinyModel()
+                        optimizer = torch.optim.Adam(model.parameters(), lr=0.0004, weight_decay=1e-4)
+                        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
+                        checkpoint_state = {'model': model.state_dict(), 'optimizer': optimizer.state_dict(),
+                                            'scheduler': scheduler.state_dict()}
+                    else:
+                        checkpoint_state = source_state
+                    torch.save(checkpoint_state, 'source.pth')
                     args += ['--pre_epochs', '0', '--checkpoint', 'source.pth']
                 with patch('sys.argv', args), \
                      patch.object(train.Networks, 'Model', TinyModel), \
@@ -237,7 +243,7 @@ class TrainingIntegrationTests(unittest.TestCase):
                      patch.object(train, 'evaluate', side_effect=score), \
                      redirect_stdout(io.StringIO()):
                     self.assertEqual(train.run_training(), 0.42)
-                base = Path('models/rafdb_fer/mobilenet_v2_rafdb_fer_temporal_consistency_v1')
+                base = Path('models/rafdb_fer/mobilenet_v2_rafdb_fer_prototype_recovery_v2')
                 source = cpu_load(str(base) + '_source_best.pth')
                 target = cpu_load(str(base) + '_target_best.pth')
                 self.assertEqual(len(test_states), 1)
@@ -250,8 +256,9 @@ class TrainingIntegrationTests(unittest.TestCase):
                     self.assertEqual(len(target['target_sample_paths']), 14)
                 else:
                     self.assertNotIn('temporal_bank', target)
-                if checkpoint:
+                if checkpoint and source_state is None:
                     self.assertEqual(source['optimizer']['param_groups'][0]['lr'], 0.0004)
+                return (student_trace, source) if return_source else student_trace
             finally:
                 os.chdir(original_cwd)
 
@@ -267,6 +274,28 @@ class TrainingIntegrationTests(unittest.TestCase):
     def test_baseline_ablation_without_temporal_or_soft_loss(self):
         self.run_case(0.2, 0.4, 0.3, extra_args=['--disable_temporal', '--target_soft_weight', '0'],
                       eval_ema=False)
+
+    def test_observation_mode_does_not_change_training(self):
+        observed = self.run_case(0.2, 0.4, 0.3)
+        disabled = self.run_case(0.2, 0.4, 0.3, extra_args=['--disable_temporal'])
+        self.assertEqual(len(observed), 3)
+        for observed_epoch, disabled_epoch in zip(observed, disabled):
+            for key in observed_epoch:
+                self.assertTrue(torch.equal(observed_epoch[key], disabled_epoch[key]), key)
+
+    def test_filter_and_soft_loss_remain_explicitly_available(self):
+        self.run_case(0.2, 0.4, 0.3, extra_args=['--temporal_mode', 'filter',
+                                              '--target_soft_weight', '0.5'])
+
+    def test_optional_labeled_source_balancing_runs(self):
+        self.run_case(0.2, 0.4, 0.3, extra_args=['--source_balance_power', '0.5'])
+
+    def test_reusing_source_checkpoint_matches_full_source_then_target(self):
+        full_trace, source = self.run_case(0.2, 0.4, 0.3, return_source=True)
+        reused_trace = self.run_case(0.2, 0.4, 0.3, checkpoint=True, source_state=source)
+        for full_epoch, reused_epoch in zip(full_trace, reused_trace):
+            for key in full_epoch:
+                self.assertTrue(torch.equal(full_epoch[key], reused_epoch[key]), key)
 
     def test_evaluation_loss_weights_samples_and_reports_recalls(self):
         import train

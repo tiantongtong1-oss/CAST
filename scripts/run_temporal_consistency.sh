@@ -3,14 +3,16 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 mkdir -p logs
-run_tag="temporal_consistency_v1_$(date -u +%Y%m%d_%H%M%S)"
+run_tag="prototype_recovery_v2_$(date -u +%Y%m%d_%H%M%S)"
 
-# Defaults match the supplied MobileNetV2 prototype experiment. Extra CLI
-# arguments can override defaults, including source/target paths and run_name.
+# Recovery defaults: observe temporal history without filtering, hard target
+# CE, unchanged prototype objective. --temporal_mode filter is now opt-in.
+# Extra CLI arguments override defaults, including paths, seed and run_name.
 python train.py \
   --backbone mobilenet_v2 \
   --pre_epochs 30 \
   --epochs 30 \
+  --seed 1314 \
   --lr 0.001 \
   --w1 4 --w2 0.3 --w3 0.1 \
   --ema_decay 0.999 \
@@ -19,7 +21,7 @@ python train.py \
   --proto_weight 0.10 --proto_temperature 0.20 --proto_momentum 0.99 \
   --proto_source_anchor 0.50 --proto_warmup_epochs 3 --proto_ramp_epochs 5 \
   --temporal_momentum 0.7 --temporal_min_streak 2 --temporal_warmup_epochs 2 \
-  --target_soft_weight 0.5 \
+  --target_soft_weight 0 \
   --eval_ema \
   --run_name "$run_tag" \
   "$@" \

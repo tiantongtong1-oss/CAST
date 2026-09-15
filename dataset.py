@@ -28,10 +28,11 @@ class RafDataSet(data.Dataset):
         file_names = dataset.iloc[:, NAME_COLUMN].values
         self.label = dataset.iloc[:, LABEL_COLUMN].values - 1
 
-        seed = np.random.seed(2000)
-        np.random.shuffle(file_names)
-        seed = np.random.seed(2000)
-        np.random.shuffle(self.label)
+        # One local permutation keeps image/label pairs together and does not
+        # reset the caller's augmentation RNG during dataset construction.
+        order = np.random.RandomState(2000).permutation(len(file_names))
+        file_names = file_names[order]
+        self.label = self.label[order]
 
         self.file_paths = []
         for f in file_names:
@@ -131,8 +132,7 @@ class FER(data.Dataset):
             )
 
         if phase == 'train':
-            np.random.seed(2000)
-            np.random.shuffle(files)
+            np.random.RandomState(2000).shuffle(files)
 
         for file in files:
             self.file_paths.append(file)

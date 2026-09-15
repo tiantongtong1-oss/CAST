@@ -13,15 +13,20 @@ Ubuntu 16.04 LTS, python 3.8, pytorch 1.8.1
 [FER2013](https://paperswithcode.com/dataset/fer2013)
 
 
-## Current experiment: temporal consistency
+## Current experiment: prototype recovery v2
 
-See [log diagnosis, implementation, run commands and ablations](EXPERIMENT_TEMPORAL_CONSISTENCY.md).
+See [new log diagnosis, recovery defaults and source balancing ablation](RECOVERY_V2.md).
+Temporal filtering and soft supervision are now opt-in; defaults preserve dual-view prototype supervision.
 
 ```bash
-bash scripts/run_temporal_consistency.sh
+bash scripts/run_recovery.sh
 ```
 
 Behavioral tests: `python -m unittest discover -s tests -v`.
+
+The recovery script reuses the previous prototype experiment's source checkpoint.
+For a fresh 30+30 epoch run, use `bash scripts/run_temporal_consistency.sh`.
+See [historical temporal v1 implementation](EXPERIMENT_TEMPORAL_CONSISTENCY.md) for the earlier experiment.
 
 ## MobileNetV2 dual-view EMA baseline
 
