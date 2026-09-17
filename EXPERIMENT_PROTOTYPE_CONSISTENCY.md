@@ -1,34 +1,121 @@
-# Experiment: Prototype Consistency v2 + Source Class-Distribution Energy Gate
+# Experiment: Prototype Consistency v3 + Confidence/Energy OR Rescue
 
-Base experiment: `experiment/prototype-consistency-v1`
+Base experiment: `experiment/prototype-consistency-v2`
 
-Experiment branch: `experiment/prototype-consistency-v2`
+Experiment branch: `experiment/prototype-consistency-v3`
 
-This version keeps the v1 EMA teacher, dual-view confidence filtering, class-adaptive thresholds, and source-anchored prototype consistency loss. It adds a second pseudo-label validation stage in representation space: a source class-distribution energy gate.
+This version keeps the v2 EMA teacher, dual-view prediction agreement, class-adaptive confidence thresholds, source-anchored prototype consistency loss, and source class-distribution energy model. The key change is how confidence and energy are combined.
 
-## Motivation
+## Core change
 
-A target sample can pass the two-view confidence rule while still being geometrically atypical for its predicted source class. A single class prototype only describes the class center and does not capture anisotropic class spread or whether the sample lies in a locally supported region of the source distribution.
+v2 uses energy as a veto after confidence filtering:
 
-v2 therefore models each source class with:
+```text
+m_final = m_conf AND m_energy
+```
 
-- a class mean / prototype `p_c`;
-- a shrinkage covariance `Sigma_c`;
-- a Mahalanobis global deviation `D_c(z)`;
-- a source-supported local density `L_c(z)`;
-- a class-specific energy threshold calibrated only from labeled source features.
+v3 uses energy as a rescue signal for samples whose two weak views agree on the same class:
 
-The energy gate is applied after the existing dual-view confidence rule. It does not use FER2013 training labels.
+```text
+m_agree = pred(view1) == pred(view2)
+
+m_conf = m_agree
+         AND confidence(view1) >= class threshold
+         AND confidence(view2) >= class threshold
+
+m_energy = m_agree
+           AND source class distribution is initialized
+           AND log E_pseudo(z) <= tau_energy,pseudo
+
+m_rescue = m_agree AND m_energy AND NOT m_conf
+m_final  = m_conf OR m_rescue
+```
+
+Equivalently:
+
+```text
+m_final = m_agree AND (m_high_confidence OR m_strong_energy_support)
+```
+
+The two weak views must still predict the same class. Energy does not rescue samples whose weak views disagree.
+
+## Why the energy candidate set changed
+
+In v2, the energy bank is evaluated only on samples that already pass the confidence filter. That is correct for a veto gate, but it cannot implement a real OR rule because `m_energy` is then a subset of `m_conf`.
+
+v3 therefore evaluates energy on every sample satisfying `m_agree`. This allows an agreed target sample that misses the confidence threshold to be accepted when its representation is strongly supported by the predicted source class distribution.
+
+## Stronger energy threshold for rescue
+
+The energy threshold has a different role in v3. In v2, `energy_quantile=0.95` is a relatively permissive veto threshold: it mainly removes extreme geometric outliers.
+
+In v3, energy alone may rescue a low-confidence pseudo label, so the default is deliberately stricter:
+
+```text
+energy_quantile = 0.75
+```
+
+For each class `c`, the threshold is still calibrated from source leave-one-out energies:
+
+```text
+tau_energy,c = quantile(log E_c(source), energy_quantile)
+```
+
+A lower quantile means a target sample must lie in a more strongly source-supported region before energy can rescue it.
+
+## Safety for missing source distributions
+
+`ClassDistributionBank.gate()` intentionally fails open when a class has no valid source distribution. That behavior is useful in v2 because it prevents a missing distribution from deleting all pseudo labels of that class.
+
+For v3 rescue this would be unsafe: an uninitialized class must not rescue a low-confidence sample. Therefore v3 explicitly requires:
+
+```text
+source_initialized[pseudo_class] == True
+```
+
+before `m_energy` can contribute to rescue.
+
+## Warmup
+
+Default:
+
+```text
+energy_warmup_epochs = 1
+```
+
+During warmup, energy is computed and logged but cannot rescue samples:
+
+```text
+epoch < energy_warmup_epochs:
+    m_final = m_conf
+```
+
+After warmup:
+
+```text
+m_final = m_conf OR m_rescue
+```
+
+## Downstream use
+
+As in v2, the final mask is reused by the existing training pipeline. A rescued pseudo label therefore participates in:
+
+- target classification loss;
+- CAST target affinity alignment;
+- prototype consistency loss;
+- target EMA prototype updates.
+
+No additional energy gradient loss is introduced.
 
 ## Distribution energy
 
-For class `c` and normalized representation `z`:
+The source class-distribution model is unchanged from v2. For normalized feature `z` and source class `c`:
 
 ```text
 D_c(z) = (z - p_c)^T Sigma_c^{-1} (z - p_c)
 ```
 
-Local support is estimated from source representatives of class `c`:
+Local source support is estimated with a Gaussian kernel in the same Mahalanobis geometry:
 
 ```text
 L_c(z) = (1 / M_c) * sum_j exp(
@@ -36,100 +123,25 @@ L_c(z) = (1 / M_c) * sum_j exp(
 )
 ```
 
-The conceptual energy is:
-
-```text
-E_c(z) = D_c(z) / (L_c(z) + eps)
-```
-
-The implementation compares `log E_c(z)` instead of `E_c(z)` directly:
+The implementation compares:
 
 ```text
 log E_c(z) = log(D_c(z) + eps) - log L_c(z)
 ```
 
-This is monotonic with the original energy and avoids kernel underflow in the 512-D feature space. The density calculation uses `logsumexp`.
-
-## Covariance stabilization
-
-The source covariance is regularized before inversion:
-
-```text
-Sigma_reg = (1 - s) * Sigma
-            + s * mean_variance * I
-            + eps * I
-```
-
-The precision matrix is then obtained from a symmetric eigendecomposition rather than a direct matrix inverse. Default shrinkage is `s = 0.05`.
-
-## Class-specific energy threshold
-
-For each class, v2 computes leave-one-out source energies on the density representatives and sets:
-
-```text
-tau_energy,c = quantile(log E_c(source), energy_quantile)
-```
-
-Default:
-
-```text
-energy_quantile = 0.95
-```
-
-A target pseudo label `c` passes the distribution gate only when:
-
-```text
-log E_c(z_target) <= tau_energy,c
-```
-
-Classes without a valid source distribution fail open instead of deleting the entire pseudo class.
-
-## Final pseudo-label mask
-
-The existing confidence mask remains:
-
-```text
-m_conf = weak-view agreement
-         AND confidence(view1) >= class threshold
-         AND confidence(view2) >= class threshold
-```
-
-After the energy warmup:
-
-```text
-m_energy = log E_pseudo(z) <= tau_energy,pseudo
-m_final  = m_conf AND m_energy
-```
-
-`m_final` is then reused by the existing training pipeline for target classification loss, CAST target affinity alignment, prototype consistency loss, and target EMA prototype updates.
-
-The energy term is deliberately a gate, not an additional gradient loss, so v2 isolates pseudo-label reliability from representation regularization.
+rather than computing the ratio directly.
 
 ## Dynamic source-distribution rebuild
 
-The fixed source prototype used by Prototype Consistency v1 is unchanged. The distribution bank is different: by default it is rebuilt at the beginning of every target epoch using deterministic RAF-DB views and the current EMA teacher.
-
-This avoids comparing late-stage target features against covariance and density statistics measured in an obsolete early-stage teacher feature space.
-
-Use `--energy_refresh_interval N` to rebuild less frequently if the extra source pass is too expensive.
-
-## Density memory
-
-Mean and covariance use all source features collected for each class. Local density uses at most `energy_max_density_samples` deterministic representatives per class to keep target-batch gating practical.
+The source distribution bank is rebuilt using deterministic RAF-DB views and the current EMA teacher every `energy_refresh_interval` target epochs.
 
 Default:
 
 ```text
-energy_max_density_samples = 256
+energy_refresh_interval = 1
 ```
 
-`energy_bandwidth` is dimension-normalized internally; the effective Gaussian bandwidth is:
-
-```text
-h_effective = energy_bandwidth * sqrt(feature_dim)
-```
-
-With the current 512-D feature heads, the default multiplier is `1.0`.
+The fixed source prototype used by the prototype-consistency term remains unchanged.
 
 ## Defaults
 
@@ -143,7 +155,7 @@ proto_ramp_epochs           = 5
 
 energy_gate                 = enabled
 energy_bandwidth            = 1.0
-energy_quantile             = 0.95
+energy_quantile             = 0.75
 energy_cov_shrinkage        = 0.05
 energy_max_density_samples  = 256
 energy_warmup_epochs        = 1
@@ -152,21 +164,23 @@ energy_refresh_interval     = 1
 
 ## Diagnostics
 
-Each target epoch logs the existing prototype diagnostics plus:
+Each target epoch reports:
 
 ```text
-Energy source counts
-Class log-energy thresholds
-Energy gate enforced
+Agreement_Num
 Confidence_Accept_Num
 Energy_Pass_Num
+Energy_Rescue_Num
 Final_Accept_Num
-Mean_Assigned_LogEnergy
-Pseudo_Distribution_Before_Energy
-Pseudo_Distribution_After_Energy
+Mean_Agreed_LogEnergy
+Pseudo_Distribution_Confidence
+Pseudo_Distribution_Rescued
+Pseudo_Distribution_Final
 ```
 
-The before/after class histograms are important. If one minority class is almost eliminated by the energy gate, first relax `--energy_quantile` or increase `--energy_warmup_epochs` rather than adding more losses.
+`Energy_Rescue_Num` is the key v3 metric. It counts pseudo labels that would have been rejected by the strict confidence rule but were recovered by source-distribution support.
+
+The per-class rescued distribution should be monitored carefully. If one class contributes a disproportionate number of rescued labels, reduce `energy_quantile` before changing other losses.
 
 ## Run
 
@@ -193,12 +207,12 @@ python train.py \
   --proto_ramp_epochs 5 \
   --energy_gate \
   --energy_bandwidth 1.0 \
-  --energy_quantile 0.95 \
+  --energy_quantile 0.75 \
   --energy_cov_shrinkage 0.05 \
   --energy_max_density_samples 256 \
   --energy_warmup_epochs 1 \
   --energy_refresh_interval 1 \
-  2>&1 | tee logs/cast_prototype_consistency_v2_energy_mobilenet_v2.log
+  2>&1 | tee logs/cast_prototype_consistency_v3_or_mobilenet_v2.log
 ```
 
 ## Suggested ablations
@@ -206,10 +220,11 @@ python train.py \
 Keep all other settings fixed and compare:
 
 ```text
-A. v1: prototype consistency only
-B. v2 with --no_energy_gate
-C. v2 energy gate, quantile 0.95
-D. v2 energy gate, quantile 0.97
+A. v2: confidence AND energy, quantile 0.95
+B. v3 with --no_energy_gate (strict confidence only)
+C. v3 OR rescue, quantile 0.75
+D. v3 OR rescue, quantile 0.60
+E. v3 OR rescue, quantile 0.85
 ```
 
-If the gate rejects too many otherwise confident samples, first try a higher source energy quantile such as `0.97`; if it rejects almost nothing, try `0.90` or `0.925`. Do not tune against the final test set.
+Do not tune against the final test set. Use validation accuracy together with `Energy_Rescue_Num` and the per-class rescued distribution to judge whether the rescue condition is too strict or too permissive.
