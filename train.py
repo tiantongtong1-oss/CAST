@@ -14,6 +14,7 @@ import Networks
 from dataset import RafDataSet, FER
 from ema_utils import create_ema_teacher, select_dual_view_pseudo_labels, update_ema_teacher
 from prototype_utils import FeatureHook, PrototypeBank, prototype_weight_for_epoch
+from energy_utils import ClassDistributionBank
 import image_utils as util
 from randaugment import RandAugmentMC
 
@@ -71,8 +72,7 @@ def parse_args():
     parser.add_argument('--threshold_max', type=float, default=0.95,
                         help='maximum class-adaptive threshold')
 
-    # Prototype-consistency v1. The defaults intentionally keep this
-    # regularizer weaker than the main CAST classification objective.
+    # Prototype-consistency regularizer retained from v1.
     parser.add_argument('--proto_weight', type=float, default=0.10,
                         help='maximum prototype-consistency loss weight')
     parser.add_argument('--proto_temperature', type=float, default=0.20,
@@ -85,6 +85,25 @@ def parse_args():
                         help='epochs that only update prototype memory, without its loss')
     parser.add_argument('--proto_ramp_epochs', type=int, default=5,
                         help='epochs used to linearly ramp prototype loss to full weight')
+
+    # Prototype-consistency v2: source class-distribution energy gate.
+    parser.set_defaults(energy_gate=True)
+    parser.add_argument('--energy_gate', dest='energy_gate', action='store_true',
+                        help='enable source class-distribution pseudo-label gating (default)')
+    parser.add_argument('--no_energy_gate', dest='energy_gate', action='store_false',
+                        help='disable the class-distribution energy gate')
+    parser.add_argument('--energy_bandwidth', type=float, default=1.0,
+                        help='dimension-normalized KDE bandwidth multiplier')
+    parser.add_argument('--energy_quantile', type=float, default=0.95,
+                        help='source leave-one-out log-energy quantile used per class')
+    parser.add_argument('--energy_cov_shrinkage', type=float, default=0.05,
+                        help='shrinkage strength for each source class covariance')
+    parser.add_argument('--energy_max_density_samples', type=int, default=256,
+                        help='maximum source representatives per class for local density')
+    parser.add_argument('--energy_warmup_epochs', type=int, default=1,
+                        help='target epochs that log energy but do not enforce its gate')
+    parser.add_argument('--energy_refresh_interval', type=int, default=1,
+                        help='rebuild source distributions every N target epochs')
 
     args = parser.parse_args()
     if not (0.0 <= args.threshold_min <= args.threshold_max <= 1.0):
@@ -107,6 +126,18 @@ def parse_args():
         parser.error('--proto_source_anchor must be in [0, 1]')
     if args.proto_warmup_epochs < 0 or args.proto_ramp_epochs < 0:
         parser.error('prototype warmup/ramp epochs must be nonnegative')
+    if args.energy_bandwidth <= 0.0:
+        parser.error('--energy_bandwidth must be positive')
+    if not (0.0 < args.energy_quantile < 1.0):
+        parser.error('--energy_quantile must be in (0, 1)')
+    if not (0.0 <= args.energy_cov_shrinkage <= 1.0):
+        parser.error('--energy_cov_shrinkage must be in [0, 1]')
+    if args.energy_max_density_samples < 2:
+        parser.error('--energy_max_density_samples must be at least 2')
+    if args.energy_warmup_epochs < 0:
+        parser.error('--energy_warmup_epochs must be nonnegative')
+    if args.energy_refresh_interval < 1:
+        parser.error('--energy_refresh_interval must be at least 1')
     return args
 
 
@@ -248,7 +279,7 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch, best_val_acc, args
 
 
 def initialize_source_prototypes(teacher, feature_hook, loader, prototype_bank):
-    """Build deterministic source semantic anchors from labeled RAF-DB."""
+    """Build fixed source semantic anchors from deterministic RAF-DB views."""
     teacher.eval()
     with torch.no_grad():
         for imgs, targets in loader:
@@ -259,6 +290,19 @@ def initialize_source_prototypes(teacher, feature_hook, loader, prototype_bank):
     prototype_bank.finalize_source()
 
 
+def rebuild_source_distribution(teacher, feature_hook, loader, distribution_bank):
+    """Re-estimate source class geometry in the current EMA-teacher space."""
+    distribution_bank.reset_source()
+    teacher.eval()
+    with torch.no_grad():
+        for imgs, targets in loader:
+            imgs = imgs.cuda(non_blocking=True)
+            targets = targets.cuda(non_blocking=True)
+            teacher(imgs, None, None, mode='test', task='source')
+            distribution_bank.accumulate_source(feature_hook.output, targets)
+    distribution_bank.finalize_source()
+
+
 def run_training():
     args = parse_args()
     model_path = os.path.join('./models', args.data1 + '_' + args.data2)
@@ -267,16 +311,17 @@ def run_training():
     source_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_prototype_consistency_v1_source_best.pth'
+        + '_prototype_consistency_v2_source_best.pth'
     )
     target_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_prototype_consistency_v1_target_best.pth'
+        + '_prototype_consistency_v2_target_best.pth'
     )
 
     print('---------------------------------------------------------------------------------------')
-    print('EMA + Dual View + Stable CAT + Prototype Consistency v1: %s with source %s and target %s' %
+    print('EMA + Dual View + Stable CAT + Prototype Consistency v2 + Class Energy Gate: '
+          '%s with source %s and target %s' %
           (args.backbone, args.data1, args.data2))
     print('alpha(w1):%s beta(w2):%s gamma(w3):%s ema:%s '
           'tau0:%s threshold_beta:%s margin:%s threshold_range:[%s,%s]' %
@@ -286,6 +331,11 @@ def run_training():
     print('prototype weight:%s temp:%s momentum:%s source_anchor:%s warmup:%s ramp:%s' %
           (args.proto_weight, args.proto_temperature, args.proto_momentum,
            args.proto_source_anchor, args.proto_warmup_epochs, args.proto_ramp_epochs))
+    print('energy gate:%s bandwidth:%s quantile:%s covariance_shrinkage:%s '
+          'density_samples:%s warmup:%s refresh_interval:%s' %
+          (args.energy_gate, args.energy_bandwidth, args.energy_quantile,
+           args.energy_cov_shrinkage, args.energy_max_density_samples,
+           args.energy_warmup_epochs, args.energy_refresh_interval))
     print('---------------------------------------------------------------------------------------')
 
     if args.backbone == 'resnet18':
@@ -306,7 +356,6 @@ def run_training():
         args.source_path, phase='train', transform=weak_transform,
         strong_transform=None, basic_aug=False
     )
-    # Deterministic source view for semantic prototype initialization.
     source_prototype = RafDataSet(
         args.source_path, phase='train', transform=test_transform,
         strong_transform=None, basic_aug=False
@@ -438,10 +487,36 @@ def run_training():
     print('source prototype counts: %s' %
           np.array2string(prototype_bank.source_counts.cpu().numpy(), separator=', '))
 
+    distribution_bank = ClassDistributionBank(
+        class_num,
+        model.fc.in_features,
+        bandwidth=args.energy_bandwidth,
+        covariance_shrinkage=args.energy_cov_shrinkage,
+        energy_quantile=args.energy_quantile,
+        max_density_samples=args.energy_max_density_samples,
+    ).cuda()
+
     best_target_val_acc = -1.0
     global_step = 0
 
     for i in range(args.epochs):
+        if args.energy_gate and i % args.energy_refresh_interval == 0:
+            rebuild_source_distribution(
+                teacher,
+                teacher_feature_hook,
+                prototype_loader_source,
+                distribution_bank,
+            )
+            print('[Target Epoch %d] Energy source counts: %s' %
+                  (i, np.array2string(
+                      distribution_bank.source_counts.cpu().numpy(), separator=', '
+                  )))
+            print('[Target Epoch %d] Class log-energy thresholds: %s' %
+                  (i, np.array2string(
+                      distribution_bank.log_energy_thresholds.cpu().numpy(),
+                      precision=4,
+                  )))
+
         thresholds, class_mean, global_mean, threshold_center = calculate_target_thresholds(
             teacher,
             threshold_loader_target,
@@ -455,6 +530,7 @@ def run_training():
         current_proto_weight = prototype_weight_for_epoch(
             i, args.proto_weight, args.proto_warmup_epochs, args.proto_ramp_epochs
         )
+        enforce_energy_gate = args.energy_gate and i >= args.energy_warmup_epochs
 
         print('[Target Epoch %d] class mean confidence: %s global_mean: %.4f '
               'threshold_center: %.4f' %
@@ -462,6 +538,8 @@ def run_training():
                global_mean, threshold_center))
         print('[Target Epoch %d] class-adaptive thresholds: %s' %
               (i, np.array2string(thresholds.numpy(), precision=4)))
+        print('[Target Epoch %d] Energy gate enforced: %s' %
+              (i, enforce_energy_gate))
 
         model.train()
         source_train_iter = iter(train_loader_source)
@@ -470,12 +548,17 @@ def run_training():
         train_loss3 = 0.0
         train_proto_loss = 0.0
         batch_count = 0
-        confident_num = 0
         agreement_num = 0
+        confidence_accept_num = 0
+        energy_pass_num = 0
+        final_accept_num = 0
+        energy_sum = 0.0
+        energy_count = 0
         prototype_agree_num = 0
         prototype_checked_num = 0
         prototype_similarity_sum = 0.0
-        pseudo_distribution = np.zeros(class_num, dtype=np.int64)
+        pseudo_distribution_before = np.zeros(class_num, dtype=np.int64)
+        pseudo_distribution_after = np.zeros(class_num, dtype=np.int64)
 
         for weak1, weak2, strong, _ in train_loader_target:
             try:
@@ -494,7 +577,7 @@ def run_training():
                 teacher_features1 = teacher_feature_hook.output.detach()
                 logits2, _ = teacher(weak2, None, None, 'test', 'target')
                 teacher_features2 = teacher_feature_hook.output.detach()
-                pseudo_targets, con_idx, agree_count = select_dual_view_pseudo_labels(
+                pseudo_targets, confidence_idx, agree_count = select_dual_view_pseudo_labels(
                     logits1, logits2, thresholds
                 )
                 teacher_mean_features = F.normalize(
@@ -502,6 +585,26 @@ def run_training():
                     + F.normalize(teacher_features2, dim=1),
                     dim=1,
                 )
+
+                confidence_mask = confidence_idx.bool()
+                if args.energy_gate:
+                    log_energy, energy_mask = distribution_bank.gate(
+                        teacher_mean_features,
+                        pseudo_targets,
+                        confidence_mask,
+                    )
+                else:
+                    log_energy = teacher_mean_features.new_full(
+                        (teacher_mean_features.size(0),), float('nan')
+                    )
+                    energy_mask = confidence_mask.clone()
+
+                if enforce_energy_gate:
+                    final_mask = confidence_mask & energy_mask
+                else:
+                    final_mask = confidence_mask
+                con_idx = final_mask.float()
+
                 proto_agree, proto_checked, proto_similarity = (
                     prototype_bank.agreement_stats(
                         teacher_mean_features, pseudo_targets, con_idx
@@ -509,13 +612,29 @@ def run_training():
                 )
 
             agreement_num += agree_count
-            confident_num += int(con_idx.sum().item())
+            confidence_accept_num += int(confidence_mask.sum().item())
+            energy_pass_num += int((confidence_mask & energy_mask).sum().item())
+            final_accept_num += int(final_mask.sum().item())
+
+            finite_energy = confidence_mask & torch.isfinite(log_energy)
+            if finite_energy.any():
+                energy_sum += float(log_energy[finite_energy].sum().item())
+                energy_count += int(finite_energy.sum().item())
+
             prototype_agree_num += proto_agree
             prototype_checked_num += proto_checked
             prototype_similarity_sum += proto_similarity * proto_checked
-            reliable = pseudo_targets[con_idx.bool()].cpu().numpy()
-            for c in range(class_num):
-                pseudo_distribution[c] += int(np.sum(reliable == c))
+
+            before_labels = pseudo_targets[confidence_mask].cpu().numpy()
+            after_labels = pseudo_targets[final_mask].cpu().numpy()
+            if before_labels.size > 0:
+                pseudo_distribution_before += np.bincount(
+                    before_labels, minlength=class_num
+                ).astype(np.int64)
+            if after_labels.size > 0:
+                pseudo_distribution_after += np.bincount(
+                    after_labels, minlength=class_num
+                ).astype(np.int64)
 
             model.train()
             source_con_idx = torch.ones(source_imgs.shape[0])
@@ -572,10 +691,16 @@ def run_training():
             prototype_similarity_sum / float(prototype_checked_num)
             if prototype_checked_num > 0 else 0.0
         )
-        print('[Target Epoch %d] Agreement_Num: %d Confident_Num: %d '
-              'Pseudo_Distribution: %s' %
-              (i, agreement_num, confident_num,
-               np.array2string(pseudo_distribution, separator=', ')))
+        mean_log_energy = energy_sum / float(energy_count) if energy_count > 0 else 0.0
+
+        print('[Target Epoch %d] Agreement_Num: %d Confidence_Accept_Num: %d '
+              'Energy_Pass_Num: %d Final_Accept_Num: %d Mean_Assigned_LogEnergy: %.4f' %
+              (i, agreement_num, confidence_accept_num, energy_pass_num,
+               final_accept_num, mean_log_energy))
+        print('[Target Epoch %d] Pseudo_Distribution_Before_Energy: %s' %
+              (i, np.array2string(pseudo_distribution_before, separator=', ')))
+        print('[Target Epoch %d] Pseudo_Distribution_After_Energy: %s' %
+              (i, np.array2string(pseudo_distribution_after, separator=', ')))
         print('[Target Epoch %d] Prototype_Agreement: %d/%d (%.4f) '
               'Mean_Assigned_Cosine: %.4f Target_Prototype_Counts: %s' %
               (i, prototype_agree_num, prototype_checked_num,
