@@ -1,0 +1,13 @@
+---------------------------------------------------------------------------------------
+Training resnet18 with source data rafdb and target data fer
+alpha(w1):4.0 beta(w2):0.3 gamma(w3):0.1 phi:1.4
+---------------------------------------------------------------------------------------
+The dataset distribute: 1290, 281, 717, 4772, 1982, 705, 2524
+FER train split (train), samples: 28709
+The dataset distribute: 3171, 4097, 436, 7215, 4830, 3995, 4965
+FER train split (train), samples: 28709
+The dataset distribute: 3171, 4097, 436, 7215, 4830, 3995, 4965
+FER val split (val), samples: 3589
+The dataset distribute: 415, 496, 56, 895, 653, 467, 607
+FER test split (test), samples: 3589
+The dataset distribute: 416, 528, 55, 879, 594, 491, 626

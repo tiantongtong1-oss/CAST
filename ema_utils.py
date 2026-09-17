@@ -8,19 +8,19 @@ def create_ema_teacher(student):
     teacher = copy.deepcopy(student)
     teacher.eval()
     for parameter in teacher.parameters():
+        #关闭教师梯度，不经过反向传播
         parameter.requires_grad_(False)
     return teacher
 
 
 @torch.no_grad()
 def update_ema_teacher(teacher, student, decay=0.999, global_step=None):
-    """Update teacher parameters and floating buffers with a fixed EMA decay.
+    """使用固定的 EMA 衰减率更新 teacher 的参数和浮点型 buffer
 
-    The teacher is initialized from the student, so an early-step decay warmup is
-    unnecessary and makes the teacher follow noisy target updates too quickly.
-    Floating-point buffers (notably BatchNorm running_mean/running_var) receive
-    the same EMA update. Integer counters such as num_batches_tracked are copied.
-    ``global_step`` is retained only for call-site compatibility.
+    由于 teacher 是由 student 初始化得到的，因此在训练早期没有必要对衰减率进行 warmup；这样做反而会使 teacher 过快地跟随带有较大噪声的 target 更新，。
+    浮点型 buffer（尤其是 BatchNorm 中的 running_mean 和 running_var）同样采用 EMA 方式更新。对于整数类型的计数器，例如 num_batches_tracked，则直接复制。
+    保留 global_step 参数仅用于兼容现有调用接口。
+
     """
     del global_step
     ema_decay = float(decay)
@@ -28,6 +28,7 @@ def update_ema_teacher(teacher, student, decay=0.999, global_step=None):
     teacher_params = dict(teacher.named_parameters())
     student_params = dict(student.named_parameters())
     for name, teacher_param in teacher_params.items():
+        #教师参数更新
         teacher_param.mul_(ema_decay).add_(
             student_params[name].detach(), alpha=1.0 - ema_decay
         )
@@ -49,10 +50,10 @@ def update_ema_teacher(teacher, student, decay=0.999, global_step=None):
 
 @torch.no_grad()
 def select_dual_view_pseudo_labels(logits1, logits2, thresholds):
-    """Strict two-view pseudo-label filtering.
+    """严格的双视图伪标签筛选。
 
-    A target sample is reliable only when both weak views predict the same class
-    and EACH view independently exceeds that class's adaptive threshold.
+    只有当两个弱增强视图预测出相同的类别，并且每个视图的预测置信度都分别超过该类别对应的自适应阈值时，才认为该目标样本是可靠的。
+           
     """
     probs1 = F.softmax(logits1, dim=1)
     probs2 = F.softmax(logits2, dim=1)

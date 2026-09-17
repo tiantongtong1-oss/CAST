@@ -1,0 +1,36 @@
+---------------------------------------------------------------------------------------
+Improved CAST: mobilenet_v2, source rafdb, target fer
+w1:4.0 w2:0.3 w3:0.1 phi:1.4 ema:0.999 lambda_t:1.0 lambda_aff:0.1
+---------------------------------------------------------------------------------------
+The dataset distribute: 1290, 281, 717, 4772, 1982, 705, 2524
+FER train split (train), samples: 28709
+The dataset distribute: 3171, 4097, 436, 7215, 4830, 3995, 4965
+FER train split (train), samples: 28709
+The dataset distribute: 3171, 4097, 436, 7215, 4830, 3995, 4965
+FER val split (val), samples: 3589
+The dataset distribute: 415, 496, 56, 895, 653, 467, 607
+FER test split (test), samples: 3589
+The dataset distribute: 416, 528, 55, 879, 594, 491, 626
+[Source Epoch 0] Training accuracy: 0.6112. Classification Loss: 1.253 Class Enhancement: -0.028 Weight Loss: 0.506 LR: 0.000950
+[Epoch 0] Target Validation accuracy: 0.3578. Loss: 1.813
+best source-stage validation accuracy 0.3578
+[Source Epoch 1] Training accuracy: 0.7545. Classification Loss: 0.903 Class Enhancement: -0.062 Weight Loss: 0.486 LR: 0.000902
+[Epoch 1] Target Validation accuracy: 0.4439. Loss: 1.551
+best source-stage validation accuracy 0.4439
+[Target Epoch 0] class-wise thresholds: [0.55 0.55 0.55 0.55 0.55 0.55 0.55]
+[Target Epoch 0] corrected target prior: [0.1436 0.1249 0.1152 0.1943 0.1525 0.1243 0.1452]
+[Target Epoch 0] Agreement_Num: 21701 Confident_Num: 1299 Pseudo_Distribution: [939,   0,   0,   1, 126, 229,   4]
+[Target Epoch 0] SourceCE: 0.651 TargetCE: 0.167 lambda_t: 0.200 DDRL: -0.039 (Domain: 0.001 ClassSep: -0.040) ProtoAff: 0.415 lambda_aff: 0.000 Classifier: 0.464 LR: 0.000857
+[Epoch 0] Target Validation accuracy: 0.3399. Loss: 1.815
+best target-stage validation accuracy 0.3399
+[Target Epoch 1] class-wise thresholds: [0.617 0.55  0.55  0.55  0.55  0.55  0.55 ]
+[Target Epoch 1] corrected target prior: [0.1666 0.1445 0.1364 0.1228 0.1445 0.1496 0.1356]
+[Target Epoch 1] Agreement_Num: 22034 Confident_Num: 1759 Pseudo_Distribution: [1002,    2,    0,   85,  249,  413,    8]
+[Target Epoch 1] SourceCE: 0.525 TargetCE: 0.117 lambda_t: 0.400 DDRL: -0.042 (Domain: 0.001 ClassSep: -0.043) ProtoAff: 0.382 lambda_aff: 0.000 Classifier: 0.450 LR: 0.000815
+[Epoch 1] Target Validation accuracy: 0.3979. Loss: 1.764
+best target-stage validation accuracy 0.3979
+[Epoch 2] Target Test accuracy: 0.4012. Loss: 1.733
+best source-stage validation accuracy 0.4439
+best target-stage validation accuracy 0.3979
+selected validation accuracy 0.3979
+final target test accuracy 0.4012

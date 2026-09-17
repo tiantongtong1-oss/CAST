@@ -4,20 +4,26 @@ from torchvision import models
 
 
 def compute_kernel_matrix(source, target, kernel_mul=2.0, kernel_num=5):
+    #得到一个source 和 target的相似度矩阵
+
     """Multi-kernel Gaussian matrix used by MK-MMD (paper Eq. 9-12)."""
-    n_samples = int(source.size(0)) + int(target.size(0))
+    n_samples = int(source.size(0)) + int(target.size(0))  #总样本数
     total = torch.cat([source, target], dim=0)
+    #增加维度
     total0 = total.unsqueeze(0).expand(total.size(0), total.size(0), total.size(1))
     total1 = total.unsqueeze(1).expand(total.size(0), total.size(0), total.size(1))
+    #一次性计算所有样本两两之间的差，并计算欧氏距离的平方
     l2_distance = ((total0 - total1) ** 2).sum(2)
 
     if n_samples <= 1:
         return torch.zeros_like(l2_distance)
-
+    #作为典型距离，detach()不做反向传播，仅作为参数尺度
     bandwidth = torch.sum(l2_distance.detach()) / (n_samples ** 2 - n_samples)
+    #限制最小值
     bandwidth = torch.clamp(bandwidth, min=1e-12)
     bandwidth /= kernel_mul ** (kernel_num // 2)
     bandwidth_list = [bandwidth * (kernel_mul ** i) for i in range(kernel_num)]
+    #两个样本越近，kernel 越接近 1；两个样本越远，kernel 越接近 0。
     kernel_val = [torch.exp(-l2_distance / bandwidth_temp) for bandwidth_temp in bandwidth_list]
     return sum(kernel_val)
 

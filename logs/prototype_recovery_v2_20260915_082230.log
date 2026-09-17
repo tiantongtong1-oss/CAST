@@ -1,0 +1,440 @@
+---------------------------------------------------------------------------------------
+CAST Prototype Recovery v2: mobilenet_v2 with source rafdb and target fer
+alpha(w1):4.0 beta(w2):0.3 gamma(w3):0.1 ema:0.999 tau0:0.85 threshold_beta:0.5 margin:0.02 threshold_range:[0.8,0.95]
+prototype weight:0.1 temp:0.2 momentum:0.99 source_anchor:0.5 warmup:3 ramp:5
+temporal mode:observe momentum:0.7 min_streak:2 warmup:2 target_soft_weight:0.2 eval_ema:True run_name:recovery_v3_s1314
+seed:1314 source_balance_power:0.5 source_balance_max_ratio:2.0
+---------------------------------------------------------------------------------------
+The dataset distribute: 1290, 281, 717, 4772, 1982, 705, 2524
+The dataset distribute: 1290, 281, 717, 4772, 1982, 705, 2524
+FER train split (train), samples: 28709
+The dataset distribute: 3171, 4097, 436, 7215, 4830, 3995, 4965
+FER train split (train), samples: 28709
+The dataset distribute: 3171, 4097, 436, 7215, 4830, 3995, 4965
+FER val split (val), samples: 3589
+The dataset distribute: 415, 496, 56, 895, 653, 467, 607
+FER test split (test), samples: 3589
+The dataset distribute: 416, 528, 55, 879, 594, 491, 626
+Loading pretrained weights... models/rafdb_fer/mobilenet_v2_rafdb_fer_prototype_consistency_v1_source_best.pth
+Input checkpoint SHA256: 34e2412ce2618b153951dd8eda56a41571816fd2aa2a7e9e328d984e2bed0cdd
+[Epoch -1] Target Validation Source accuracy: 0.5107. Loss: 1.612
+[Epoch -1] Target Validation Source recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.6867 0.0766 0.4286 0.8257 0.487  0.2441 0.5189] Macro Recall: 0.4668
+Target RNG reset to seed 1314; source/target/threshold loaders use independent streams
+Target train path-order SHA256: 9727131c2f4c4e4dedbd39e94f5353a97cd0d16dbbe21b4df3bb5a8384e25b33
+Target initial LR: 0.00044013
+source prototype counts: [1290,  281,  717, 4772, 1982,  705, 2524]
+Target-stage labeled-source class weights: [1.9233 2.     2.     1.     1.5517 2.     1.375 ]
+[Target Epoch 0] class mean confidence: [0.7622 0.6766 0.6224 0.7854 0.7037 0.6763 0.6787] global_mean: 0.7008 threshold_center: 0.8500
+[Target Epoch 0] class-adaptive thresholds: [0.8807 0.8379 0.8108 0.8923 0.8515 0.8378 0.839 ]
+[Target Epoch 0] Agreement_Num: 22747 Confident_Num: 7977 Pseudo_Distribution: [1108,  164,  127, 3669, 1342,  408, 1159]
+[Target Epoch 0] Dual_Pseudo_Distribution: [1108,  164,  127, 3669, 1342,  408, 1159] SoftWeight: 0.0000
+[Target Epoch 0] Temporal_Stable: 0/7977 History_Disagrees: 0 Label_Flips: 0 Retention_By_Class: [1. 1. 1. 1. 1. 1. 1.] Warmup: True
+[Target Epoch 0] Temporal_Mode: observe Rejected_By_Class: [0, 0, 0, 0, 0, 0, 0]
+[Target Epoch 0] Source CE: 0.2162 Target CE: 0.2515 Accepted_Targets: 7977
+[Target Epoch 0] Prototype_Agreement: 7964/7977 (0.9984) Mean_Assigned_Cosine: 0.9806 Target_Prototype_Counts: [1108,  164,  127, 3669, 1342,  408, 1159]
+[Target Epoch 0] Classification Loss: 0.224 Affinity Loss: -0.171 Weight Loss: 0.447 Prototype Loss: 0.565 ProtoWeight: 0.0000 LR: 0.000418
+[Epoch 0] Target Validation Student accuracy: 0.5057. Loss: 1.737
+[Epoch 0] Target Validation Student recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7614 0.0544 0.3929 0.7709 0.3522 0.3619 0.5947] Macro Recall: 0.4698
+[Epoch 0] Target Validation EMA accuracy: 0.5183. Loss: 1.605
+[Epoch 0] Target Validation EMA recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.706  0.0786 0.4286 0.8257 0.4855 0.2634 0.5354] Macro Recall: 0.4747
+best target-stage validation accuracy 0.5183 (ema_teacher)
+[Target Epoch 1] class mean confidence: [0.7772 0.6895 0.6314 0.7935 0.71   0.6925 0.6895] global_mean: 0.7119 threshold_center: 0.8500
+[Target Epoch 1] class-adaptive thresholds: [0.8826 0.8388 0.8097 0.8908 0.849  0.8403 0.8388]
+[Target Epoch 1] Agreement_Num: 23036 Confident_Num: 9222 Pseudo_Distribution: [1258,  176,  145, 4173, 1537,  469, 1464]
+[Target Epoch 1] Dual_Pseudo_Distribution: [1258,  176,  145, 4173, 1537,  469, 1464] SoftWeight: 0.0000
+[Target Epoch 1] Temporal_Stable: 6597/9222 History_Disagrees: 39 Label_Flips: 5788 Retention_By_Class: [1. 1. 1. 1. 1. 1. 1.] Warmup: True
+[Target Epoch 1] Temporal_Mode: observe Rejected_By_Class: [0, 0, 0, 0, 0, 0, 0]
+[Target Epoch 1] Source CE: 0.1713 Target CE: 0.2154 Accepted_Targets: 9222
+[Target Epoch 1] Prototype_Agreement: 9202/9222 (0.9978) Mean_Assigned_Cosine: 0.9791 Target_Prototype_Counts: [2366,  340,  272, 7842, 2879,  877, 2623]
+[Target Epoch 1] Classification Loss: 0.182 Affinity Loss: -0.187 Weight Loss: 0.445 Prototype Loss: 0.542 ProtoWeight: 0.0000 LR: 0.000397
+[Epoch 1] Target Validation Student accuracy: 0.5185. Loss: 1.732
+[Epoch 1] Target Validation Student recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7084 0.0565 0.25   0.8168 0.4732 0.2805 0.5832] Macro Recall: 0.4527
+[Epoch 1] Target Validation EMA accuracy: 0.5244. Loss: 1.605
+[Epoch 1] Target Validation EMA recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7157 0.0766 0.4286 0.8268 0.4885 0.2762 0.5519] Macro Recall: 0.4806
+best target-stage validation accuracy 0.5244 (ema_teacher)
+[Target Epoch 2] class mean confidence: [0.7835 0.7009 0.6553 0.8073 0.7212 0.7113 0.7051] global_mean: 0.7264 threshold_center: 0.8500
+[Target Epoch 2] class-adaptive thresholds: [0.8786 0.8373 0.8145 0.8905 0.8474 0.8424 0.8394]
+[Target Epoch 2] Agreement_Num: 23436 Confident_Num: 10168 Pseudo_Distribution: [1479,  212,  166, 4428, 1695,  516, 1672]
+[Target Epoch 2] Dual_Pseudo_Distribution: [1479,  212,  166, 4428, 1695,  516, 1672] SoftWeight: 0.2000
+[Target Epoch 2] Temporal_Stable: 7761/10168 History_Disagrees: 35 Label_Flips: 5486 Retention_By_Class: [1. 1. 1. 1. 1. 1. 1.] Warmup: False
+[Target Epoch 2] Temporal_Mode: observe Rejected_By_Class: [0, 0, 0, 0, 0, 0, 0]
+[Target Epoch 2] Source CE: 0.1415 Target CE: 0.2820 Accepted_Targets: 10168
+[Target Epoch 2] Prototype_Agreement: 10153/10168 (0.9985) Mean_Assigned_Cosine: 0.9772 Target_Prototype_Counts: [ 3845,   552,   438, 12270,  4574,  1393,  4295]
+[Target Epoch 2] Classification Loss: 0.178 Affinity Loss: -0.192 Weight Loss: 0.443 Prototype Loss: 0.518 ProtoWeight: 0.0000 LR: 0.000377
+[Epoch 2] Target Validation Student accuracy: 0.5277. Loss: 1.675
+[Epoch 2] Target Validation Student recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7518 0.0766 0.4821 0.8291 0.4992 0.2827 0.5222] Macro Recall: 0.4920
+[Epoch 2] Target Validation EMA accuracy: 0.5300. Loss: 1.609
+[Epoch 2] Target Validation EMA recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7349 0.0726 0.4464 0.8291 0.49   0.2805 0.5651] Macro Recall: 0.4884
+best target-stage validation accuracy 0.5300 (ema_teacher)
+[Target Epoch 3] class mean confidence: [0.8022 0.7081 0.6568 0.818  0.7292 0.7196 0.7137] global_mean: 0.7354 threshold_center: 0.8500
+[Target Epoch 3] class-adaptive thresholds: [0.8834 0.8364 0.8107 0.8913 0.8469 0.8421 0.8392]
+[Target Epoch 3] Agreement_Num: 23648 Confident_Num: 10989 Pseudo_Distribution: [1660,  218,  215, 4649, 1785,  578, 1884]
+[Target Epoch 3] Dual_Pseudo_Distribution: [1660,  218,  215, 4649, 1785,  578, 1884] SoftWeight: 0.2000
+[Target Epoch 3] Temporal_Stable: 8679/10989 History_Disagrees: 24 Label_Flips: 5179 Retention_By_Class: [1. 1. 1. 1. 1. 1. 1.] Warmup: False
+[Target Epoch 3] Temporal_Mode: observe Rejected_By_Class: [0, 0, 0, 0, 0, 0, 0]
+[Target Epoch 3] Source CE: 0.1222 Target CE: 0.2786 Accepted_Targets: 10989
+[Target Epoch 3] Prototype_Agreement: 10976/10989 (0.9988) Mean_Assigned_Cosine: 0.9753 Target_Prototype_Counts: [ 5505,   770,   653, 16919,  6359,  1971,  6179]
+[Target Epoch 3] Classification Loss: 0.165 Affinity Loss: -0.190 Weight Loss: 0.443 Prototype Loss: 0.494 ProtoWeight: 0.0200 LR: 0.000358
+[Epoch 3] Target Validation Student accuracy: 0.5344. Loss: 1.750
+[Epoch 3] Target Validation Student recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7566 0.0907 0.4107 0.7765 0.4747 0.3276 0.6227] Macro Recall: 0.4942
+[Epoch 3] Target Validation EMA accuracy: 0.5294. Loss: 1.621
+[Epoch 3] Target Validation EMA recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7325 0.0665 0.3929 0.8313 0.4839 0.2848 0.5733] Macro Recall: 0.4807
+best target-stage validation accuracy 0.5344 (student)
+[Target Epoch 4] class mean confidence: [0.812  0.7241 0.661  0.8216 0.7354 0.7331 0.7277] global_mean: 0.7450 threshold_center: 0.8500
+[Target Epoch 4] class-adaptive thresholds: [0.8835 0.8396 0.808  0.8883 0.8452 0.8441 0.8413]
+[Target Epoch 4] Agreement_Num: 24015 Confident_Num: 11802 Pseudo_Distribution: [1775,  263,  233, 4880, 1918,  646, 2087]
+[Target Epoch 4] Dual_Pseudo_Distribution: [1775,  263,  233, 4880, 1918,  646, 2087] SoftWeight: 0.2000
+[Target Epoch 4] Temporal_Stable: 9514/11802 History_Disagrees: 24 Label_Flips: 4998 Retention_By_Class: [1. 1. 1. 1. 1. 1. 1.] Warmup: False
+[Target Epoch 4] Temporal_Mode: observe Rejected_By_Class: [0, 0, 0, 0, 0, 0, 0]
+[Target Epoch 4] Source CE: 0.1123 Target CE: 0.2715 Accepted_Targets: 11802
+[Target Epoch 4] Prototype_Agreement: 11790/11802 (0.9990) Mean_Assigned_Cosine: 0.9725 Target_Prototype_Counts: [ 7280,  1033,   886, 21799,  8277,  2617,  8266]
+[Target Epoch 4] Classification Loss: 0.158 Affinity Loss: -0.185 Weight Loss: 0.442 Prototype Loss: 0.447 ProtoWeight: 0.0400 LR: 0.000341
+[Epoch 4] Target Validation Student accuracy: 0.5341. Loss: 1.680
+[Epoch 4] Target Validation Student recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.6964 0.1169 0.3929 0.819  0.51   0.2784 0.5799] Macro Recall: 0.4848
+[Epoch 4] Target Validation EMA accuracy: 0.5325. Loss: 1.632
+[Epoch 4] Target Validation EMA recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7373 0.0706 0.375  0.8358 0.4855 0.2934 0.5717] Macro Recall: 0.4813
+[Target Epoch 5] class mean confidence: [0.8232 0.7373 0.6742 0.8275 0.7429 0.75   0.7347] global_mean: 0.7557 threshold_center: 0.8500
+[Target Epoch 5] class-adaptive thresholds: [0.8837 0.8408 0.8092 0.8859 0.8436 0.8472 0.8395]
+[Target Epoch 5] Agreement_Num: 24080 Confident_Num: 12576 Pseudo_Distribution: [1866,  300,  244, 5099, 2038,  692, 2337]
+[Target Epoch 5] Dual_Pseudo_Distribution: [1866,  300,  244, 5099, 2038,  692, 2337] SoftWeight: 0.2000
+[Target Epoch 5] Temporal_Stable: 10338/12576 History_Disagrees: 21 Label_Flips: 4780 Retention_By_Class: [1. 1. 1. 1. 1. 1. 1.] Warmup: False
+[Target Epoch 5] Temporal_Mode: observe Rejected_By_Class: [0, 0, 0, 0, 0, 0, 0]
+[Target Epoch 5] Source CE: 0.0993 Target CE: 0.2582 Accepted_Targets: 12576
+[Target Epoch 5] Prototype_Agreement: 12556/12576 (0.9984) Mean_Assigned_Cosine: 0.9691 Target_Prototype_Counts: [ 9146,  1333,  1130, 26898, 10315,  3309, 10603]
+[Target Epoch 5] Classification Loss: 0.148 Affinity Loss: -0.189 Weight Loss: 0.442 Prototype Loss: 0.401 ProtoWeight: 0.0600 LR: 0.000324
+[Epoch 5] Target Validation Student accuracy: 0.5405. Loss: 1.725
+[Epoch 5] Target Validation Student recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7398 0.0605 0.2321 0.8291 0.5651 0.3084 0.5519] Macro Recall: 0.4695
+[Epoch 5] Target Validation EMA accuracy: 0.5369. Loss: 1.639
+[Epoch 5] Target Validation EMA recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7301 0.0766 0.3929 0.8425 0.487  0.3041 0.5766] Macro Recall: 0.4871
+best target-stage validation accuracy 0.5405 (student)
+[Target Epoch 6] class mean confidence: [0.8257 0.7662 0.6785 0.8391 0.7492 0.7525 0.7444] global_mean: 0.7651 threshold_center: 0.8500
+[Target Epoch 6] class-adaptive thresholds: [0.8803 0.8505 0.8067 0.887  0.8421 0.8437 0.8397]
+[Target Epoch 6] Agreement_Num: 24311 Confident_Num: 13259 Pseudo_Distribution: [1976,  305,  250, 5261, 2202,  736, 2529]
+[Target Epoch 6] Dual_Pseudo_Distribution: [1976,  305,  250, 5261, 2202,  736, 2529] SoftWeight: 0.2000
+[Target Epoch 6] Temporal_Stable: 11128/13259 History_Disagrees: 22 Label_Flips: 4580 Retention_By_Class: [1. 1. 1. 1. 1. 1. 1.] Warmup: False
+[Target Epoch 6] Temporal_Mode: observe Rejected_By_Class: [0, 0, 0, 0, 0, 0, 0]
+[Target Epoch 6] Source CE: 0.0903 Target CE: 0.2624 Accepted_Targets: 13259
+[Target Epoch 6] Prototype_Agreement: 13243/13259 (0.9988) Mean_Assigned_Cosine: 0.9662 Target_Prototype_Counts: [11122,  1638,  1380, 32159, 12517,  4045, 13132]
+[Target Epoch 6] Classification Loss: 0.144 Affinity Loss: -0.196 Weight Loss: 0.442 Prototype Loss: 0.384 ProtoWeight: 0.0800 LR: 0.000307
+[Epoch 6] Target Validation Student accuracy: 0.5417. Loss: 1.742
+[Epoch 6] Target Validation Student recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7711 0.0423 0.2857 0.8358 0.5942 0.2976 0.514 ] Macro Recall: 0.4772
+[Epoch 6] Target Validation EMA accuracy: 0.5389. Loss: 1.647
+[Epoch 6] Target Validation EMA recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7349 0.0685 0.3571 0.8413 0.49   0.3062 0.5914] Macro Recall: 0.4842
+best target-stage validation accuracy 0.5417 (student)
+[Target Epoch 7] class mean confidence: [0.8274 0.7707 0.6912 0.8427 0.7601 0.7675 0.7537] global_mean: 0.7733 threshold_center: 0.8500
+[Target Epoch 7] class-adaptive thresholds: [0.877  0.8487 0.8089 0.8847 0.8434 0.8471 0.8402]
+[Target Epoch 7] Agreement_Num: 24592 Confident_Num: 13769 Pseudo_Distribution: [2055,  324,  261, 5404, 2319,  774, 2632]
+[Target Epoch 7] Dual_Pseudo_Distribution: [2055,  324,  261, 5404, 2319,  774, 2632] SoftWeight: 0.2000
+[Target Epoch 7] Temporal_Stable: 11751/13769 History_Disagrees: 13 Label_Flips: 4384 Retention_By_Class: [1. 1. 1. 1. 1. 1. 1.] Warmup: False
+[Target Epoch 7] Temporal_Mode: observe Rejected_By_Class: [0, 0, 0, 0, 0, 0, 0]
+[Target Epoch 7] Source CE: 0.0794 Target CE: 0.2496 Accepted_Targets: 13769
+[Target Epoch 7] Prototype_Agreement: 13744/13769 (0.9982) Mean_Assigned_Cosine: 0.9636 Target_Prototype_Counts: [13177,  1962,  1641, 37563, 14836,  4819, 15764]
+[Target Epoch 7] Classification Loss: 0.134 Affinity Loss: -0.179 Weight Loss: 0.442 Prototype Loss: 0.356 ProtoWeight: 0.1000 LR: 0.000292
+[Epoch 7] Target Validation Student accuracy: 0.5419. Loss: 1.793
+[Epoch 7] Target Validation Student recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7398 0.0565 0.3393 0.8168 0.5299 0.3212 0.5997] Macro Recall: 0.4861
+[Epoch 7] Target Validation EMA accuracy: 0.5453. Loss: 1.651
+[Epoch 7] Target Validation EMA recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7349 0.0746 0.375  0.848  0.5038 0.3191 0.5881] Macro Recall: 0.4919
+best target-stage validation accuracy 0.5453 (ema_teacher)
+[Target Epoch 8] class mean confidence: [0.8318 0.787  0.7029 0.8489 0.7658 0.7731 0.7586] global_mean: 0.7812 threshold_center: 0.8500
+[Target Epoch 8] class-adaptive thresholds: [0.8753 0.8529 0.8109 0.8839 0.8423 0.846  0.8387]
+[Target Epoch 8] Agreement_Num: 24660 Confident_Num: 14340 Pseudo_Distribution: [2144,  341,  288, 5502, 2470,  811, 2784]
+[Target Epoch 8] Dual_Pseudo_Distribution: [2144,  341,  288, 5502, 2470,  811, 2784] SoftWeight: 0.2000
+[Target Epoch 8] Temporal_Stable: 12269/14340 History_Disagrees: 22 Label_Flips: 4123 Retention_By_Class: [1. 1. 1. 1. 1. 1. 1.] Warmup: False
+[Target Epoch 8] Temporal_Mode: observe Rejected_By_Class: [0, 0, 0, 0, 0, 0, 0]
+[Target Epoch 8] Source CE: 0.0737 Target CE: 0.2373 Accepted_Targets: 14340
+[Target Epoch 8] Prototype_Agreement: 14319/14340 (0.9985) Mean_Assigned_Cosine: 0.9613 Target_Prototype_Counts: [15321,  2303,  1929, 43065, 17306,  5630, 18548]
+[Target Epoch 8] Classification Loss: 0.128 Affinity Loss: -0.177 Weight Loss: 0.442 Prototype Loss: 0.348 ProtoWeight: 0.1000 LR: 0.000277
+[Epoch 8] Target Validation Student accuracy: 0.5447. Loss: 1.868
+[Epoch 8] Target Validation Student recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7687 0.0444 0.3036 0.8101 0.5161 0.349  0.6129] Macro Recall: 0.4864
+[Epoch 8] Target Validation EMA accuracy: 0.5475. Loss: 1.662
+[Epoch 8] Target Validation EMA recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7494 0.0706 0.375  0.848  0.5023 0.3169 0.598 ] Macro Recall: 0.4943
+best target-stage validation accuracy 0.5475 (ema_teacher)
+[Target Epoch 9] class mean confidence: [0.8407 0.7916 0.7077 0.8566 0.7691 0.7762 0.7673] global_mean: 0.7870 threshold_center: 0.8500
+[Target Epoch 9] class-adaptive thresholds: [0.8768 0.8523 0.8103 0.8848 0.8411 0.8446 0.8401]
+[Target Epoch 9] Agreement_Num: 24771 Confident_Num: 14807 Pseudo_Distribution: [2206,  361,  286, 5619, 2590,  853, 2892]
+[Target Epoch 9] Dual_Pseudo_Distribution: [2206,  361,  286, 5619, 2590,  853, 2892] SoftWeight: 0.2000
+[Target Epoch 9] Temporal_Stable: 12862/14807 History_Disagrees: 15 Label_Flips: 3985 Retention_By_Class: [1. 1. 1. 1. 1. 1. 1.] Warmup: False
+[Target Epoch 9] Temporal_Mode: observe Rejected_By_Class: [0, 0, 0, 0, 0, 0, 0]
+[Target Epoch 9] Source CE: 0.0663 Target CE: 0.2326 Accepted_Targets: 14807
+[Target Epoch 9] Prototype_Agreement: 14794/14807 (0.9991) Mean_Assigned_Cosine: 0.9597 Target_Prototype_Counts: [17527,  2664,  2215, 48684, 19896,  6483, 21440]
+[Target Epoch 9] Classification Loss: 0.123 Affinity Loss: -0.182 Weight Loss: 0.442 Prototype Loss: 0.331 ProtoWeight: 0.1000 LR: 0.000264
+[Epoch 9] Target Validation Student accuracy: 0.5428. Loss: 1.867
+[Epoch 9] Target Validation Student recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7518 0.0585 0.375  0.8514 0.5038 0.3019 0.5832] Macro Recall: 0.4894
+[Epoch 9] Target Validation EMA accuracy: 0.5481. Loss: 1.672
+[Epoch 9] Target Validation EMA recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7518 0.0706 0.3571 0.8503 0.5069 0.3148 0.5947] Macro Recall: 0.4923
+best target-stage validation accuracy 0.5481 (ema_teacher)
+[Target Epoch 10] class mean confidence: [0.8411 0.7999 0.7217 0.861  0.777  0.7918 0.7747] global_mean: 0.7953 threshold_center: 0.8500
+[Target Epoch 10] class-adaptive thresholds: [0.8729 0.8523 0.8132 0.8828 0.8408 0.8482 0.8397]
+[Target Epoch 10] Agreement_Num: 24881 Confident_Num: 15304 Pseudo_Distribution: [2242,  376,  306, 5707, 2783,  878, 3012]
+[Target Epoch 10] Dual_Pseudo_Distribution: [2242,  376,  306, 5707, 2783,  878, 3012] SoftWeight: 0.2000
+[Target Epoch 10] Temporal_Stable: 13323/15304 History_Disagrees: 14 Label_Flips: 3872 Retention_By_Class: [1. 1. 1. 1. 1. 1. 1.] Warmup: False
+[Target Epoch 10] Temporal_Mode: observe Rejected_By_Class: [0, 0, 0, 0, 0, 0, 0]
+[Target Epoch 10] Source CE: 0.0612 Target CE: 0.2236 Accepted_Targets: 15304
+[Target Epoch 10] Prototype_Agreement: 15289/15304 (0.9990) Mean_Assigned_Cosine: 0.9580 Target_Prototype_Counts: [19769,  3040,  2521, 54391, 22679,  7361, 24452]
+[Target Epoch 10] Classification Loss: 0.117 Affinity Loss: -0.181 Weight Loss: 0.441 Prototype Loss: 0.317 ProtoWeight: 0.1000 LR: 0.000250
+[Epoch 10] Target Validation Student accuracy: 0.5500. Loss: 1.833
+[Epoch 10] Target Validation Student recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7904 0.0726 0.2321 0.8168 0.5345 0.3426 0.5881] Macro Recall: 0.4824
+[Epoch 10] Target Validation EMA accuracy: 0.5469. Loss: 1.680
+[Epoch 10] Target Validation EMA recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7663 0.0645 0.3393 0.848  0.513  0.3084 0.5865] Macro Recall: 0.4894
+best target-stage validation accuracy 0.5500 (student)
+[Target Epoch 11] class mean confidence: [0.8459 0.8184 0.7238 0.865  0.7849 0.7916 0.7815] global_mean: 0.8016 threshold_center: 0.8500
+[Target Epoch 11] class-adaptive thresholds: [0.8722 0.8584 0.8111 0.8817 0.8417 0.845  0.84  ]
+[Target Epoch 11] Agreement_Num: 25018 Confident_Num: 15690 Pseudo_Distribution: [2283,  374,  311, 5759, 2869,  922, 3172]
+[Target Epoch 11] Dual_Pseudo_Distribution: [2283,  374,  311, 5759, 2869,  922, 3172] SoftWeight: 0.2000
+[Target Epoch 11] Temporal_Stable: 13789/15690 History_Disagrees: 17 Label_Flips: 3761 Retention_By_Class: [1. 1. 1. 1. 1. 1. 1.] Warmup: False
+[Target Epoch 11] Temporal_Mode: observe Rejected_By_Class: [0, 0, 0, 0, 0, 0, 0]
+[Target Epoch 11] Source CE: 0.0555 Target CE: 0.2185 Accepted_Targets: 15690
+[Target Epoch 11] Prototype_Agreement: 15670/15690 (0.9987) Mean_Assigned_Cosine: 0.9565 Target_Prototype_Counts: [22052,  3414,  2832, 60150, 25548,  8283, 27624]
+[Target Epoch 11] Classification Loss: 0.113 Affinity Loss: -0.193 Weight Loss: 0.442 Prototype Loss: 0.311 ProtoWeight: 0.1000 LR: 0.000238
+[Epoch 11] Target Validation Student accuracy: 0.5534. Loss: 1.865
+[Epoch 11] Target Validation Student recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7687 0.0685 0.3036 0.8268 0.5084 0.3597 0.6194] Macro Recall: 0.4936
+[Epoch 11] Target Validation EMA accuracy: 0.5497. Loss: 1.682
+[Epoch 11] Target Validation EMA recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.759  0.0625 0.3214 0.8525 0.5222 0.3062 0.5964] Macro Recall: 0.4886
+best target-stage validation accuracy 0.5534 (student)
+[Target Epoch 12] class mean confidence: [0.8447 0.8249 0.7172 0.8703 0.7897 0.792  0.7842] global_mean: 0.8033 threshold_center: 0.8500
+[Target Epoch 12] class-adaptive thresholds: [0.8707 0.8608 0.807  0.8835 0.8432 0.8444 0.8405]
+[Target Epoch 12] Agreement_Num: 25151 Confident_Num: 15972 Pseudo_Distribution: [2295,  394,  323, 5860, 2940,  967, 3193]
+[Target Epoch 12] Dual_Pseudo_Distribution: [2295,  394,  323, 5860, 2940,  967, 3193] SoftWeight: 0.2000
+[Target Epoch 12] Temporal_Stable: 14152/15972 History_Disagrees: 22 Label_Flips: 3633 Retention_By_Class: [1. 1. 1. 1. 1. 1. 1.] Warmup: False
+[Target Epoch 12] Temporal_Mode: observe Rejected_By_Class: [0, 0, 0, 0, 0, 0, 0]
+[Target Epoch 12] Source CE: 0.0544 Target CE: 0.2207 Accepted_Targets: 15972
+[Target Epoch 12] Prototype_Agreement: 15947/15972 (0.9984) Mean_Assigned_Cosine: 0.9557 Target_Prototype_Counts: [24347,  3808,  3155, 66010, 28488,  9250, 30817]
+[Target Epoch 12] Classification Loss: 0.114 Affinity Loss: -0.200 Weight Loss: 0.441 Prototype Loss: 0.310 ProtoWeight: 0.1000 LR: 0.000226
+[Epoch 12] Target Validation Student accuracy: 0.5528. Loss: 1.922
+[Epoch 12] Target Validation Student recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7711 0.0645 0.3036 0.8615 0.4732 0.3126 0.6409] Macro Recall: 0.4896
+[Epoch 12] Target Validation EMA accuracy: 0.5528. Loss: 1.684
+[Epoch 12] Target Validation EMA recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7614 0.0625 0.3393 0.8536 0.5268 0.3041 0.6063] Macro Recall: 0.4934
+[Target Epoch 13] class mean confidence: [0.8516 0.8344 0.7427 0.8717 0.7914 0.7985 0.7873] global_mean: 0.8111 threshold_center: 0.8500
+[Target Epoch 13] class-adaptive thresholds: [0.8703 0.8617 0.8158 0.8803 0.8401 0.8437 0.8381]
+[Target Epoch 13] Agreement_Num: 25252 Confident_Num: 16303 Pseudo_Distribution: [2295,  391,  315, 5912, 3031,  989, 3370]
+[Target Epoch 13] Dual_Pseudo_Distribution: [2295,  391,  315, 5912, 3031,  989, 3370] SoftWeight: 0.2000
+[Target Epoch 13] Temporal_Stable: 14503/16303 History_Disagrees: 20 Label_Flips: 3506 Retention_By_Class: [1. 1. 1. 1. 1. 1. 1.] Warmup: False
+[Target Epoch 13] Temporal_Mode: observe Rejected_By_Class: [0, 0, 0, 0, 0, 0, 0]
+[Target Epoch 13] Source CE: 0.0459 Target CE: 0.2151 Accepted_Targets: 16303
+[Target Epoch 13] Prototype_Agreement: 16284/16303 (0.9988) Mean_Assigned_Cosine: 0.9547 Target_Prototype_Counts: [26642,  4199,  3470, 71922, 31519, 10239, 34187]
+[Target Epoch 13] Classification Loss: 0.107 Affinity Loss: -0.185 Weight Loss: 0.440 Prototype Loss: 0.304 ProtoWeight: 0.1000 LR: 0.000215
+[Epoch 13] Target Validation Student accuracy: 0.5520. Loss: 1.936
+[Epoch 13] Target Validation Student recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7012 0.0706 0.25   0.8693 0.5957 0.3126 0.5404] Macro Recall: 0.4771
+[Epoch 13] Target Validation EMA accuracy: 0.5553. Loss: 1.686
+[Epoch 13] Target Validation EMA recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7639 0.0625 0.3393 0.8514 0.5299 0.3148 0.6112] Macro Recall: 0.4961
+best target-stage validation accuracy 0.5553 (ema_teacher)
+[Target Epoch 14] class mean confidence: [0.8526 0.8377 0.7355 0.8747 0.7901 0.8049 0.7899] global_mean: 0.8122 threshold_center: 0.8500
+[Target Epoch 14] class-adaptive thresholds: [0.8702 0.8628 0.8116 0.8813 0.839  0.8463 0.8388]
+[Target Epoch 14] Agreement_Num: 25320 Confident_Num: 16522 Pseudo_Distribution: [2334,  405,  330, 5977, 3047,  991, 3438]
+[Target Epoch 14] Dual_Pseudo_Distribution: [2334,  405,  330, 5977, 3047,  991, 3438] SoftWeight: 0.2000
+[Target Epoch 14] Temporal_Stable: 14788/16522 History_Disagrees: 11 Label_Flips: 3449 Retention_By_Class: [1. 1. 1. 1. 1. 1. 1.] Warmup: False
+[Target Epoch 14] Temporal_Mode: observe Rejected_By_Class: [0, 0, 0, 0, 0, 0, 0]
+[Target Epoch 14] Source CE: 0.0435 Target CE: 0.2053 Accepted_Targets: 16522
+[Target Epoch 14] Prototype_Agreement: 16495/16522 (0.9984) Mean_Assigned_Cosine: 0.9541 Target_Prototype_Counts: [28976,  4604,  3800, 77899, 34566, 11230, 37625]
+[Target Epoch 14] Classification Loss: 0.102 Affinity Loss: -0.192 Weight Loss: 0.440 Prototype Loss: 0.286 ProtoWeight: 0.1000 LR: 0.000204
+[Epoch 14] Target Validation Student accuracy: 0.5556. Loss: 1.977
+[Epoch 14] Target Validation Student recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.747  0.0585 0.3214 0.8525 0.5161 0.3126 0.6442] Macro Recall: 0.4932
+[Epoch 14] Target Validation EMA accuracy: 0.5578. Loss: 1.688
+[Epoch 14] Target Validation EMA recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7614 0.0665 0.3393 0.857  0.536  0.3105 0.6129] Macro Recall: 0.4977
+best target-stage validation accuracy 0.5578 (ema_teacher)
+[Target Epoch 15] class mean confidence: [0.8561 0.8401 0.7454 0.8754 0.7963 0.8053 0.7937] global_mean: 0.8160 threshold_center: 0.8500
+[Target Epoch 15] class-adaptive thresholds: [0.87   0.862  0.8147 0.8797 0.8401 0.8446 0.8389]
+[Target Epoch 15] Agreement_Num: 25393 Confident_Num: 16751 Pseudo_Distribution: [2323,  417,  343, 6027, 3103, 1007, 3531]
+[Target Epoch 15] Dual_Pseudo_Distribution: [2323,  417,  343, 6027, 3103, 1007, 3531] SoftWeight: 0.2000
+[Target Epoch 15] Temporal_Stable: 15087/16751 History_Disagrees: 7 Label_Flips: 3402 Retention_By_Class: [1. 1. 1. 1. 1. 1. 1.] Warmup: False
+[Target Epoch 15] Temporal_Mode: observe Rejected_By_Class: [0, 0, 0, 0, 0, 0, 0]
+[Target Epoch 15] Source CE: 0.0420 Target CE: 0.2053 Accepted_Targets: 16751
+[Target Epoch 15] Prototype_Agreement: 16725/16751 (0.9984) Mean_Assigned_Cosine: 0.9539 Target_Prototype_Counts: [31299,  5021,  4143, 83926, 37669, 12237, 41156]
+[Target Epoch 15] Classification Loss: 0.102 Affinity Loss: -0.194 Weight Loss: 0.439 Prototype Loss: 0.280 ProtoWeight: 0.1000 LR: 0.000194
+[Epoch 15] Target Validation Student accuracy: 0.5603. Loss: 1.941
+[Epoch 15] Target Validation Student recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7542 0.0605 0.25   0.848  0.5636 0.3191 0.6227] Macro Recall: 0.4883
+[Epoch 15] Target Validation EMA accuracy: 0.5575. Loss: 1.688
+[Epoch 15] Target Validation EMA recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7614 0.0665 0.3036 0.8581 0.5375 0.3084 0.6129] Macro Recall: 0.4926
+best target-stage validation accuracy 0.5603 (student)
+[Target Epoch 16] class mean confidence: [0.8555 0.8538 0.7465 0.8759 0.7948 0.809  0.7975] global_mean: 0.8190 threshold_center: 0.8500
+[Target Epoch 16] class-adaptive thresholds: [0.8683 0.8674 0.8137 0.8785 0.8379 0.845  0.8393]
+[Target Epoch 16] Agreement_Num: 25439 Confident_Num: 17054 Pseudo_Distribution: [2338,  426,  357, 6075, 3176, 1033, 3649]
+[Target Epoch 16] Dual_Pseudo_Distribution: [2338,  426,  357, 6075, 3176, 1033, 3649] SoftWeight: 0.2000
+[Target Epoch 16] Temporal_Stable: 15336/17054 History_Disagrees: 13 Label_Flips: 3312 Retention_By_Class: [1. 1. 1. 1. 1. 1. 1.] Warmup: False
+[Target Epoch 16] Temporal_Mode: observe Rejected_By_Class: [0, 0, 0, 0, 0, 0, 0]
+[Target Epoch 16] Source CE: 0.0401 Target CE: 0.2039 Accepted_Targets: 17054
+[Target Epoch 16] Prototype_Agreement: 17028/17054 (0.9985) Mean_Assigned_Cosine: 0.9531 Target_Prototype_Counts: [33637,  5447,  4500, 90001, 40845, 13270, 44805]
+[Target Epoch 16] Classification Loss: 0.101 Affinity Loss: -0.180 Weight Loss: 0.439 Prototype Loss: 0.289 ProtoWeight: 0.1000 LR: 0.000184
+[Epoch 16] Target Validation Student accuracy: 0.5612. Loss: 1.935
+[Epoch 16] Target Validation Student recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7518 0.0685 0.3214 0.8581 0.559  0.3191 0.6063] Macro Recall: 0.4977
+[Epoch 16] Target Validation EMA accuracy: 0.5612. Loss: 1.688
+[Epoch 16] Target Validation EMA recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7663 0.0645 0.3393 0.8615 0.5421 0.3062 0.6211] Macro Recall: 0.5001
+best target-stage validation accuracy 0.5612 (student)
+[Target Epoch 17] class mean confidence: [0.8575 0.8617 0.7478 0.8786 0.7976 0.81   0.8001] global_mean: 0.8219 threshold_center: 0.8500
+[Target Epoch 17] class-adaptive thresholds: [0.8678 0.8699 0.8129 0.8783 0.8378 0.8441 0.8391]
+[Target Epoch 17] Agreement_Num: 25611 Confident_Num: 17246 Pseudo_Distribution: [2336,  434,  367, 6153, 3219, 1023, 3714]
+[Target Epoch 17] Dual_Pseudo_Distribution: [2336,  434,  367, 6153, 3219, 1023, 3714] SoftWeight: 0.2000
+[Target Epoch 17] Temporal_Stable: 15599/17246 History_Disagrees: 11 Label_Flips: 3186 Retention_By_Class: [1. 1. 1. 1. 1. 1. 1.] Warmup: False
+[Target Epoch 17] Temporal_Mode: observe Rejected_By_Class: [0, 0, 0, 0, 0, 0, 0]
+[Target Epoch 17] Source CE: 0.0366 Target CE: 0.1989 Accepted_Targets: 17246
+[Target Epoch 17] Prototype_Agreement: 17222/17246 (0.9986) Mean_Assigned_Cosine: 0.9531 Target_Prototype_Counts: [35973,  5881,  4867, 96154, 44064, 14293, 48519]
+[Target Epoch 17] Classification Loss: 0.097 Affinity Loss: -0.157 Weight Loss: 0.439 Prototype Loss: 0.286 ProtoWeight: 0.1000 LR: 0.000175
+[Epoch 17] Target Validation Student accuracy: 0.5698. Loss: 1.939
+[Epoch 17] Target Validation Student recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7639 0.0685 0.3036 0.8704 0.585  0.3255 0.5997] Macro Recall: 0.5024
+[Epoch 17] Target Validation EMA accuracy: 0.5620. Loss: 1.695
+[Epoch 17] Target Validation EMA recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7687 0.0645 0.3393 0.8603 0.5421 0.3084 0.6244] Macro Recall: 0.5011
+best target-stage validation accuracy 0.5698 (student)
+[Target Epoch 18] class mean confidence: [0.8616 0.8578 0.7618 0.8823 0.8023 0.8155 0.803 ] global_mean: 0.8263 threshold_center: 0.8500
+[Target Epoch 18] class-adaptive thresholds: [0.8676 0.8657 0.8178 0.878  0.838  0.8446 0.8383]
+[Target Epoch 18] Agreement_Num: 25666 Confident_Num: 17578 Pseudo_Distribution: [2346,  432,  364, 6237, 3365, 1041, 3793]
+[Target Epoch 18] Dual_Pseudo_Distribution: [2346,  432,  364, 6237, 3365, 1041, 3793] SoftWeight: 0.2000
+[Target Epoch 18] Temporal_Stable: 15872/17578 History_Disagrees: 7 Label_Flips: 3100 Retention_By_Class: [1. 1. 1. 1. 1. 1. 1.] Warmup: False
+[Target Epoch 18] Temporal_Mode: observe Rejected_By_Class: [0, 0, 0, 0, 0, 0, 0]
+[Target Epoch 18] Source CE: 0.0328 Target CE: 0.1934 Accepted_Targets: 17578
+[Target Epoch 18] Prototype_Agreement: 17558/17578 (0.9989) Mean_Assigned_Cosine: 0.9530 Target_Prototype_Counts: [ 38319,   6313,   5231, 102391,  47429,  15334,  52312]
+[Target Epoch 18] Classification Loss: 0.094 Affinity Loss: -0.176 Weight Loss: 0.438 Prototype Loss: 0.271 ProtoWeight: 0.1000 LR: 0.000166
+[Epoch 18] Target Validation Student accuracy: 0.5648. Loss: 1.979
+[Epoch 18] Target Validation Student recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7711 0.0605 0.3214 0.8827 0.5161 0.3319 0.6211] Macro Recall: 0.5007
+[Epoch 18] Target Validation EMA accuracy: 0.5614. Loss: 1.699
+[Epoch 18] Target Validation EMA recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7639 0.0665 0.3036 0.8637 0.5436 0.3062 0.6211] Macro Recall: 0.4955
+[Target Epoch 19] class mean confidence: [0.8629 0.8598 0.761  0.8874 0.8088 0.8174 0.8054] global_mean: 0.8290 threshold_center: 0.8500
+[Target Epoch 19] class-adaptive thresholds: [0.867  0.8654 0.816  0.8792 0.8399 0.8442 0.8382]
+[Target Epoch 19] Agreement_Num: 25714 Confident_Num: 17823 Pseudo_Distribution: [2368,  454,  381, 6313, 3350, 1068, 3889]
+[Target Epoch 19] Dual_Pseudo_Distribution: [2368,  454,  381, 6313, 3350, 1068, 3889] SoftWeight: 0.2000
+[Target Epoch 19] Temporal_Stable: 16151/17823 History_Disagrees: 11 Label_Flips: 3032 Retention_By_Class: [1. 1. 1. 1. 1. 1. 1.] Warmup: False
+[Target Epoch 19] Temporal_Mode: observe Rejected_By_Class: [0, 0, 0, 0, 0, 0, 0]
+[Target Epoch 19] Source CE: 0.0299 Target CE: 0.1869 Accepted_Targets: 17823
+[Target Epoch 19] Prototype_Agreement: 17808/17823 (0.9992) Mean_Assigned_Cosine: 0.9526 Target_Prototype_Counts: [ 40687,   6767,   5612, 108704,  50779,  16402,  56201]
+[Target Epoch 19] Classification Loss: 0.090 Affinity Loss: -0.175 Weight Loss: 0.438 Prototype Loss: 0.264 ProtoWeight: 0.1000 LR: 0.000158
+[Epoch 19] Target Validation Student accuracy: 0.5651. Loss: 2.032
+[Epoch 19] Target Validation Student recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7663 0.0625 0.3036 0.8659 0.5559 0.3255 0.6129] Macro Recall: 0.4989
+[Epoch 19] Target Validation EMA accuracy: 0.5617. Loss: 1.705
+[Epoch 19] Target Validation EMA recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.759  0.0665 0.3036 0.8659 0.5391 0.3126 0.6227] Macro Recall: 0.4956
+[Target Epoch 20] class mean confidence: [0.8666 0.8694 0.7774 0.8883 0.8095 0.8175 0.8097] global_mean: 0.8341 threshold_center: 0.8541
+[Target Epoch 20] class-adaptive thresholds: [0.8703 0.8717 0.8257 0.8812 0.8418 0.8458 0.8419]
+[Target Epoch 20] Agreement_Num: 25790 Confident_Num: 17920 Pseudo_Distribution: [2370,  473,  362, 6321, 3406, 1082, 3906]
+[Target Epoch 20] Dual_Pseudo_Distribution: [2370,  473,  362, 6321, 3406, 1082, 3906] SoftWeight: 0.2000
+[Target Epoch 20] Temporal_Stable: 16361/17920 History_Disagrees: 10 Label_Flips: 2963 Retention_By_Class: [1. 1. 1. 1. 1. 1. 1.] Warmup: False
+[Target Epoch 20] Temporal_Mode: observe Rejected_By_Class: [0, 0, 0, 0, 0, 0, 0]
+[Target Epoch 20] Source CE: 0.0314 Target CE: 0.1861 Accepted_Targets: 17920
+[Target Epoch 20] Prototype_Agreement: 17903/17920 (0.9991) Mean_Assigned_Cosine: 0.9524 Target_Prototype_Counts: [ 43057,   7240,   5974, 115025,  54185,  17484,  60107]
+[Target Epoch 20] Classification Loss: 0.091 Affinity Loss: -0.198 Weight Loss: 0.438 Prototype Loss: 0.267 ProtoWeight: 0.1000 LR: 0.000150
+[Epoch 20] Target Validation Student accuracy: 0.5662. Loss: 2.003
+[Epoch 20] Target Validation Student recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7687 0.0746 0.25   0.8492 0.5498 0.3319 0.6392] Macro Recall: 0.4948
+[Epoch 20] Target Validation EMA accuracy: 0.5667. Loss: 1.703
+[Epoch 20] Target Validation EMA recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7614 0.0665 0.2857 0.8693 0.5528 0.3169 0.6293] Macro Recall: 0.4974
+[Target Epoch 21] class mean confidence: [0.8657 0.8734 0.7779 0.8905 0.8083 0.8236 0.8105] global_mean: 0.8357 threshold_center: 0.8557
+[Target Epoch 21] class-adaptive thresholds: [0.8707 0.8745 0.8268 0.8831 0.842  0.8496 0.8431]
+[Target Epoch 21] Agreement_Num: 25792 Confident_Num: 17941 Pseudo_Distribution: [2335,  469,  372, 6367, 3413, 1074, 3911]
+[Target Epoch 21] Dual_Pseudo_Distribution: [2335,  469,  372, 6367, 3413, 1074, 3911] SoftWeight: 0.2000
+[Target Epoch 21] Temporal_Stable: 16472/17941 History_Disagrees: 8 Label_Flips: 2846 Retention_By_Class: [1. 1. 1. 1. 1. 1. 1.] Warmup: False
+[Target Epoch 21] Temporal_Mode: observe Rejected_By_Class: [0, 0, 0, 0, 0, 0, 0]
+[Target Epoch 21] Source CE: 0.0264 Target CE: 0.1806 Accepted_Targets: 17941
+[Target Epoch 21] Prototype_Agreement: 17928/17941 (0.9993) Mean_Assigned_Cosine: 0.9523 Target_Prototype_Counts: [ 45392,   7709,   6346, 121392,  57598,  18558,  64018]
+[Target Epoch 21] Classification Loss: 0.086 Affinity Loss: -0.196 Weight Loss: 0.438 Prototype Loss: 0.258 ProtoWeight: 0.1000 LR: 0.000142
+[Epoch 21] Target Validation Student accuracy: 0.5676. Loss: 2.032
+[Epoch 21] Target Validation Student recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7446 0.0625 0.2679 0.8726 0.5651 0.3362 0.6178] Macro Recall: 0.4952
+[Epoch 21] Target Validation EMA accuracy: 0.5695. Loss: 1.699
+[Epoch 21] Target Validation EMA recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.759  0.0665 0.2857 0.876  0.5528 0.3212 0.6343] Macro Recall: 0.4994
+[Target Epoch 22] class mean confidence: [0.8651 0.8595 0.7841 0.8902 0.8062 0.8286 0.8108] global_mean: 0.8349 threshold_center: 0.8549
+[Target Epoch 22] class-adaptive thresholds: [0.87   0.8672 0.8295 0.8825 0.8406 0.8518 0.8428]
+[Target Epoch 22] Agreement_Num: 25945 Confident_Num: 18037 Pseudo_Distribution: [2316,  484,  371, 6430, 3444, 1046, 3946]
+[Target Epoch 22] Dual_Pseudo_Distribution: [2316,  484,  371, 6430, 3444, 1046, 3946] SoftWeight: 0.2000
+[Target Epoch 22] Temporal_Stable: 16549/18037 History_Disagrees: 6 Label_Flips: 2897 Retention_By_Class: [1. 1. 1. 1. 1. 1. 1.] Warmup: False
+[Target Epoch 22] Temporal_Mode: observe Rejected_By_Class: [0, 0, 0, 0, 0, 0, 0]
+[Target Epoch 22] Source CE: 0.0283 Target CE: 0.1734 Accepted_Targets: 18037
+[Target Epoch 22] Prototype_Agreement: 18021/18037 (0.9991) Mean_Assigned_Cosine: 0.9521 Target_Prototype_Counts: [ 47708,   8193,   6717, 127822,  61042,  19604,  67964]
+[Target Epoch 22] Classification Loss: 0.084 Affinity Loss: -0.186 Weight Loss: 0.437 Prototype Loss: 0.247 ProtoWeight: 0.1000 LR: 0.000135
+[Epoch 22] Target Validation Student accuracy: 0.5687. Loss: 2.002
+[Epoch 22] Target Validation Student recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7614 0.0685 0.2679 0.8737 0.536  0.3041 0.6623] Macro Recall: 0.4963
+[Epoch 22] Target Validation EMA accuracy: 0.5676. Loss: 1.698
+[Epoch 22] Target Validation EMA recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7566 0.0685 0.3036 0.876  0.5528 0.3084 0.631 ] Macro Recall: 0.4996
+[Target Epoch 23] class mean confidence: [0.8606 0.8727 0.7939 0.8906 0.8052 0.8346 0.8095] global_mean: 0.8382 threshold_center: 0.8582
+[Target Epoch 23] class-adaptive thresholds: [0.8694 0.8755 0.8361 0.8844 0.8417 0.8564 0.8438]
+[Target Epoch 23] Agreement_Num: 25944 Confident_Num: 18135 Pseudo_Distribution: [2326,  484,  392, 6447, 3495, 1046, 3945]
+[Target Epoch 23] Dual_Pseudo_Distribution: [2326,  484,  392, 6447, 3495, 1046, 3945] SoftWeight: 0.2000
+[Target Epoch 23] Temporal_Stable: 16633/18135 History_Disagrees: 9 Label_Flips: 2821 Retention_By_Class: [1. 1. 1. 1. 1. 1. 1.] Warmup: False
+[Target Epoch 23] Temporal_Mode: observe Rejected_By_Class: [0, 0, 0, 0, 0, 0, 0]
+[Target Epoch 23] Source CE: 0.0265 Target CE: 0.1770 Accepted_Targets: 18135
+[Target Epoch 23] Prototype_Agreement: 18117/18135 (0.9990) Mean_Assigned_Cosine: 0.9521 Target_Prototype_Counts: [ 50034,   8677,   7109, 134269,  64537,  20650,  71909]
+[Target Epoch 23] Classification Loss: 0.085 Affinity Loss: -0.181 Weight Loss: 0.437 Prototype Loss: 0.247 ProtoWeight: 0.1000 LR: 0.000129
+[Epoch 23] Target Validation Student accuracy: 0.5645. Loss: 2.016
+[Epoch 23] Target Validation Student recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7325 0.0645 0.2857 0.8693 0.5727 0.2976 0.631 ] Macro Recall: 0.4933
+[Epoch 23] Target Validation EMA accuracy: 0.5653. Loss: 1.703
+[Epoch 23] Target Validation EMA recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.747  0.0665 0.2857 0.876  0.5559 0.3019 0.6293] Macro Recall: 0.4946
+[Target Epoch 24] class mean confidence: [0.8672 0.877  0.7923 0.8903 0.8064 0.8309 0.8146] global_mean: 0.8398 threshold_center: 0.8598
+[Target Epoch 24] class-adaptive thresholds: [0.8735 0.8784 0.8361 0.885  0.8431 0.8554 0.8472]
+[Target Epoch 24] Agreement_Num: 26014 Confident_Num: 18137 Pseudo_Distribution: [2305,  475,  410, 6413, 3499, 1070, 3965]
+[Target Epoch 24] Dual_Pseudo_Distribution: [2305,  475,  410, 6413, 3499, 1070, 3965] SoftWeight: 0.2000
+[Target Epoch 24] Temporal_Stable: 16674/18137 History_Disagrees: 10 Label_Flips: 2752 Retention_By_Class: [1. 1. 1. 1. 1. 1. 1.] Warmup: False
+[Target Epoch 24] Temporal_Mode: observe Rejected_By_Class: [0, 0, 0, 0, 0, 0, 0]
+[Target Epoch 24] Source CE: 0.0234 Target CE: 0.1674 Accepted_Targets: 18137
+[Target Epoch 24] Prototype_Agreement: 18127/18137 (0.9994) Mean_Assigned_Cosine: 0.9520 Target_Prototype_Counts: [ 52339,   9152,   7519, 140682,  68036,  21720,  75874]
+[Target Epoch 24] Classification Loss: 0.079 Affinity Loss: -0.172 Weight Loss: 0.437 Prototype Loss: 0.234 ProtoWeight: 0.1000 LR: 0.000122
+[Epoch 24] Target Validation Student accuracy: 0.5706. Loss: 2.018
+[Epoch 24] Target Validation Student recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.759  0.0645 0.3036 0.8592 0.5605 0.3169 0.6606] Macro Recall: 0.5035
+[Epoch 24] Target Validation EMA accuracy: 0.5670. Loss: 1.701
+[Epoch 24] Target Validation EMA recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7373 0.0665 0.2857 0.8782 0.5636 0.3019 0.6343] Macro Recall: 0.4954
+best target-stage validation accuracy 0.5706 (student)
+[Target Epoch 25] class mean confidence: [0.8658 0.885  0.7904 0.8915 0.8118 0.8324 0.811 ] global_mean: 0.8411 threshold_center: 0.8611
+[Target Epoch 25] class-adaptive thresholds: [0.8734 0.8831 0.8358 0.8863 0.8464 0.8567 0.8461]
+[Target Epoch 25] Agreement_Num: 26069 Confident_Num: 18204 Pseudo_Distribution: [2306,  497,  406, 6479, 3499, 1067, 3950]
+[Target Epoch 25] Dual_Pseudo_Distribution: [2306,  497,  406, 6479, 3499, 1067, 3950] SoftWeight: 0.2000
+[Target Epoch 25] Temporal_Stable: 16730/18204 History_Disagrees: 8 Label_Flips: 2726 Retention_By_Class: [1. 1. 1. 1. 1. 1. 1.] Warmup: False
+[Target Epoch 25] Temporal_Mode: observe Rejected_By_Class: [0, 0, 0, 0, 0, 0, 0]
+[Target Epoch 25] Source CE: 0.0227 Target CE: 0.1684 Accepted_Targets: 18204
+[Target Epoch 25] Prototype_Agreement: 18196/18204 (0.9996) Mean_Assigned_Cosine: 0.9522 Target_Prototype_Counts: [ 54645,   9649,   7925, 147161,  71535,  22787,  79824]
+[Target Epoch 25] Classification Loss: 0.079 Affinity Loss: -0.183 Weight Loss: 0.436 Prototype Loss: 0.239 ProtoWeight: 0.1000 LR: 0.000116
+[Epoch 25] Target Validation Student accuracy: 0.5656. Loss: 2.125
+[Epoch 25] Target Validation Student recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7325 0.0706 0.2857 0.8816 0.5636 0.2998 0.6227] Macro Recall: 0.4938
+[Epoch 25] Target Validation EMA accuracy: 0.5670. Loss: 1.699
+[Epoch 25] Target Validation EMA recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7398 0.0645 0.3036 0.8804 0.5605 0.2998 0.6343] Macro Recall: 0.4975
+[Target Epoch 26] class mean confidence: [0.8674 0.8816 0.7869 0.893  0.8055 0.837  0.8119] global_mean: 0.8405 threshold_center: 0.8605
+[Target Epoch 26] class-adaptive thresholds: [0.874  0.881  0.8337 0.8867 0.843  0.8587 0.8462]
+[Target Epoch 26] Agreement_Num: 26097 Confident_Num: 18216 Pseudo_Distribution: [2297,  493,  390, 6488, 3501, 1069, 3978]
+[Target Epoch 26] Dual_Pseudo_Distribution: [2297,  493,  390, 6488, 3501, 1069, 3978] SoftWeight: 0.2000
+[Target Epoch 26] Temporal_Stable: 16808/18216 History_Disagrees: 10 Label_Flips: 2678 Retention_By_Class: [1. 1. 1. 1. 1. 1. 1.] Warmup: False
+[Target Epoch 26] Temporal_Mode: observe Rejected_By_Class: [0, 0, 0, 0, 0, 0, 0]
+[Target Epoch 26] Source CE: 0.0223 Target CE: 0.1680 Accepted_Targets: 18216
+[Target Epoch 26] Prototype_Agreement: 18209/18216 (0.9996) Mean_Assigned_Cosine: 0.9518 Target_Prototype_Counts: [ 56942,  10142,   8315, 153649,  75036,  23856,  83802]
+[Target Epoch 26] Classification Loss: 0.079 Affinity Loss: -0.184 Weight Loss: 0.436 Prototype Loss: 0.230 ProtoWeight: 0.1000 LR: 0.000110
+[Epoch 26] Target Validation Student accuracy: 0.5670. Loss: 2.055
+[Epoch 26] Target Validation Student recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7566 0.0645 0.2321 0.867  0.5544 0.3105 0.6474] Macro Recall: 0.4904
+[Epoch 26] Target Validation EMA accuracy: 0.5673. Loss: 1.699
+[Epoch 26] Target Validation EMA recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7422 0.0645 0.2857 0.8804 0.562  0.2998 0.6343] Macro Recall: 0.4956
+[Target Epoch 27] class mean confidence: [0.863  0.891  0.7908 0.8932 0.8075 0.8382 0.8146] global_mean: 0.8426 threshold_center: 0.8626
+[Target Epoch 27] class-adaptive thresholds: [0.8728 0.8868 0.8367 0.8879 0.845  0.8604 0.8486]
+[Target Epoch 27] Agreement_Num: 26074 Confident_Num: 18303 Pseudo_Distribution: [2298,  493,  395, 6516, 3527, 1055, 4019]
+[Target Epoch 27] Dual_Pseudo_Distribution: [2298,  493,  395, 6516, 3527, 1055, 4019] SoftWeight: 0.2000
+[Target Epoch 27] Temporal_Stable: 16861/18303 History_Disagrees: 2 Label_Flips: 2618 Retention_By_Class: [1. 1. 1. 1. 1. 1. 1.] Warmup: False
+[Target Epoch 27] Temporal_Mode: observe Rejected_By_Class: [0, 0, 0, 0, 0, 0, 0]
+[Target Epoch 27] Source CE: 0.0200 Target CE: 0.1720 Accepted_Targets: 18303
+[Target Epoch 27] Prototype_Agreement: 18288/18303 (0.9992) Mean_Assigned_Cosine: 0.9520 Target_Prototype_Counts: [ 59240,  10635,   8710, 160165,  78563,  24911,  87821]
+[Target Epoch 27] Classification Loss: 0.079 Affinity Loss: -0.190 Weight Loss: 0.436 Prototype Loss: 0.243 ProtoWeight: 0.1000 LR: 0.000105
+[Epoch 27] Target Validation Student accuracy: 0.5592. Loss: 2.058
+[Epoch 27] Target Validation Student recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7566 0.0665 0.2679 0.8659 0.536  0.3126 0.6161] Macro Recall: 0.4888
+[Epoch 27] Target Validation EMA accuracy: 0.5667. Loss: 1.700
+[Epoch 27] Target Validation EMA recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7446 0.0645 0.2857 0.8804 0.5559 0.3019 0.6343] Macro Recall: 0.4953
+[Target Epoch 28] class mean confidence: [0.8635 0.8831 0.789  0.8936 0.806  0.8377 0.8133] global_mean: 0.8409 threshold_center: 0.8609
+[Target Epoch 28] class-adaptive thresholds: [0.8722 0.882  0.8349 0.8873 0.8434 0.8593 0.8471]
+[Target Epoch 28] Agreement_Num: 26078 Confident_Num: 18435 Pseudo_Distribution: [2286,  503,  394, 6563, 3520, 1071, 4098]
+[Target Epoch 28] Dual_Pseudo_Distribution: [2286,  503,  394, 6563, 3520, 1071, 4098] SoftWeight: 0.2000
+[Target Epoch 28] Temporal_Stable: 16990/18435 History_Disagrees: 4 Label_Flips: 2572 Retention_By_Class: [1. 1. 1. 1. 1. 1. 1.] Warmup: False
+[Target Epoch 28] Temporal_Mode: observe Rejected_By_Class: [0, 0, 0, 0, 0, 0, 0]
+[Target Epoch 28] Source CE: 0.0211 Target CE: 0.1689 Accepted_Targets: 18435
+[Target Epoch 28] Prototype_Agreement: 18424/18435 (0.9994) Mean_Assigned_Cosine: 0.9518 Target_Prototype_Counts: [ 61526,  11138,   9104, 166728,  82083,  25982,  91919]
+[Target Epoch 28] Classification Loss: 0.079 Affinity Loss: -0.185 Weight Loss: 0.436 Prototype Loss: 0.229 ProtoWeight: 0.1000 LR: 0.000099
+[Epoch 28] Target Validation Student accuracy: 0.5651. Loss: 2.096
+[Epoch 28] Target Validation Student recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7422 0.0665 0.3036 0.8603 0.5544 0.2998 0.6557] Macro Recall: 0.4975
+[Epoch 28] Target Validation EMA accuracy: 0.5695. Loss: 1.702
+[Epoch 28] Target Validation EMA recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7446 0.0645 0.3036 0.8804 0.5574 0.3019 0.6474] Macro Recall: 0.5000
+[Target Epoch 29] class mean confidence: [0.8633 0.8776 0.8    0.8949 0.8068 0.8381 0.8129] global_mean: 0.8419 threshold_center: 0.8619
+[Target Epoch 29] class-adaptive thresholds: [0.8726 0.8798 0.8409 0.8884 0.8443 0.86   0.8474]
+[Target Epoch 29] Agreement_Num: 26169 Confident_Num: 18332 Pseudo_Distribution: [2244,  498,  398, 6556, 3491, 1078, 4067]
+[Target Epoch 29] Dual_Pseudo_Distribution: [2244,  498,  398, 6556, 3491, 1078, 4067] SoftWeight: 0.2000
+[Target Epoch 29] Temporal_Stable: 16969/18332 History_Disagrees: 4 Label_Flips: 2560 Retention_By_Class: [1. 1. 1. 1. 1. 1. 1.] Warmup: False
+[Target Epoch 29] Temporal_Mode: observe Rejected_By_Class: [0, 0, 0, 0, 0, 0, 0]
+[Target Epoch 29] Source CE: 0.0201 Target CE: 0.1687 Accepted_Targets: 18332
+[Target Epoch 29] Prototype_Agreement: 18321/18332 (0.9994) Mean_Assigned_Cosine: 0.9522 Target_Prototype_Counts: [ 63770,  11636,   9502, 173284,  85574,  27060,  95986]
+[Target Epoch 29] Classification Loss: 0.078 Affinity Loss: -0.196 Weight Loss: 0.435 Prototype Loss: 0.229 ProtoWeight: 0.1000 LR: 0.000094
+[Epoch 29] Target Validation Student accuracy: 0.5667. Loss: 2.025
+[Epoch 29] Target Validation Student recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7133 0.0746 0.3036 0.8872 0.5605 0.2934 0.6376] Macro Recall: 0.4957
+[Epoch 29] Target Validation EMA accuracy: 0.5698. Loss: 1.694
+[Epoch 29] Target Validation EMA recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7398 0.0665 0.3036 0.8793 0.5605 0.3019 0.6491] Macro Recall: 0.5001
+[Epoch 30] Target Test accuracy: 0.5584. Loss: 2.058
+[Epoch 30] Target Test recall [surprise, fear, disgust, happy, sad, angry, neutral]: [0.7163 0.0758 0.2364 0.8623 0.5758 0.3035 0.6454] Macro Recall: 0.4879
+best source-stage validation accuracy 0.5107
+best target-stage validation accuracy 0.5706
+selected validation accuracy 0.5706
+selected model student
+final target test accuracy 0.5584

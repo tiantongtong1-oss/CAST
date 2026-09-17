@@ -1,0 +1,150 @@
+---------------------------------------------------------------------------------------
+Improved CAST: mobilenet_v2, source rafdb, target fer
+w1:4.0 w2:0.3 w3:0.1 phi:1.4 ema:0.999 lambda_t:1.0 lambda_aff:0.1
+---------------------------------------------------------------------------------------
+The dataset distribute: 1290, 281, 717, 4772, 1982, 705, 2524
+FER train split (train), samples: 28709
+The dataset distribute: 3171, 4097, 436, 7215, 4830, 3995, 4965
+FER train split (train), samples: 28709
+The dataset distribute: 3171, 4097, 436, 7215, 4830, 3995, 4965
+FER val split (val), samples: 3589
+The dataset distribute: 415, 496, 56, 895, 653, 467, 607
+FER test split (test), samples: 3589
+The dataset distribute: 416, 528, 55, 879, 594, 491, 626
+[Source Epoch 0] Training accuracy: 0.6112. Classification Loss: 1.253 Class Enhancement: -0.028 Weight Loss: 0.506 LR: 0.000950
+[Epoch 0] Target Validation accuracy: 0.3578. Loss: 1.813
+best source-stage validation accuracy 0.3578
+[Source Epoch 1] Training accuracy: 0.7545. Classification Loss: 0.903 Class Enhancement: -0.062 Weight Loss: 0.486 LR: 0.000902
+[Epoch 1] Target Validation accuracy: 0.4439. Loss: 1.551
+best source-stage validation accuracy 0.4439
+[Source Epoch 2] Training accuracy: 0.7893. Classification Loss: 0.785 Class Enhancement: -0.055 Weight Loss: 0.474 LR: 0.000857
+[Epoch 2] Target Validation accuracy: 0.4589. Loss: 1.543
+best source-stage validation accuracy 0.4589
+[Source Epoch 3] Training accuracy: 0.8140. Classification Loss: 0.692 Class Enhancement: -0.059 Weight Loss: 0.465 LR: 0.000815
+[Epoch 3] Target Validation accuracy: 0.4464. Loss: 1.584
+[Source Epoch 4] Training accuracy: 0.8341. Classification Loss: 0.622 Class Enhancement: -0.066 Weight Loss: 0.461 LR: 0.000774
+[Epoch 4] Target Validation accuracy: 0.4737. Loss: 1.570
+best source-stage validation accuracy 0.4737
+[Source Epoch 5] Training accuracy: 0.8531. Classification Loss: 0.558 Class Enhancement: -0.077 Weight Loss: 0.457 LR: 0.000735
+[Epoch 5] Target Validation accuracy: 0.4681. Loss: 1.566
+[Source Epoch 6] Training accuracy: 0.8591. Classification Loss: 0.528 Class Enhancement: -0.095 Weight Loss: 0.456 LR: 0.000698
+[Epoch 6] Target Validation accuracy: 0.4776. Loss: 1.543
+best source-stage validation accuracy 0.4776
+[Source Epoch 7] Training accuracy: 0.8712. Classification Loss: 0.482 Class Enhancement: -0.094 Weight Loss: 0.455 LR: 0.000663
+[Epoch 7] Target Validation accuracy: 0.4737. Loss: 1.603
+[Source Epoch 8] Training accuracy: 0.8830. Classification Loss: 0.450 Class Enhancement: -0.109 Weight Loss: 0.454 LR: 0.000630
+[Epoch 8] Target Validation accuracy: 0.4720. Loss: 1.614
+[Source Epoch 9] Training accuracy: 0.8950. Classification Loss: 0.409 Class Enhancement: -0.107 Weight Loss: 0.454 LR: 0.000599
+[Epoch 9] Target Validation accuracy: 0.4845. Loss: 1.666
+best source-stage validation accuracy 0.4845
+[Source Epoch 10] Training accuracy: 0.9006. Classification Loss: 0.386 Class Enhancement: -0.111 Weight Loss: 0.454 LR: 0.000569
+[Epoch 10] Target Validation accuracy: 0.4932. Loss: 1.627
+best source-stage validation accuracy 0.4932
+[Source Epoch 11] Training accuracy: 0.9147. Classification Loss: 0.343 Class Enhancement: -0.122 Weight Loss: 0.450 LR: 0.000540
+[Epoch 11] Target Validation accuracy: 0.4854. Loss: 1.696
+[Source Epoch 12] Training accuracy: 0.9213. Classification Loss: 0.323 Class Enhancement: -0.131 Weight Loss: 0.450 LR: 0.000513
+[Epoch 12] Target Validation accuracy: 0.4809. Loss: 1.647
+[Source Epoch 13] Training accuracy: 0.9298. Classification Loss: 0.300 Class Enhancement: -0.158 Weight Loss: 0.450 LR: 0.000488
+[Epoch 13] Target Validation accuracy: 0.4954. Loss: 1.654
+best source-stage validation accuracy 0.4954
+[Source Epoch 14] Training accuracy: 0.9346. Classification Loss: 0.275 Class Enhancement: -0.169 Weight Loss: 0.450 LR: 0.000463
+[Epoch 14] Target Validation accuracy: 0.4801. Loss: 1.692
+[Source Epoch 15] Training accuracy: 0.9377. Classification Loss: 0.263 Class Enhancement: -0.199 Weight Loss: 0.450 LR: 0.000440
+[Epoch 15] Target Validation accuracy: 0.4873. Loss: 1.657
+[Source Epoch 16] Training accuracy: 0.9443. Classification Loss: 0.237 Class Enhancement: -0.192 Weight Loss: 0.449 LR: 0.000418
+[Epoch 16] Target Validation accuracy: 0.4893. Loss: 1.692
+[Source Epoch 17] Training accuracy: 0.9519. Classification Loss: 0.221 Class Enhancement: -0.229 Weight Loss: 0.449 LR: 0.000397
+[Epoch 17] Target Validation accuracy: 0.4893. Loss: 1.809
+[Source Epoch 18] Training accuracy: 0.9564. Classification Loss: 0.206 Class Enhancement: -0.206 Weight Loss: 0.449 LR: 0.000377
+[Epoch 18] Target Validation accuracy: 0.4901. Loss: 1.830
+[Source Epoch 19] Training accuracy: 0.9592. Classification Loss: 0.192 Class Enhancement: -0.219 Weight Loss: 0.448 LR: 0.000358
+[Epoch 19] Target Validation accuracy: 0.5021. Loss: 1.770
+best source-stage validation accuracy 0.5021
+[Source Epoch 20] Training accuracy: 0.9648. Classification Loss: 0.175 Class Enhancement: -0.227 Weight Loss: 0.449 LR: 0.000341
+[Epoch 20] Target Validation accuracy: 0.4957. Loss: 1.785
+[Source Epoch 21] Training accuracy: 0.9694. Classification Loss: 0.166 Class Enhancement: -0.244 Weight Loss: 0.448 LR: 0.000324
+[Epoch 21] Target Validation accuracy: 0.4837. Loss: 1.845
+[Source Epoch 22] Training accuracy: 0.9694. Classification Loss: 0.158 Class Enhancement: -0.256 Weight Loss: 0.448 LR: 0.000307
+[Epoch 22] Target Validation accuracy: 0.5026. Loss: 1.780
+best source-stage validation accuracy 0.5026
+[Source Epoch 23] Training accuracy: 0.9725. Classification Loss: 0.148 Class Enhancement: -0.256 Weight Loss: 0.447 LR: 0.000292
+[Epoch 23] Target Validation accuracy: 0.4859. Loss: 1.861
+[Source Epoch 24] Training accuracy: 0.9738. Classification Loss: 0.138 Class Enhancement: -0.256 Weight Loss: 0.447 LR: 0.000277
+[Epoch 24] Target Validation accuracy: 0.5035. Loss: 1.822
+best source-stage validation accuracy 0.5035
+[Source Epoch 25] Training accuracy: 0.9778. Classification Loss: 0.132 Class Enhancement: -0.259 Weight Loss: 0.447 LR: 0.000264
+[Epoch 25] Target Validation accuracy: 0.4759. Loss: 1.956
+[Source Epoch 26] Training accuracy: 0.9786. Classification Loss: 0.123 Class Enhancement: -0.242 Weight Loss: 0.446 LR: 0.000250
+[Epoch 26] Target Validation accuracy: 0.4904. Loss: 1.886
+[Source Epoch 27] Training accuracy: 0.9800. Classification Loss: 0.119 Class Enhancement: -0.266 Weight Loss: 0.446 LR: 0.000238
+[Epoch 27] Target Validation accuracy: 0.4887. Loss: 1.859
+[Source Epoch 28] Training accuracy: 0.9824. Classification Loss: 0.110 Class Enhancement: -0.242 Weight Loss: 0.446 LR: 0.000226
+[Epoch 28] Target Validation accuracy: 0.4870. Loss: 1.872
+[Source Epoch 29] Training accuracy: 0.9836. Classification Loss: 0.106 Class Enhancement: -0.284 Weight Loss: 0.446 LR: 0.000215
+[Epoch 29] Target Validation accuracy: 0.5043. Loss: 1.861
+best source-stage validation accuracy 0.5043
+[Target Epoch 0] class-wise thresholds: [0.6788 0.5638 0.5908 0.6761 0.6573 0.7066 0.5987]
+[Target Epoch 0] corrected target prior: [0.1418 0.0757 0.0959 0.2287 0.1577 0.1033 0.1967]
+[Target Epoch 0] Agreement_Num: 22084 Confident_Num: 4499 Pseudo_Distribution: [ 543,  547, 1055,   49,  841,  444, 1020]
+[Target Epoch 0] SourceCE: 0.078 TargetCE: 0.389 lambda_t: 0.200 DDRL: -0.136 (Domain: 0.002 ClassSep: -0.137) ProtoAff: 0.416 lambda_aff: 0.000 Classifier: 0.443 LR: 0.000204
+[Epoch 0] Target Validation accuracy: 0.4280. Loss: 2.049
+best target-stage validation accuracy 0.4280
+[Target Epoch 1] class-wise thresholds: [0.7236 0.7078 0.624  0.7373 0.7211 0.6897 0.6501]
+[Target Epoch 1] corrected target prior: [0.1349 0.1022 0.141  0.1959 0.1442 0.1055 0.1764]
+[Target Epoch 1] Agreement_Num: 22394 Confident_Num: 3668 Pseudo_Distribution: [398, 523, 819,   2, 613, 580, 733]
+[Target Epoch 1] SourceCE: 0.072 TargetCE: 0.258 lambda_t: 0.400 DDRL: -0.129 (Domain: 0.001 ClassSep: -0.131) ProtoAff: 0.381 lambda_aff: 0.000 Classifier: 0.439 LR: 0.000194
+[Epoch 1] Target Validation accuracy: 0.4581. Loss: 2.133
+best target-stage validation accuracy 0.4581
+[Target Epoch 2] class-wise thresholds: [0.7305 0.7236 0.6421 0.7231 0.7265 0.7137 0.6619]
+[Target Epoch 2] corrected target prior: [0.1359 0.1075 0.1438 0.1859 0.1436 0.1089 0.1744]
+[Target Epoch 2] Agreement_Num: 22636 Confident_Num: 3875 Pseudo_Distribution: [439, 573, 795,  15, 648, 647, 758]
+[Target Epoch 2] SourceCE: 0.072 TargetCE: 0.209 lambda_t: 0.600 DDRL: -0.107 (Domain: 0.000 ClassSep: -0.108) ProtoAff: 0.366 lambda_aff: 0.020 Classifier: 0.437 LR: 0.000184
+[Epoch 2] Target Validation accuracy: 0.4492. Loss: 2.094
+[Target Epoch 3] class-wise thresholds: [0.7483 0.7521 0.6487 0.7124 0.7313 0.7266 0.6743]
+[Target Epoch 3] corrected target prior: [0.1331 0.1082 0.1438 0.1805 0.1461 0.1119 0.1763]
+[Target Epoch 3] Agreement_Num: 22786 Confident_Num: 3923 Pseudo_Distribution: [407, 511, 828,  50, 682, 667, 778]
+[Target Epoch 3] SourceCE: 0.074 TargetCE: 0.186 lambda_t: 0.800 DDRL: -0.122 (Domain: 0.000 ClassSep: -0.122) ProtoAff: 0.358 lambda_aff: 0.040 Classifier: 0.436 LR: 0.000175
+[Epoch 3] Target Validation accuracy: 0.4361. Loss: 2.242
+[Target Epoch 4] class-wise thresholds: [0.7602 0.7637 0.6597 0.7072 0.7419 0.746  0.6835]
+[Target Epoch 4] corrected target prior: [0.1312 0.1093 0.1443 0.1764 0.1463 0.1152 0.1773]
+[Target Epoch 4] Agreement_Num: 22915 Confident_Num: 4040 Pseudo_Distribution: [449, 550, 834,  73, 664, 691, 779]
+[Target Epoch 4] SourceCE: 0.078 TargetCE: 0.150 lambda_t: 1.000 DDRL: -0.116 (Domain: -0.000 ClassSep: -0.115) ProtoAff: 0.350 lambda_aff: 0.060 Classifier: 0.435 LR: 0.000166
+[Epoch 4] Target Validation accuracy: 0.4377. Loss: 2.306
+[Target Epoch 5] class-wise thresholds: [0.7707 0.7752 0.6712 0.7037 0.7526 0.7516 0.6952]
+[Target Epoch 5] corrected target prior: [0.132  0.1096 0.1459 0.1731 0.145  0.117  0.1774]
+[Target Epoch 5] Agreement_Num: 22982 Confident_Num: 4111 Pseudo_Distribution: [407, 548, 873,  84, 644, 728, 827]
+[Target Epoch 5] SourceCE: 0.068 TargetCE: 0.138 lambda_t: 1.000 DDRL: -0.109 (Domain: 0.001 ClassSep: -0.109) ProtoAff: 0.344 lambda_aff: 0.080 Classifier: 0.434 LR: 0.000158
+[Epoch 5] Target Validation accuracy: 0.4511. Loss: 2.288
+[Target Epoch 6] class-wise thresholds: [0.7762 0.7875 0.6816 0.6946 0.7632 0.7643 0.7102]
+[Target Epoch 6] corrected target prior: [0.1304 0.1094 0.148  0.1702 0.1453 0.1183 0.1784]
+[Target Epoch 6] Agreement_Num: 23147 Confident_Num: 4103 Pseudo_Distribution: [466, 539, 885, 141, 629, 732, 711]
+[Target Epoch 6] SourceCE: 0.068 TargetCE: 0.123 lambda_t: 1.000 DDRL: -0.115 (Domain: 0.000 ClassSep: -0.115) ProtoAff: 0.341 lambda_aff: 0.100 Classifier: 0.433 LR: 0.000150
+[Epoch 6] Target Validation accuracy: 0.4305. Loss: 2.422
+[Target Epoch 7] class-wise thresholds: [0.7872 0.802  0.6919 0.6859 0.7698 0.7726 0.7233]
+[Target Epoch 7] corrected target prior: [0.1305 0.1092 0.1488 0.1677 0.145  0.1195 0.1794]
+[Target Epoch 7] Agreement_Num: 23219 Confident_Num: 4243 Pseudo_Distribution: [451, 551, 923, 220, 637, 770, 691]
+[Target Epoch 7] SourceCE: 0.060 TargetCE: 0.120 lambda_t: 1.000 DDRL: -0.104 (Domain: 0.000 ClassSep: -0.104) ProtoAff: 0.337 lambda_aff: 0.100 Classifier: 0.433 LR: 0.000142
+[Epoch 7] Target Validation accuracy: 0.4597. Loss: 2.287
+best target-stage validation accuracy 0.4597
+[Target Epoch 8] class-wise thresholds: [0.7944 0.8106 0.7009 0.6777 0.7756 0.7895 0.7353]
+[Target Epoch 8] corrected target prior: [0.1299 0.1095 0.1496 0.1663 0.1458 0.1203 0.1785]
+[Target Epoch 8] Agreement_Num: 23325 Confident_Num: 4317 Pseudo_Distribution: [464, 551, 965, 316, 634, 741, 646]
+[Target Epoch 8] SourceCE: 0.055 TargetCE: 0.126 lambda_t: 1.000 DDRL: -0.110 (Domain: 0.001 ClassSep: -0.111) ProtoAff: 0.340 lambda_aff: 0.100 Classifier: 0.433 LR: 0.000135
+[Epoch 8] Target Validation accuracy: 0.4450. Loss: 2.388
+[Target Epoch 9] class-wise thresholds: [0.8014 0.8179 0.7031 0.6655 0.79   0.7892 0.7436]
+[Target Epoch 9] corrected target prior: [0.1296 0.1098 0.1523 0.1656 0.1446 0.1196 0.1786]
+[Target Epoch 9] Agreement_Num: 23362 Confident_Num: 4456 Pseudo_Distribution: [454, 566, 986, 499, 555, 792, 604]
+[Target Epoch 9] SourceCE: 0.057 TargetCE: 0.098 lambda_t: 1.000 DDRL: -0.110 (Domain: 0.000 ClassSep: -0.111) ProtoAff: 0.334 lambda_aff: 0.100 Classifier: 0.433 LR: 0.000129
+[Epoch 9] Target Validation accuracy: 0.4271. Loss: 2.426
+[Target Epoch 10] class-wise thresholds: [0.7979 0.8276 0.7167 0.6598 0.7985 0.7994 0.7515]
+[Target Epoch 10] corrected target prior: [0.1287 0.1103 0.153  0.1657 0.1436 0.1207 0.178 ]
+[Target Epoch 10] Agreement_Num: 23448 Confident_Num: 4627 Pseudo_Distribution: [509, 538, 966, 653, 562, 796, 603]
+[Target Epoch 10] SourceCE: 0.050 TargetCE: 0.089 lambda_t: 1.000 DDRL: -0.121 (Domain: 0.001 ClassSep: -0.122) ProtoAff: 0.333 lambda_aff: 0.100 Classifier: 0.433 LR: 0.000122
+[Epoch 10] Target Validation accuracy: 0.4347. Loss: 2.420
+[Target Epoch 11] class-wise thresholds: [0.8009 0.8329 0.7254 0.6584 0.8071 0.8135 0.7588]
+[Target Epoch 11] corrected target prior: [0.1295 0.1092 0.1532 0.1663 0.1435 0.1215 0.1769]
+[Target Epoch 11] Agreement_Num: 23469 Confident_Num: 4696 Pseudo_Distribution: [502, 551, 975, 809, 518, 769, 572]
+[Target Epoch 11] SourceCE: 0.047 TargetCE: 0.107 lambda_t: 1.000 DDRL: -0.115 (Domain: 0.001 ClassSep: -0.116) ProtoAff: 0.337 lambda_aff: 0.100 Classifier: 0.433 LR: 0.000116
+[Epoch 11] Target Validation accuracy: 0.4402. Loss: 2.352
+[Target Epoch 12] class-wise thresholds: [0.8046 0.8345 0.7306 0.6623 0.8079 0.8322 0.7613]
+[Target Epoch 12] corrected target prior: [0.1297 0.1098 0.1521 0.1683 0.1437 0.1211 0.1753]
