@@ -72,7 +72,7 @@ def parse_args():
     parser.add_argument('--threshold_max', type=float, default=0.95,
                         help='maximum class-adaptive threshold')
 
-    # Prototype-consistency regularizer retained from v1.
+    # Prototype-consistency regularizer retained from v1/v2.
     parser.add_argument('--proto_weight', type=float, default=0.10,
                         help='maximum prototype-consistency loss weight')
     parser.add_argument('--proto_temperature', type=float, default=0.20,
@@ -86,22 +86,22 @@ def parse_args():
     parser.add_argument('--proto_ramp_epochs', type=int, default=5,
                         help='epochs used to linearly ramp prototype loss to full weight')
 
-    # Prototype-consistency v2: source class-distribution energy gate.
+    # Prototype-consistency v3: energy can rescue an agreed low-confidence label.
     parser.set_defaults(energy_gate=True)
     parser.add_argument('--energy_gate', dest='energy_gate', action='store_true',
-                        help='enable source class-distribution pseudo-label gating (default)')
+                        help='enable source class-distribution energy OR rescue (default)')
     parser.add_argument('--no_energy_gate', dest='energy_gate', action='store_false',
-                        help='disable the class-distribution energy gate')
+                        help='disable energy-based pseudo-label rescue')
     parser.add_argument('--energy_bandwidth', type=float, default=1.0,
                         help='dimension-normalized KDE bandwidth multiplier')
-    parser.add_argument('--energy_quantile', type=float, default=0.95,
-                        help='source leave-one-out log-energy quantile used per class')
+    parser.add_argument('--energy_quantile', type=float, default=0.75,
+                        help='source leave-one-out log-energy quantile used for strong rescue')
     parser.add_argument('--energy_cov_shrinkage', type=float, default=0.05,
                         help='shrinkage strength for each source class covariance')
     parser.add_argument('--energy_max_density_samples', type=int, default=256,
                         help='maximum source representatives per class for local density')
     parser.add_argument('--energy_warmup_epochs', type=int, default=1,
-                        help='target epochs that log energy but do not enforce its gate')
+                        help='target epochs that log energy but do not enable OR rescue')
     parser.add_argument('--energy_refresh_interval', type=int, default=1,
                         help='rebuild source distributions every N target epochs')
 
@@ -311,16 +311,16 @@ def run_training():
     source_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_prototype_consistency_v2_source_best.pth'
+        + '_prototype_consistency_v3_source_best.pth'
     )
     target_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_prototype_consistency_v2_target_best.pth'
+        + '_prototype_consistency_v3_target_best.pth'
     )
 
     print('---------------------------------------------------------------------------------------')
-    print('EMA + Dual View + Stable CAT + Prototype Consistency v2 + Class Energy Gate: '
+    print('EMA + Dual View + Stable CAT + Prototype Consistency v3 + Confidence/Energy OR: '
           '%s with source %s and target %s' %
           (args.backbone, args.data1, args.data2))
     print('alpha(w1):%s beta(w2):%s gamma(w3):%s ema:%s '
@@ -331,7 +331,7 @@ def run_training():
     print('prototype weight:%s temp:%s momentum:%s source_anchor:%s warmup:%s ramp:%s' %
           (args.proto_weight, args.proto_temperature, args.proto_momentum,
            args.proto_source_anchor, args.proto_warmup_epochs, args.proto_ramp_epochs))
-    print('energy gate:%s bandwidth:%s quantile:%s covariance_shrinkage:%s '
+    print('energy rescue:%s bandwidth:%s quantile:%s covariance_shrinkage:%s '
           'density_samples:%s warmup:%s refresh_interval:%s' %
           (args.energy_gate, args.energy_bandwidth, args.energy_quantile,
            args.energy_cov_shrinkage, args.energy_max_density_samples,
@@ -511,7 +511,7 @@ def run_training():
                   (i, np.array2string(
                       distribution_bank.source_counts.cpu().numpy(), separator=', '
                   )))
-            print('[Target Epoch %d] Class log-energy thresholds: %s' %
+            print('[Target Epoch %d] Class log-energy rescue thresholds: %s' %
                   (i, np.array2string(
                       distribution_bank.log_energy_thresholds.cpu().numpy(),
                       precision=4,
@@ -530,7 +530,7 @@ def run_training():
         current_proto_weight = prototype_weight_for_epoch(
             i, args.proto_weight, args.proto_warmup_epochs, args.proto_ramp_epochs
         )
-        enforce_energy_gate = args.energy_gate and i >= args.energy_warmup_epochs
+        enable_energy_rescue = args.energy_gate and i >= args.energy_warmup_epochs
 
         print('[Target Epoch %d] class mean confidence: %s global_mean: %.4f '
               'threshold_center: %.4f' %
@@ -538,8 +538,8 @@ def run_training():
                global_mean, threshold_center))
         print('[Target Epoch %d] class-adaptive thresholds: %s' %
               (i, np.array2string(thresholds.numpy(), precision=4)))
-        print('[Target Epoch %d] Energy gate enforced: %s' %
-              (i, enforce_energy_gate))
+        print('[Target Epoch %d] Energy OR rescue enabled: %s' %
+              (i, enable_energy_rescue))
 
         model.train()
         source_train_iter = iter(train_loader_source)
@@ -551,14 +551,16 @@ def run_training():
         agreement_num = 0
         confidence_accept_num = 0
         energy_pass_num = 0
+        energy_rescue_num = 0
         final_accept_num = 0
         energy_sum = 0.0
         energy_count = 0
         prototype_agree_num = 0
         prototype_checked_num = 0
         prototype_similarity_sum = 0.0
-        pseudo_distribution_before = np.zeros(class_num, dtype=np.int64)
-        pseudo_distribution_after = np.zeros(class_num, dtype=np.int64)
+        pseudo_distribution_confidence = np.zeros(class_num, dtype=np.int64)
+        pseudo_distribution_rescued = np.zeros(class_num, dtype=np.int64)
+        pseudo_distribution_final = np.zeros(class_num, dtype=np.int64)
 
         for weak1, weak2, strong, _ in train_loader_target:
             try:
@@ -586,22 +588,42 @@ def run_training():
                     dim=1,
                 )
 
+                # Confidence still uses the strict v1/v2 rule: agreement plus
+                # both weak-view confidences above the class-adaptive threshold.
                 confidence_mask = confidence_idx.bool()
+
+                # Energy must be evaluated on all samples whose two weak views
+                # agree. If it were evaluated only on confidence_mask, an OR
+                # rule could never rescue a low-confidence sample.
+                agreement_mask = torch.argmax(logits1, dim=1).eq(
+                    torch.argmax(logits2, dim=1)
+                )
+
                 if args.energy_gate:
                     log_energy, energy_mask = distribution_bank.gate(
                         teacher_mean_features,
                         pseudo_targets,
-                        confidence_mask,
+                        agreement_mask,
                     )
+                    # ClassDistributionBank.gate intentionally fails open for an
+                    # uninitialized class, which is correct for v2 veto gating
+                    # but unsafe for v3 rescue. An uninitialized class must not
+                    # be allowed to rescue low-confidence pseudo labels.
+                    initialized_mask = distribution_bank.source_initialized.index_select(
+                        0, pseudo_targets
+                    )
+                    energy_mask = energy_mask & initialized_mask
                 else:
                     log_energy = teacher_mean_features.new_full(
                         (teacher_mean_features.size(0),), float('nan')
                     )
-                    energy_mask = confidence_mask.clone()
+                    energy_mask = torch.zeros_like(agreement_mask)
 
-                if enforce_energy_gate:
-                    final_mask = confidence_mask & energy_mask
+                if enable_energy_rescue:
+                    rescue_mask = agreement_mask & energy_mask & ~confidence_mask
+                    final_mask = confidence_mask | rescue_mask
                 else:
+                    rescue_mask = torch.zeros_like(confidence_mask)
                     final_mask = confidence_mask
                 con_idx = final_mask.float()
 
@@ -613,10 +635,11 @@ def run_training():
 
             agreement_num += agree_count
             confidence_accept_num += int(confidence_mask.sum().item())
-            energy_pass_num += int((confidence_mask & energy_mask).sum().item())
+            energy_pass_num += int((agreement_mask & energy_mask).sum().item())
+            energy_rescue_num += int(rescue_mask.sum().item())
             final_accept_num += int(final_mask.sum().item())
 
-            finite_energy = confidence_mask & torch.isfinite(log_energy)
+            finite_energy = agreement_mask & torch.isfinite(log_energy)
             if finite_energy.any():
                 energy_sum += float(log_energy[finite_energy].sum().item())
                 energy_count += int(finite_energy.sum().item())
@@ -625,15 +648,20 @@ def run_training():
             prototype_checked_num += proto_checked
             prototype_similarity_sum += proto_similarity * proto_checked
 
-            before_labels = pseudo_targets[confidence_mask].cpu().numpy()
-            after_labels = pseudo_targets[final_mask].cpu().numpy()
-            if before_labels.size > 0:
-                pseudo_distribution_before += np.bincount(
-                    before_labels, minlength=class_num
+            confidence_labels = pseudo_targets[confidence_mask].cpu().numpy()
+            rescued_labels = pseudo_targets[rescue_mask].cpu().numpy()
+            final_labels = pseudo_targets[final_mask].cpu().numpy()
+            if confidence_labels.size > 0:
+                pseudo_distribution_confidence += np.bincount(
+                    confidence_labels, minlength=class_num
                 ).astype(np.int64)
-            if after_labels.size > 0:
-                pseudo_distribution_after += np.bincount(
-                    after_labels, minlength=class_num
+            if rescued_labels.size > 0:
+                pseudo_distribution_rescued += np.bincount(
+                    rescued_labels, minlength=class_num
+                ).astype(np.int64)
+            if final_labels.size > 0:
+                pseudo_distribution_final += np.bincount(
+                    final_labels, minlength=class_num
                 ).astype(np.int64)
 
             model.train()
@@ -694,13 +722,16 @@ def run_training():
         mean_log_energy = energy_sum / float(energy_count) if energy_count > 0 else 0.0
 
         print('[Target Epoch %d] Agreement_Num: %d Confidence_Accept_Num: %d '
-              'Energy_Pass_Num: %d Final_Accept_Num: %d Mean_Assigned_LogEnergy: %.4f' %
+              'Energy_Pass_Num: %d Energy_Rescue_Num: %d Final_Accept_Num: %d '
+              'Mean_Agreed_LogEnergy: %.4f' %
               (i, agreement_num, confidence_accept_num, energy_pass_num,
-               final_accept_num, mean_log_energy))
-        print('[Target Epoch %d] Pseudo_Distribution_Before_Energy: %s' %
-              (i, np.array2string(pseudo_distribution_before, separator=', ')))
-        print('[Target Epoch %d] Pseudo_Distribution_After_Energy: %s' %
-              (i, np.array2string(pseudo_distribution_after, separator=', ')))
+               energy_rescue_num, final_accept_num, mean_log_energy))
+        print('[Target Epoch %d] Pseudo_Distribution_Confidence: %s' %
+              (i, np.array2string(pseudo_distribution_confidence, separator=', ')))
+        print('[Target Epoch %d] Pseudo_Distribution_Rescued: %s' %
+              (i, np.array2string(pseudo_distribution_rescued, separator=', ')))
+        print('[Target Epoch %d] Pseudo_Distribution_Final: %s' %
+              (i, np.array2string(pseudo_distribution_final, separator=', ')))
         print('[Target Epoch %d] Prototype_Agreement: %d/%d (%.4f) '
               'Mean_Assigned_Cosine: %.4f Target_Prototype_Counts: %s' %
               (i, prototype_agree_num, prototype_checked_num,
