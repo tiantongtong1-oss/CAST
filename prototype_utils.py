@@ -155,7 +155,7 @@ class PrototypeBank(nn.Module):
         selected_labels = labels[reliable_mask].long()
         # 混合原型（源锚点 + 目标 EMA），detach 不参与梯度
         prototypes = self.blended_prototypes().detach()
-        # 特征与各类原型的相似度 / 温度 → 分类 logits
+        # 特征与各类原型的相似度   → 分类 logits
         logits = selected_features.mm(prototypes.t()) / float(temperature)
         # 每个样本的交叉熵损失
         per_sample = F.cross_entropy(logits, selected_labels, reduction='none')

@@ -7,7 +7,12 @@
     <list default="true" id="64d165f2-a439-40c6-ac3a-247d788c5774" name="更改" comment="">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/Networks.py" beforeDir="false" afterPath="$PROJECT_DIR$/Networks.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/energy_utils.py" beforeDir="false" afterPath="$PROJECT_DIR$/energy_utils.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/ARCHITECTURE.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/architecture_manifest.json" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/cast_mobilenetv2_framework.pdf" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/cast_mobilenetv2_framework.png" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/cast_mobilenetv2_framework.svg" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/docs/draw_architecture.py" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/prototype_utils.py" beforeDir="false" afterPath="$PROJECT_DIR$/prototype_utils.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/train.py" beforeDir="false" afterPath="$PROJECT_DIR$/train.py" afterDir="false" />
     </list>
@@ -34,23 +39,23 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent"><![CDATA[{
-  "keyToString": {
-    "ModuleVcsDetector.initialDetectionPerformed": "true",
-    "Python.dataset.executor": "Run",
-    "RunOnceActivity.ShowReadmeOnStart": "true",
-    "RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager": "true",
-    "RunOnceActivity.git.unshallow": "true",
-    "git-widget-placeholder": "experiment/prototype-consistency-v3",
-    "last_opened_file_path": "/workspace/ttt/code/CAST",
-    "node.js.detected.package.eslint": "true",
-    "node.js.detected.package.tslint": "true",
-    "node.js.selected.package.eslint": "(autodetect)",
-    "node.js.selected.package.tslint": "(autodetect)",
-    "nodejs_package_manager_path": "npm",
-    "vue.rearranger.settings.migration": "true"
+  <component name="PropertiesComponent">{
+  &quot;keyToString&quot;: {
+    &quot;ModuleVcsDetector.initialDetectionPerformed&quot;: &quot;true&quot;,
+    &quot;Python.dataset.executor&quot;: &quot;Run&quot;,
+    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
+    &quot;git-widget-placeholder&quot;: &quot;experiment/prototype-consistency-v3&quot;,
+    &quot;last_opened_file_path&quot;: &quot;/workspace/ttt/code/CAST&quot;,
+    &quot;node.js.detected.package.eslint&quot;: &quot;true&quot;,
+    &quot;node.js.detected.package.tslint&quot;: &quot;true&quot;,
+    &quot;node.js.selected.package.eslint&quot;: &quot;(autodetect)&quot;,
+    &quot;node.js.selected.package.tslint&quot;: &quot;(autodetect)&quot;,
+    &quot;nodejs_package_manager_path&quot;: &quot;npm&quot;,
+    &quot;vue.rearranger.settings.migration&quot;: &quot;true&quot;
   }
-}]]></component>
+}</component>
   <component name="RdControllerToolWindowsLayoutState" isNewUi="true">
     <layout>
       <window_info id="Bookmarks" side_tool="true" />
@@ -59,7 +64,7 @@
       <window_info id="Commit_Guest" show_stripe_button="false" />
       <window_info id="Pull Requests" />
       <window_info id="Learn" />
-      <window_info active="true" content_ui="combo" id="Project" order="0" visible="true" weight="0.1497396" />
+      <window_info active="true" content_ui="combo" id="Project" order="0" visible="true" weight="0.10859375" />
       <window_info id="Commit" order="1" weight="0.25" />
       <window_info id="Structure" order="2" side_tool="true" weight="0.25" />
       <window_info anchor="bottom" id="Database Changes" />
@@ -71,7 +76,7 @@
       <window_info anchor="bottom" id="Version Control" order="0" weight="0.20009784" />
       <window_info anchor="bottom" id="Problems" order="1" />
       <window_info anchor="bottom" id="Problems View" order="2" />
-      <window_info active="true" anchor="bottom" id="Terminal" order="3" visible="true" weight="0.1254845" />
+      <window_info active="true" anchor="bottom" id="Terminal" order="3" visible="true" weight="0.13614342" />
       <window_info anchor="bottom" id="Services" order="4" weight="0.30474806" />
       <window_info anchor="bottom" id="Python Packages" order="5" weight="0.1" />
       <window_info anchor="bottom" id="Python Console" order="6" weight="0.30474806" />
@@ -149,6 +154,7 @@
       <workItem from="1789265891287" duration="50733000" />
       <workItem from="1789375413821" duration="43013000" />
       <workItem from="1789530303611" duration="13845000" />
+      <workItem from="1789977488796" duration="10317000" />
     </task>
     <servers />
   </component>

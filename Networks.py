@@ -98,10 +98,10 @@ class Model(nn.Module):
                 epoch=0, source_count=None):
         fea = self.feature(x)
         out = self.bn(self.fc(fea))
-
+        # 测试模式
         if mode != 'train':
             return out, fea.cpu()
-
+        # 在源域训练
         if task == 'source':
             features = self.split_feature_makeLD(fea, targets)
             eta = self.volume(features)
@@ -111,47 +111,56 @@ class Model(nn.Module):
                 class_features = features[i]
                 other_features = remove_element(features, i)
                 if class_features.size(0) >= 2 and other_features.size(0) >= 2:
+                    # mmd_loss衡量的是第 i 类和其他所有类特征分布之间的相似度
                     inter_loss += mmd_loss(class_features, other_features) * eta[i]
 
             # Paper Eq. (11)-(12): maximize inter-class discrepancy.
             affinity_loss = -inter_loss / self.num_classes
+            # 返回分类 logits以及类间分离损失
             return [out, affinity_loss]
-
+        # 目标域训练
         if task == 'target':
             if idx is None or source_count is None:
                 raise ValueError('Target training requires confidence mask idx and source_count.')
 
+            # 1. 用置信掩码 idx 筛选样本
             valid_idx = (idx == 1).nonzero(as_tuple=False).squeeze(1)
             fea_selected = torch.index_select(fea, 0, valid_idx)
             targets_selected = torch.index_select(targets, 0, valid_idx)
 
-            # Source samples are concatenated first and are always confident.
+            # 2. 前 source_count 个是源域样本，后面是目标域样本
             source_count = min(int(source_count), fea_selected.size(0))
             source_fea = fea_selected[:source_count]
             source_targets = targets_selected[:source_count]
             target_fea = fea_selected[source_count:]
             target_targets = targets_selected[source_count:]
 
+            # 3. 分别按类别拆分
             source_features = self.split_feature_makeLD(source_fea, source_targets)
             target_features = self.split_feature_makeLD(target_fea, target_targets)
             all_features = self.split_feature_makeLD(fea_selected, targets_selected)
             eta = self.volume(all_features)
 
-            intra_loss = fea.new_tensor(0.0)
-            inter_loss = fea.new_tensor(0.0)
+            # 4. 同时算类内对齐 + 类间分离
+            intra_loss = fea.new_tensor(0.0)    # 同类源/目标特征的 MMD
+            inter_loss = fea.new_tensor(0.0)    # 不同类特征的 MMD
 
             for i in range(self.num_classes):
+
                 fea_s = source_features[i]
                 fea_t = target_features[i]
                 if fea_s.size(0) >= 2 and fea_t.size(0) >= 2:
+                    # 类内：源域第 i 类 vs 目标域第 i 类，乘以该类的权重 eta[i]
                     intra_loss += mmd_loss(fea_s, fea_t) * eta[i]
 
-                class_features = all_features[i]
-                other_features = remove_element(all_features, i)
+                class_features = all_features[i]  # 第 i 类的所有样本（源+目标）
+                other_features = remove_element(all_features, i)    # 除第 i 类外的所有样本
                 if class_features.size(0) >= 2 and other_features.size(0) >= 2:
+                    # 类间：第 i 类 vs 其他类
                     inter_loss += mmd_loss(class_features, other_features) * eta[i]
 
             # Paper Eq. (12): intra-class domain alignment + inter-class separation.
+            # 特征分布对齐损失
             affinity_loss = (intra_loss - inter_loss) / self.num_classes
             return [out, affinity_loss]
 
@@ -168,7 +177,7 @@ class Model(nn.Module):
             x_parts.append(torch.index_select(x, 0, ind))
         return x_parts
 
-    CCDR类级别表示权重的实际计算
+    # CCDR类级别表示权重的实际计算
     def volume(self, features):
 
         if not features:

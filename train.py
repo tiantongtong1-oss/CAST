@@ -15,6 +15,8 @@ from prototype_utils import FeatureHook, PrototypeBank, prototype_weight_for_epo
 from energy_utils import ClassDistributionBank
 import image_utils as util
 from randaugment import RandAugmentMC
+# 总训练入口与调度器。串起数据、Source 预训练、EMA Teacher、
+# 双视图伪标签、自适应阈值、Energy Rescue、Prototype Consistency、验证和测试
 
 #随机种子
 seed = 1314
@@ -30,7 +32,7 @@ torch.backends.cudnn.deterministic = True
 def _init_fn(worker_id):
     np.random.seed(seed + worker_id)
 
-
+# 定义训练全部超参数
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data1', type=str, default='rafdb', help='source data')
@@ -143,7 +145,7 @@ def build_transforms():
     ])
     return weak, strong, test
 
-# 分类器调制损失
+# 分类器调制损失，对分类器各类别权重计算两两 余弦相似度，约束分类器权重关系
 def classifier_modulation_loss(model):
     weight = model.fc.weight
     norm = torch.norm(weight, dim=1, keepdim=True).clamp_min(1e-12)
@@ -152,12 +154,12 @@ def classifier_modulation_loss(model):
     return torch.mean((matrix + 1.0) / 2.0)
 
 
-    # 根据目标域样本的预测置信度，
-    # 为每个类别计算自适应的伪标签置信度阈值。
-    # 记录每个预测类别的置信度总和
 def calculate_target_thresholds(model, loader, class_num, threshold_base,
                                 threshold_beta, threshold_margin,
                                 threshold_min, threshold_max):
+
+    # EMA Teacher 扫描整个target train，根据各预测类别平均confidence 生成类别自适应置信度阈值
+
     class_sum = torch.zeros(class_num, dtype=torch.float64)
     # 记录每个预测类别包含的样本数量
     class_count = torch.zeros(class_num, dtype=torch.float64)
@@ -213,6 +215,7 @@ def calculate_target_thresholds(model, loader, class_num, threshold_base,
 
 
 def evaluate(model, loader, criterion, num_samples, epoch, split_name):
+    # 在 FER val/test 上算 CE、accuracy 和 confusion matrix
     val_loss = 0.0
     iter_cnt = 0
     bingo_cnt = 0
@@ -243,6 +246,8 @@ def evaluate(model, loader, criterion, num_samples, epoch, split_name):
 
 def save_checkpoint(path, model, optimizer, scheduler, epoch, best_val_acc, args,
                     teacher=None, prototype_bank=None):
+    # 保存 Student、optimizer、scheduler、epoch 等；
+    # 目标阶段还可保存 EMA Teacher 和 PrototypeBank
     state = {
         'model': model.state_dict(),
         'optimizer': optimizer.state_dict(),
@@ -259,7 +264,9 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch, best_val_acc, args
 
 
 def initialize_source_prototypes(teacher, feature_hook, loader, prototype_bank):
-    """Build fixed source semantic anchors from deterministic RAF-DB views."""
+
+    # 用 Teacher 在确定性的 RAF-DB source view 上抽特征，创建固定 源域原型
+
     teacher.eval()
     with torch.no_grad():
         for imgs, targets in loader:
@@ -271,7 +278,9 @@ def initialize_source_prototypes(teacher, feature_hook, loader, prototype_bank):
 
 
 def rebuild_source_distribution(teacher, feature_hook, loader, distribution_bank):
-    """Re-estimate source class geometry in the current EMA-teacher space."""
+
+    # 用当前 EMA Teacher 重新扫描 RAF-DB，重建每类均值、协方差、KDE 和 energy threshold
+
     distribution_bank.reset_source()
     teacher.eval()
     with torch.no_grad():
@@ -385,10 +394,12 @@ def run_training():
         target_test, batch_size=test_batch, num_workers=args.workers,
         shuffle=False, pin_memory=True,
     )
-
+    # 输出分类 logits 和 source affinity loss
     model = Networks.Model(backbone=args.backbone, num_classes=class_num).cuda()
+    # 训练组件初始化
     optimizer = torch.optim.Adam(model.parameters(), args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
+    # 交叉熵损失
     criterion = torch.nn.CrossEntropyLoss(reduction='none')
 
     if args.checkpoint:
@@ -409,14 +420,16 @@ def run_training():
         for imgs, targets in train_loader_source:
             imgs = imgs.cuda(non_blocking=True)
             targets = targets.cuda(non_blocking=True)
-
+            # 清空梯度
             optimizer.zero_grad()
             output = model(imgs, targets, None, 'train', 'source')
             cls_loss = torch.mean(criterion(output[0], targets))
             aff_loss = output[1]
             weight_loss = classifier_modulation_loss(model)
             loss = cls_loss * args.w1 + aff_loss * args.w2 + weight_loss * args.w3
+            # 反向传播
             loss.backward()
+            # 更新参数
             optimizer.step()
 
             predicts = torch.argmax(output[0], dim=1)
@@ -426,7 +439,7 @@ def run_training():
             train_loss2 += aff_loss.item()
             train_loss3 += weight_loss.item()
             batch_count += 1
-
+        # 更新学习率
         scheduler.step()
         train_acc = float(bingo_cnt) / max(sample_count, 1)
         print('[Source Epoch %d] Training accuracy: %.4f. Classification Loss: %.3f '
@@ -436,7 +449,7 @@ def run_training():
                train_loss2 / max(batch_count, 1),
                train_loss3 / max(batch_count, 1),
                optimizer.param_groups[0]['lr']))
-
+        # 保存最佳的model
         val_acc = evaluate(
             model, val_loader_target, criterion, len(target_val), i, 'Validation'
         )
@@ -445,28 +458,36 @@ def run_training():
             save_checkpoint(source_best_path, model, optimizer, scheduler, i,
                             best_source_val_acc, args)
             print('best source-stage validation accuracy %.4f' % best_source_val_acc)
-
+    # 加载源域训练好的 checkpoint
     checkpoint = torch.load(source_best_path, map_location='cuda')
     model.load_state_dict(checkpoint['model'])
     optimizer.load_state_dict(checkpoint['optimizer'])
     scheduler.load_state_dict(checkpoint['scheduler'])
 
+    # 构建 EMA 教师模型
     teacher = create_ema_teacher(model).cuda()
+
+    # 一个特征钩子，挂到 teacher.feature 和 model.feature 上
+    # 作用：在前向传播时自动截获骨干网络的输出特征 fea，不需要改模型代码。
     teacher_feature_hook = FeatureHook(teacher.feature)
     student_feature_hook = FeatureHook(model.feature)
 
+    # 初始化原型库（存储每个类别的特征原型）
     prototype_bank = PrototypeBank(
         class_num,
         model.fc.in_features,
         momentum=args.proto_momentum,
-        source_anchor=args.proto_source_anchor,
+        source_anchor=args.proto_source_anchor,  #锚点权重
     ).cuda()
+
+    # 源域数据初始化原型
     initialize_source_prototypes(
         teacher, teacher_feature_hook, prototype_loader_source, prototype_bank
     )
     print('source prototype counts: %s' %
           np.array2string(prototype_bank.source_counts.cpu().numpy(), separator=', '))
 
+    # 初始化类别分布库（存储每个类别的特征分布），用于目标域伪标签/置信度
     distribution_bank = ClassDistributionBank(
         class_num,
         model.fc.in_features,
@@ -573,9 +594,7 @@ def run_training():
                 # 传统的高置信度伪标签
                 confidence_mask = confidence_idx.bool()
 
-                # Energy must be evaluated on all samples whose two weak views
-                # agree. If it were evaluated only on confidence_mask, an OR
-                # rule could never rescue a low-confidence sample.
+
                 agreement_mask = torch.argmax(logits1, dim=1).eq(
                     torch.argmax(logits2, dim=1)
                 )
