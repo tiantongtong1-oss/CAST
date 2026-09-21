@@ -20,13 +20,9 @@ class FeatureHook:
 
 
 class PrototypeBank(nn.Module):
-    """Source-anchored EMA class prototypes for target consistency training.
-
-    Source prototypes are computed once from labeled RAF-DB features and remain
-    fixed semantic anchors. Target prototypes are updated class-by-class from
-    reliable dual-view EMA-teacher features. The prototype used by the loss is
-    a normalized blend of the fixed source anchor and the adaptive target EMA.
-    """
+    # 用于目标域一致性训练的源锚定EMA类原型
+    # 源原型由带标签的RAF-DB特征一次性计算得到，并作为固定的语义锚点保持不变。目标原型则从可靠的双视角EMA教师特征中按类别逐一更新。损
+    # 失函数所使用的原型是固定源锚点与自适应目标EMA原型的归一化混合。
 
     def __init__(self, num_classes, feature_dim, momentum=0.99,
                  source_anchor=0.5):
@@ -91,6 +87,9 @@ class PrototypeBank(nn.Module):
                 self.source_initialized[c] = True
 
     @torch.no_grad()
+
+    # 目标原型（target prototype）的动量更新（momentum update）函数，
+    # 作用是：用当前 batch中“可靠样本”的类别均值，以动量方式去更新每个类别的目标原型（类中心）
     def update_target(self, features, labels, reliable_mask):
         reliable_mask = reliable_mask.bool()
         if not reliable_mask.any():
@@ -142,24 +141,25 @@ class PrototypeBank(nn.Module):
 
         return F.normalize(prototypes, dim=1)
 
+    # 类平衡的原型对比损失 在可靠的目标域样本上，拉近特征与“正确类原型”的距离，同时推开与其他类原型的距离
     def consistency_loss(self, features, labels, reliable_mask,
                          temperature=0.2):
-        """Class-balanced prototype contrastive loss on reliable target samples."""
         reliable_mask = reliable_mask.bool()
         if not reliable_mask.any():
+            # 没有可靠样本，返回可求导的 0
             return features.sum() * 0.0
-
         if temperature <= 0.0:
             raise ValueError('prototype temperature must be positive')
-
+            # 取可靠样本特征并 L2 归一化，点积即余弦相似度
         selected_features = F.normalize(features[reliable_mask], dim=1)
         selected_labels = labels[reliable_mask].long()
+        # 混合原型（源锚点 + 目标 EMA），detach 不参与梯度
         prototypes = self.blended_prototypes().detach()
+        # 特征与各类原型的相似度 / 温度 → 分类 logits
         logits = selected_features.mm(prototypes.t()) / float(temperature)
+        # 每个样本的交叉熵损失
         per_sample = F.cross_entropy(logits, selected_labels, reduction='none')
-
-        # Equalize classes inside the prototype regularizer so dominant pseudo
-        # classes do not overwhelm minority expression classes.
+        # 类平衡：每个类先求平均，再对类求平均，避免多数类主导
         per_class = []
         for c in selected_labels.unique(sorted=True):
             class_mask = selected_labels.eq(c)
@@ -187,7 +187,7 @@ class PrototypeBank(nn.Module):
             float(assigned_similarity.mean().item()),
         )
 
-
+# 来控制“目标原型库相关的损失项在训练中从无到有、逐步启用
 def prototype_weight_for_epoch(epoch, max_weight, warmup_epochs, ramp_epochs):
     """Warm up the target prototype bank before enabling its gradient loss."""
     if max_weight <= 0.0 or epoch < warmup_epochs:

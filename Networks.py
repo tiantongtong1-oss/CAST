@@ -168,17 +168,9 @@ class Model(nn.Module):
             x_parts.append(torch.index_select(x, 0, ind))
         return x_parts
 
+    CCDR类级别表示权重的实际计算
     def volume(self, features):
-        """CCDR class-level representation weights from paper Eq. (2)-(5).
 
-        The paper defines rho_i = (1 / (N_c h)) * sum_j k((f_i-f_j)/h),
-        V_c = sum_i 1/rho_i, and eta_c = 1/V_c.  We therefore compute the
-        Gaussian kernel directly in representation space instead of using
-        sklearn KernelDensity's *normalized high-dimensional probability
-        density*.  The latter contains an h^{-d} normalization term; in a
-        512-D feature space it can make densities astronomically large and
-        eta_c explode to ~1e12, which is not the quantity in Eq. (2).
-        """
         if not features:
             return []
 

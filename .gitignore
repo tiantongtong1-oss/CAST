@@ -3,3 +3,6 @@ __pycache__/
 .pytest_cache/
 models/
 new_logs/
+docs/
+experiments/
+*.md

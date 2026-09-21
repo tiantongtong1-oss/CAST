@@ -1,10 +1,8 @@
 import warnings
 warnings.filterwarnings('ignore')
-
 import argparse
 import os
 import random
-
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -18,7 +16,7 @@ from energy_utils import ClassDistributionBank
 import image_utils as util
 from randaugment import RandAugmentMC
 
-
+#随机种子
 seed = 1314
 np.random.seed(seed)
 torch.manual_seed(seed)
@@ -105,48 +103,15 @@ def parse_args():
     parser.add_argument('--energy_refresh_interval', type=int, default=1,
                         help='rebuild source distributions every N target epochs')
 
-    args = parser.parse_args()
-    if not (0.0 <= args.threshold_min <= args.threshold_max <= 1.0):
-        parser.error('require 0 <= threshold_min <= threshold_max <= 1')
-    if not (0.0 <= args.threshold_base <= args.threshold_max):
-        parser.error('require 0 <= threshold_base <= threshold_max')
-    if args.threshold_beta < 0.0:
-        parser.error('--threshold_beta must be nonnegative')
-    if args.threshold_margin < 0.0:
-        parser.error('--threshold_margin must be nonnegative')
-    if not (0.0 <= args.ema_decay < 1.0):
-        parser.error('--ema_decay must be in [0, 1)')
-    if args.proto_weight < 0.0:
-        parser.error('--proto_weight must be nonnegative')
-    if args.proto_temperature <= 0.0:
-        parser.error('--proto_temperature must be positive')
-    if not (0.0 <= args.proto_momentum < 1.0):
-        parser.error('--proto_momentum must be in [0, 1)')
-    if not (0.0 <= args.proto_source_anchor <= 1.0):
-        parser.error('--proto_source_anchor must be in [0, 1]')
-    if args.proto_warmup_epochs < 0 or args.proto_ramp_epochs < 0:
-        parser.error('prototype warmup/ramp epochs must be nonnegative')
-    if args.energy_bandwidth <= 0.0:
-        parser.error('--energy_bandwidth must be positive')
-    if not (0.0 < args.energy_quantile < 1.0):
-        parser.error('--energy_quantile must be in (0, 1)')
-    if not (0.0 <= args.energy_cov_shrinkage <= 1.0):
-        parser.error('--energy_cov_shrinkage must be in [0, 1]')
-    if args.energy_max_density_samples < 2:
-        parser.error('--energy_max_density_samples must be at least 2')
-    if args.energy_warmup_epochs < 0:
-        parser.error('--energy_warmup_epochs must be nonnegative')
-    if args.energy_refresh_interval < 1:
-        parser.error('--energy_refresh_interval must be at least 1')
-    return args
 
-
+#图像预处理、数据增强生成 弱增强 weak、强增强 strong、测试预处理 test
 def build_transforms():
+    # 对图像的 RGB 三个通道做标准化
     normalize = transforms.Normalize(
         mean=[0.485, 0.456, 0.406],
         std=[0.229, 0.224, 0.225]
     )
-
+    # 弱增强
     weak = transforms.Compose([
         transforms.ToPILImage(),
         transforms.Resize((256, 256)),
@@ -163,6 +128,7 @@ def build_transforms():
         transforms.RandomCrop(224),
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomApply([transforms.RandomRotation(20)], p=0.5),
+        #强数据增强（随机选两种增强方式，强度为10 ）
         RandAugmentMC(n=2, m=10),
         transforms.ToTensor(),
         normalize,
@@ -177,7 +143,7 @@ def build_transforms():
     ])
     return weak, strong, test
 
-
+# 分类器调制损失
 def classifier_modulation_loss(model):
     weight = model.fc.weight
     norm = torch.norm(weight, dim=1, keepdim=True).clamp_min(1e-12)
@@ -186,19 +152,33 @@ def classifier_modulation_loss(model):
     return torch.mean((matrix + 1.0) / 2.0)
 
 
+    # 根据目标域样本的预测置信度，
+    # 为每个类别计算自适应的伪标签置信度阈值。
+    # 记录每个预测类别的置信度总和
 def calculate_target_thresholds(model, loader, class_num, threshold_base,
                                 threshold_beta, threshold_margin,
                                 threshold_min, threshold_max):
-    """Global-confidence-aware relative class-adaptive thresholds."""
     class_sum = torch.zeros(class_num, dtype=torch.float64)
+    # 记录每个预测类别包含的样本数量
     class_count = torch.zeros(class_num, dtype=torch.float64)
-
+    # 切换到评估模式，关闭 Dropout、固定 BatchNorm 等
     model.eval()
+
+    # 这里只进行推理，不计算梯度，减少显存和计算开销
     with torch.no_grad():
         for batch in loader:
             imgs = batch[0].cuda(non_blocking=True)
+
+            # 使用模型对目标域图像进行预测
+            # logits：分类输出
+            # _：其他不需要使用的输出
             logits, _ = model(imgs, None, None, mode='test', task='target')
+
+            #转化成类别概率
             probs = F.softmax(logits, dim=1).cpu()
+            # 获取每个样本的最大预测概率和对应预测类别
+            # max_prob：模型预测的最高置信度
+            # pred_label：最高置信度对应的类别
             max_prob, pred_label = torch.max(probs, dim=1)
 
             class_sum.scatter_add_(0, pred_label, max_prob.double())
@@ -574,6 +554,8 @@ def run_training():
             strong = strong.cuda(non_blocking=True)
 
             teacher.eval()
+            # 用EMA Teacher对目标域样本的两个弱增强视图进行预测，生成伪标签，并提取一个融合后的teacher 特征，供后面的
+            # energy判断和prototype更新使用
             with torch.no_grad():
                 logits1, _ = teacher(weak1, None, None, 'test', 'target')
                 teacher_features1 = teacher_feature_hook.output.detach()
@@ -588,8 +570,7 @@ def run_training():
                     dim=1,
                 )
 
-                # Confidence still uses the strict v1/v2 rule: agreement plus
-                # both weak-view confidences above the class-adaptive threshold.
+                # 传统的高置信度伪标签
                 confidence_mask = confidence_idx.bool()
 
                 # Energy must be evaluated on all samples whose two weak views
@@ -598,7 +579,7 @@ def run_training():
                 agreement_mask = torch.argmax(logits1, dim=1).eq(
                     torch.argmax(logits2, dim=1)
                 )
-
+                # 条件性地调用一个energy gate（能量门控）机制
                 if args.energy_gate:
                     log_energy, energy_mask = distribution_bank.gate(
                         teacher_mean_features,
@@ -619,6 +600,7 @@ def run_training():
                     )
                     energy_mask = torch.zeros_like(agreement_mask)
 
+                #拯救策略！！！
                 if enable_energy_rescue:
                     rescue_mask = agreement_mask & energy_mask & ~confidence_mask
                     final_mask = confidence_mask | rescue_mask
@@ -627,27 +609,30 @@ def run_training():
                     final_mask = confidence_mask
                 con_idx = final_mask.float()
 
+                # 评估函数，用来统计在“可靠样本”上，模型特征与原型之间的预测一致性和相似度，会只检查 con_idx=1 的最终可靠目标样本
                 proto_agree, proto_checked, proto_similarity = (
                     prototype_bank.agreement_stats(
                         teacher_mean_features, pseudo_targets, con_idx
                     )
                 )
-
+            # 统计当前epoch中不同阶段一共接纳了多少目标样本
             agreement_num += agree_count
             confidence_accept_num += int(confidence_mask.sum().item())
             energy_pass_num += int((agreement_mask & energy_mask).sum().item())
             energy_rescue_num += int(rescue_mask.sum().item())
             final_accept_num += int(final_mask.sum().item())
 
+            # 确实成功计算出有限energy的样本进行统计
             finite_energy = agreement_mask & torch.isfinite(log_energy)
             if finite_energy.any():
                 energy_sum += float(log_energy[finite_energy].sum().item())
                 energy_count += int(finite_energy.sum().item())
-
+            # 累计prototype诊断指标
             prototype_agree_num += proto_agree
             prototype_checked_num += proto_checked
             prototype_similarity_sum += proto_similarity * proto_checked
 
+            # 统计伪标签在不同掩码筛选下的类别分布
             confidence_labels = pseudo_targets[confidence_mask].cpu().numpy()
             rescued_labels = pseudo_targets[rescue_mask].cpu().numpy()
             final_labels = pseudo_targets[final_mask].cpu().numpy()
@@ -665,41 +650,50 @@ def run_training():
                 ).astype(np.int64)
 
             model.train()
+            # 给所有源域样本一个权重1，默认全可信
             source_con_idx = torch.ones(source_imgs.shape[0])
+            # 源域图像+目标域strong augmentation
             train_imgs = torch.cat((source_imgs, strong.cpu()), dim=0).cuda(non_blocking=True)
             train_targets = torch.cat((source_targets, pseudo_targets.cpu()), dim=0).cuda(non_blocking=True)
             train_con_idx = torch.cat((source_con_idx, con_idx.cpu()), dim=0).cuda(non_blocking=True)
 
+            # 清空模型参数的梯度
             optimizer.zero_grad()
             output = model(
                 train_imgs, train_targets, train_con_idx, 'train', 'target',
                 source_count=source_imgs.shape[0],
             )
-
+            # 分类损失
             per_sample_loss = criterion(output[0], train_targets) * train_con_idx
+            # 对真正有效的源域和目标域样本求平均分类损失
             cls_loss = per_sample_loss.sum() / train_con_idx.sum().clamp_min(1.0)
             aff_loss = output[1]
+            # 分类器权重之间的正则项
             weight_loss = classifier_modulation_loss(model)
-
+            # 把前面的源域特征切掉，只保留zt（student）
             target_student_features = student_feature_hook.output[source_imgs.shape[0]:]
+            #prototype consistency原型一致性，让目标样本的 Student 特征靠近对应伪标签类别的 prototype
             proto_loss = prototype_bank.consistency_loss(
                 target_student_features,
                 pseudo_targets,
                 con_idx,
                 temperature=args.proto_temperature,
             )
-
+            # 总损失
             loss = (
                 cls_loss * args.w1
                 + aff_loss * args.w2
                 + weight_loss * args.w3
                 + proto_loss * current_proto_weight
             )
+            #反向传播
             loss.backward()
             optimizer.step()
 
             global_step += 1
+            # 更新EMA Teacher
             update_ema_teacher(teacher, model, args.ema_decay, global_step)
+            # 这是更新目标域prototype
             prototype_bank.update_target(
                 teacher_mean_features, pseudo_targets, con_idx
             )
@@ -709,8 +703,9 @@ def run_training():
             train_loss3 += weight_loss.item()
             train_proto_loss += proto_loss.item()
             batch_count += 1
-
+        # 更新学习率
         scheduler.step()
+        # 求均值
         proto_agreement_rate = (
             float(prototype_agree_num) / float(prototype_checked_num)
             if prototype_checked_num > 0 else 0.0
@@ -719,6 +714,7 @@ def run_training():
             prototype_similarity_sum / float(prototype_checked_num)
             if prototype_checked_num > 0 else 0.0
         )
+        # 整个 epoch 的平均log energy
         mean_log_energy = energy_sum / float(energy_count) if energy_count > 0 else 0.0
 
         print('[Target Epoch %d] Agreement_Num: %d Confidence_Accept_Num: %d '
@@ -746,7 +742,7 @@ def run_training():
                train_proto_loss / max(batch_count, 1),
                current_proto_weight,
                optimizer.param_groups[0]['lr']))
-
+        # 在每个epoch 后用目标域 validation set做验证
         val_acc = evaluate(
             model, val_loader_target, criterion, len(target_val), i, 'Validation'
         )
