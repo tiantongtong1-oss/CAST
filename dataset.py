@@ -94,10 +94,11 @@ class FER(data.Dataset):
     }
 
     def __init__(self, path, phase, transform=None, weak2_transform=None,
-                 strong_transform=None, basic_aug=False):
+                 strong_transform=None, basic_aug=False, return_index=False):
         self.phase = phase
         self.transform = transform
         self.weak2_transform = weak2_transform
+        self.return_index = bool(return_index)
         self.strong_transform = strong_transform
         self.basic_aug = basic_aug
         self.aug_func = [util.flip_image, util.add_gaussian_noise, util.crop, util.rotation]
@@ -127,9 +128,11 @@ class FER(data.Dataset):
                 'No FER2013 images found for phase %s. Expected %s' % (phase, expected)
             )
 
+        # Independent training/memory views must assign the same ID to a path.
+        # Use a local RNG so constructing a dataset does not reset training RNGs.
+        files = sorted(files)
         if phase == 'train':
-            np.random.seed(2000)
-            np.random.shuffle(files)
+            np.random.RandomState(2000).shuffle(files)
 
         for file in files:
             self.file_paths.append(file)
@@ -167,11 +170,15 @@ class FER(data.Dataset):
             img_weak2 = self.weak2_transform(image)
             if self.strong_transform is not None:
                 img_strong = self.strong_transform(image)
-                return img, img_weak2, img_strong, label
-            return img, img_weak2, label
+                result = (img, img_weak2, img_strong, label)
+            else:
+                result = (img, img_weak2, label)
+            return result + (idx,) if self.return_index else result
 
         if self.strong_transform is not None:
             img_strong = self.strong_transform(image)
-            return img, img_strong, label
+            result = (img, img_strong, label)
+            return result + (idx,) if self.return_index else result
 
-        return img, label
+        result = (img, label)
+        return result + (idx,) if self.return_index else result

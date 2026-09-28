@@ -1,5 +1,9 @@
 # Experiment: Prototype Consistency v3 + Confidence/Energy OR Rescue
 
+> Historical v3 documentation. This v4 branch replaces energy rescue with
+> prototype/kNN reliability. For current commands and parameters, see
+> [EXPERIMENT_PROTOTYPE_KNN_V4.md](EXPERIMENT_PROTOTYPE_KNN_V4.md).
+
 Base experiment: `experiment/prototype-consistency-v2`
 
 Experiment branch: `experiment/prototype-consistency-v3`

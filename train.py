@@ -12,11 +12,11 @@ import Networks
 from dataset import RafDataSet, FER
 from ema_utils import create_ema_teacher, select_dual_view_pseudo_labels, update_ema_teacher
 from prototype_utils import FeatureHook, PrototypeBank, prototype_weight_for_epoch
-from energy_utils import ClassDistributionBank
+from knn_reliability import KNNReliabilityBank, combine_rescue_masks
 import image_utils as util
 from randaugment import RandAugmentMC
 # 总训练入口与调度器。串起数据、Source 预训练、EMA Teacher、
-# 双视图伪标签、自适应阈值、Energy Rescue、Prototype Consistency、验证和测试
+# 双视图伪标签、自适应阈值、KNN Reliability Rescue、Prototype Consistency、验证和测试
 
 #随机种子
 seed = 1314
@@ -33,7 +33,7 @@ def _init_fn(worker_id):
     np.random.seed(seed + worker_id)
 
 # 定义训练全部超参数
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--data1', type=str, default='rafdb', help='source data')
     parser.add_argument('--data2', type=str, default='fer', help='target data')
@@ -86,24 +86,42 @@ def parse_args():
     parser.add_argument('--proto_ramp_epochs', type=int, default=5,
                         help='epochs used to linearly ramp prototype loss to full weight')
 
-    # Prototype-consistency v3: energy can rescue an agreed low-confidence label.
-    parser.set_defaults(energy_gate=True)
-    parser.add_argument('--energy_gate', dest='energy_gate', action='store_true',
-                        help='enable source class-distribution energy OR rescue (default)')
-    parser.add_argument('--no_energy_gate', dest='energy_gate', action='store_false',
-                        help='disable energy-based pseudo-label rescue')
-    parser.add_argument('--energy_bandwidth', type=float, default=1.0,
-                        help='dimension-normalized KDE bandwidth multiplier')
-    parser.add_argument('--energy_quantile', type=float, default=0.75,
-                        help='source leave-one-out log-energy quantile used for strong rescue')
-    parser.add_argument('--energy_cov_shrinkage', type=float, default=0.05,
-                        help='shrinkage strength for each source class covariance')
-    parser.add_argument('--energy_max_density_samples', type=int, default=256,
-                        help='maximum source representatives per class for local density')
-    parser.add_argument('--energy_warmup_epochs', type=int, default=1,
-                        help='target epochs that log energy but do not enable OR rescue')
-    parser.add_argument('--energy_refresh_interval', type=int, default=1,
-                        help='rebuild source distributions every N target epochs')
+    parser.set_defaults(knn_gate=True)
+    parser.add_argument('--knn_gate', dest='knn_gate', action='store_true',
+                        help='enable prototype-region/kNN OR rescue (default)')
+    parser.add_argument('--no_knn_gate', dest='knn_gate', action='store_false',
+                        help='strict dual-view confidence baseline without rescue')
+    parser.add_argument('--knn_k', type=int, default=20)
+    parser.add_argument('--knn_interval_lambda', type=float, default=1.5,
+                        help='prototype confidence-region radius = lambda * sigma')
+    parser.add_argument('--knn_sigma_momentum', type=float, default=0.9,
+                        help='global radial variance EMA, updated once per refresh')
+    parser.add_argument('--knn_bandwidth_multiplier', type=float, default=1.0,
+                        help='local Gaussian bandwidth = multiplier * sigma')
+    parser.add_argument('--knn_score_threshold', type=float, default=0.5)
+    parser.add_argument('--knn_density_threshold', type=float, default=0.5,
+                        help='dense/sparse diagnostic cutoff; not an extra gate')
+    parser.add_argument('--knn_warmup_epochs', type=int, default=3)
+    parser.add_argument('--knn_refresh_interval', type=int, default=1)
+    parser.add_argument('--knn_query_chunk_size', type=int, default=128,
+                        help='bound temporary kNN distance matrix memory')
+
+    args = parser.parse_args(argv)
+    if args.knn_k < 1 or args.knn_query_chunk_size < 1 or args.knn_refresh_interval < 1:
+        parser.error('knn_k, knn_query_chunk_size and knn_refresh_interval must be positive')
+    if args.knn_warmup_epochs < 0 or args.pre_epochs < 0 or args.epochs < 0:
+        parser.error('epoch counts must be nonnegative')
+    if not 0 <= args.knn_sigma_momentum < 1:
+        parser.error('knn_sigma_momentum must be in [0, 1)')
+    for name in ('knn_interval_lambda', 'knn_bandwidth_multiplier'):
+        if not np.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
+            parser.error('%s must be finite and positive' % name)
+    for name in ('knn_score_threshold', 'knn_density_threshold'):
+        if not 0 < getattr(args, name) <= 1:
+            parser.error('%s must be in (0, 1]' % name)
+    if args.pre_epochs == 0 and not args.checkpoint:
+        parser.error('--pre_epochs 0 requires --checkpoint with pretrained model weights')
+    return args
 
 
 #图像预处理、数据增强生成 弱增强 weak、强增强 strong、测试预处理 test
@@ -245,7 +263,7 @@ def evaluate(model, loader, criterion, num_samples, epoch, split_name):
 
 
 def save_checkpoint(path, model, optimizer, scheduler, epoch, best_val_acc, args,
-                    teacher=None, prototype_bank=None):
+                    teacher=None, prototype_bank=None, reliability_bank=None):
     # 保存 Student、optimizer、scheduler、epoch 等；
     # 目标阶段还可保存 EMA Teacher 和 PrototypeBank
     state = {
@@ -260,6 +278,8 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch, best_val_acc, args
         state['ema_teacher'] = teacher.state_dict()
     if prototype_bank is not None:
         state['prototype_bank'] = prototype_bank.state_dict()
+    if reliability_bank is not None:
+        state['reliability_bank'] = reliability_bank.state_dict()
     torch.save(state, path)
 
 
@@ -277,19 +297,40 @@ def initialize_source_prototypes(teacher, feature_hook, loader, prototype_bank):
     prototype_bank.finalize_source()
 
 
-def rebuild_source_distribution(teacher, feature_hook, loader, distribution_bank):
+@torch.no_grad()
+def refresh_reliability_bank(teacher, feature_hook, source_loader, target_loader,
+                             prototype_bank, reliability_bank):
+    """Refresh source scale and target-train memory in the same teacher space.
 
-    # 用当前 EMA Teacher 重新扫描 RAF-DB，重建每类均值、协方差、KDE 和 energy threshold
-
-    distribution_bank.reset_source()
+    Target labels from the dataset are intentionally ignored. A deterministic
+    view is used for memory; only the two training weak views decide agreement.
+    """
+    device = next(teacher.parameters()).device
+    reliability_bank.begin_source_refresh(
+        prototype_bank.blended_prototypes(),
+        prototype_bank.source_initialized | prototype_bank.target_initialized,
+    )
     teacher.eval()
-    with torch.no_grad():
-        for imgs, targets in loader:
-            imgs = imgs.cuda(non_blocking=True)
-            targets = targets.cuda(non_blocking=True)
-            teacher(imgs, None, None, mode='test', task='source')
-            distribution_bank.accumulate_source(feature_hook.output, targets)
-    distribution_bank.finalize_source()
+    for imgs, targets in source_loader:
+        imgs = imgs.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        teacher(imgs, None, None, mode='test', task='source')
+        reliability_bank.accumulate_source(feature_hook.output, targets)
+    reliability_bank.finalize_source()
+
+    features, labels, confidences, sample_ids = [], [], [], []
+    for imgs, _, ids in target_loader:
+        logits, _ = teacher(imgs.to(device, non_blocking=True), None, None,
+                            mode='test', task='target')
+        conf, pred = F.softmax(logits, dim=1).max(dim=1)
+        features.append(feature_hook.output.detach().cpu())
+        labels.append(pred.cpu())
+        confidences.append(conf.cpu())
+        sample_ids.append(ids.cpu())
+    if features:
+        reliability_bank.set_target_memory(
+            torch.cat(features), torch.cat(labels), torch.cat(confidences), torch.cat(sample_ids)
+        )
 
 
 def run_training():
@@ -300,16 +341,16 @@ def run_training():
     source_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_prototype_consistency_v3_source_best.pth'
+        + '_prototype_knn_v4_source_best.pth'
     )
     target_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_prototype_consistency_v3_target_best.pth'
+        + '_prototype_knn_v4_target_best.pth'
     )
 
     print('---------------------------------------------------------------------------------------')
-    print('EMA + Dual View + Stable CAT + Prototype Consistency v3 + Confidence/Energy OR: '
+    print('EMA + Dual View + Stable CAT + Prototype KNN v4 + Confidence/KNN OR: '
           '%s with source %s and target %s' %
           (args.backbone, args.data1, args.data2))
     print('alpha(w1):%s beta(w2):%s gamma(w3):%s ema:%s '
@@ -320,11 +361,12 @@ def run_training():
     print('prototype weight:%s temp:%s momentum:%s source_anchor:%s warmup:%s ramp:%s' %
           (args.proto_weight, args.proto_temperature, args.proto_momentum,
            args.proto_source_anchor, args.proto_warmup_epochs, args.proto_ramp_epochs))
-    print('energy rescue:%s bandwidth:%s quantile:%s covariance_shrinkage:%s '
-          'density_samples:%s warmup:%s refresh_interval:%s' %
-          (args.energy_gate, args.energy_bandwidth, args.energy_quantile,
-           args.energy_cov_shrinkage, args.energy_max_density_samples,
-           args.energy_warmup_epochs, args.energy_refresh_interval))
+    print('knn rescue:%s k:%s lambda:%s sigma_momentum:%s bandwidth:%s '
+          'score_threshold:%s density_threshold:%s warmup:%s refresh_interval:%s' %
+          (args.knn_gate, args.knn_k, args.knn_interval_lambda,
+           args.knn_sigma_momentum, args.knn_bandwidth_multiplier,
+           args.knn_score_threshold, args.knn_density_threshold,
+           args.knn_warmup_epochs, args.knn_refresh_interval))
     print('---------------------------------------------------------------------------------------')
 
     if args.backbone == 'resnet18':
@@ -353,12 +395,20 @@ def run_training():
     target_train = FER(
         args.target_path, phase='train', transform=weak_transform,
         weak2_transform=weak_transform, strong_transform=strong_transform,
-        basic_aug=False
+        basic_aug=False, return_index=True
     )
     target_threshold = FER(
         args.target_path, phase='train', transform=weak_transform,
         strong_transform=None, basic_aug=False
     )
+    target_memory = None
+    if args.knn_gate:
+        target_memory = FER(
+            args.target_path, phase='train', transform=test_transform,
+            basic_aug=False, return_index=True,
+        )
+        if target_train.file_paths != target_memory.file_paths:
+            raise RuntimeError('training and memory views must share identical sample IDs')
     target_val = FER(
         args.target_path, phase='val', transform=test_transform,
         strong_transform=None
@@ -386,6 +436,12 @@ def run_training():
         target_threshold, batch_size=test_batch, num_workers=args.workers,
         shuffle=False, pin_memory=True, worker_init_fn=_init_fn,
     )
+    memory_loader_target = None
+    if target_memory is not None:
+        memory_loader_target = torch.utils.data.DataLoader(
+            target_memory, batch_size=test_batch, num_workers=args.workers,
+            shuffle=False, pin_memory=True, worker_init_fn=_init_fn,
+        )
     val_loader_target = torch.utils.data.DataLoader(
         target_val, batch_size=test_batch, num_workers=args.workers,
         shuffle=False, pin_memory=True,
@@ -458,11 +514,18 @@ def run_training():
             save_checkpoint(source_best_path, model, optimizer, scheduler, i,
                             best_source_val_acc, args)
             print('best source-stage validation accuracy %.4f' % best_source_val_acc)
-    # 加载源域训练好的 checkpoint
-    checkpoint = torch.load(source_best_path, map_location='cuda')
-    model.load_state_dict(checkpoint['model'])
-    optimizer.load_state_dict(checkpoint['optimizer'])
-    scheduler.load_state_dict(checkpoint['scheduler'])
+    # --checkpoint is weights initialization, not a full target-stage resume.
+    if args.pre_epochs > 0:
+        checkpoint = torch.load(source_best_path, map_location='cuda')
+        model.load_state_dict(checkpoint['model'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        scheduler.load_state_dict(checkpoint['scheduler'])
+    else:
+        # Weights were loaded above; start target training with a fresh optimizer.
+        source_best_path = args.checkpoint
+        best_source_val_acc = evaluate(
+            model, val_loader_target, criterion, len(target_val), -1, 'Validation'
+        )
 
     # 构建 EMA 教师模型
     teacher = create_ema_teacher(model).cuda()
@@ -487,37 +550,23 @@ def run_training():
     print('source prototype counts: %s' %
           np.array2string(prototype_bank.source_counts.cpu().numpy(), separator=', '))
 
-    # 初始化类别分布库（存储每个类别的特征分布），用于目标域伪标签/置信度
-    distribution_bank = ClassDistributionBank(
+    # 新的拯救模块：冻结的混合原型 + 全局 sigma EMA + 目标域全类别近邻库。
+    reliability_bank = KNNReliabilityBank(
         class_num,
         model.fc.in_features,
-        bandwidth=args.energy_bandwidth,
-        covariance_shrinkage=args.energy_cov_shrinkage,
-        energy_quantile=args.energy_quantile,
-        max_density_samples=args.energy_max_density_samples,
+        k=args.knn_k,
+        interval_lambda=args.knn_interval_lambda,
+        sigma_momentum=args.knn_sigma_momentum,
+        bandwidth_multiplier=args.knn_bandwidth_multiplier,
+        score_threshold=args.knn_score_threshold,
+        density_threshold=args.knn_density_threshold,
+        query_chunk_size=args.knn_query_chunk_size,
     ).cuda()
 
     best_target_val_acc = -1.0
     global_step = 0
 
     for i in range(args.epochs):
-        if args.energy_gate and i % args.energy_refresh_interval == 0:
-            rebuild_source_distribution(
-                teacher,
-                teacher_feature_hook,
-                prototype_loader_source,
-                distribution_bank,
-            )
-            print('[Target Epoch %d] Energy source counts: %s' %
-                  (i, np.array2string(
-                      distribution_bank.source_counts.cpu().numpy(), separator=', '
-                  )))
-            print('[Target Epoch %d] Class log-energy rescue thresholds: %s' %
-                  (i, np.array2string(
-                      distribution_bank.log_energy_thresholds.cpu().numpy(),
-                      precision=4,
-                  )))
-
         thresholds, class_mean, global_mean, threshold_center = calculate_target_thresholds(
             teacher,
             threshold_loader_target,
@@ -528,10 +577,20 @@ def run_training():
             args.threshold_min,
             args.threshold_max,
         )
+        if args.knn_gate and i % args.knn_refresh_interval == 0:
+            refresh_reliability_bank(
+                teacher, teacher_feature_hook, prototype_loader_source,
+                memory_loader_target, prototype_bank, reliability_bank,
+            )
+            print('[Target Epoch %d] KNN Source_Count: %d Target_Memory_Count: %d '
+                  'Global_Sigma: %.6f Sigma_Ready: %s' %
+                  (i, reliability_bank.source_count.item(),
+                   reliability_bank.memory_ids.numel(), reliability_bank.sigma.item(),
+                   reliability_bank.sigma_initialized.item()))
         current_proto_weight = prototype_weight_for_epoch(
             i, args.proto_weight, args.proto_warmup_epochs, args.proto_ramp_epochs
         )
-        enable_energy_rescue = args.energy_gate and i >= args.energy_warmup_epochs
+        enable_knn_rescue = args.knn_gate and i >= args.knn_warmup_epochs
 
         print('[Target Epoch %d] class mean confidence: %s global_mean: %.4f '
               'threshold_center: %.4f' %
@@ -539,8 +598,8 @@ def run_training():
                global_mean, threshold_center))
         print('[Target Epoch %d] class-adaptive thresholds: %s' %
               (i, np.array2string(thresholds.numpy(), precision=4)))
-        print('[Target Epoch %d] Energy OR rescue enabled: %s' %
-              (i, enable_energy_rescue))
+        print('[Target Epoch %d] KNN OR rescue enabled: %s' %
+              (i, enable_knn_rescue))
 
         model.train()
         source_train_iter = iter(train_loader_source)
@@ -551,11 +610,13 @@ def run_training():
         batch_count = 0
         agreement_num = 0
         confidence_accept_num = 0
-        energy_pass_num = 0
-        energy_rescue_num = 0
+        knn_pass_num = 0
+        knn_rescue_num = 0
         final_accept_num = 0
-        energy_sum = 0.0
-        energy_count = 0
+        score_sum = 0.0
+        density_sum = 0.0
+        knn_checked_num = 0
+        dense_num = 0
         prototype_agree_num = 0
         prototype_checked_num = 0
         prototype_similarity_sum = 0.0
@@ -563,7 +624,7 @@ def run_training():
         pseudo_distribution_rescued = np.zeros(class_num, dtype=np.int64)
         pseudo_distribution_final = np.zeros(class_num, dtype=np.int64)
 
-        for weak1, weak2, strong, _ in train_loader_target:
+        for weak1, weak2, strong, _, sample_ids in train_loader_target:
             try:
                 source_imgs, source_targets = next(source_train_iter)
             except StopIteration:
@@ -576,7 +637,7 @@ def run_training():
 
             teacher.eval()
             # 用EMA Teacher对目标域样本的两个弱增强视图进行预测，生成伪标签，并提取一个融合后的teacher 特征，供后面的
-            # energy判断和prototype更新使用
+            # kNN可靠性判断和prototype更新使用
             with torch.no_grad():
                 logits1, _ = teacher(weak1, None, None, 'test', 'target')
                 teacher_features1 = teacher_feature_hook.output.detach()
@@ -598,34 +659,19 @@ def run_training():
                 agreement_mask = torch.argmax(logits1, dim=1).eq(
                     torch.argmax(logits2, dim=1)
                 )
-                # 条件性地调用一个energy gate（能量门控）机制
-                if args.energy_gate:
-                    log_energy, energy_mask = distribution_bank.gate(
-                        teacher_mean_features,
-                        pseudo_targets,
-                        agreement_mask,
+                knn_result = None
+                reliability_mask = torch.zeros_like(agreement_mask)
+                if args.knn_gate:
+                    knn_result = reliability_bank.gate(
+                        teacher_mean_features, pseudo_targets, sample_ids,
+                        agreement_mask, thresholds,
                     )
-                    # ClassDistributionBank.gate intentionally fails open for an
-                    # uninitialized class, which is correct for v2 veto gating
-                    # but unsafe for v3 rescue. An uninitialized class must not
-                    # be allowed to rescue low-confidence pseudo labels.
-                    initialized_mask = distribution_bank.source_initialized.index_select(
-                        0, pseudo_targets
-                    )
-                    energy_mask = energy_mask & initialized_mask
-                else:
-                    log_energy = teacher_mean_features.new_full(
-                        (teacher_mean_features.size(0),), float('nan')
-                    )
-                    energy_mask = torch.zeros_like(agreement_mask)
+                    reliability_mask = knn_result['pass_mask']
 
-                #拯救策略！！！
-                if enable_energy_rescue:
-                    rescue_mask = agreement_mask & energy_mask & ~confidence_mask
-                    final_mask = confidence_mask | rescue_mask
-                else:
-                    rescue_mask = torch.zeros_like(confidence_mask)
-                    final_mask = confidence_mask
+                final_mask, rescue_mask = combine_rescue_masks(
+                    confidence_mask, agreement_mask, reliability_mask, enable_knn_rescue
+                )
+                # Networks.forward selects idx == 1: retain a binary mask here.
                 con_idx = final_mask.float()
 
                 # 评估函数，用来统计在“可靠样本”上，模型特征与原型之间的预测一致性和相似度，会只检查 con_idx=1 的最终可靠目标样本
@@ -637,15 +683,16 @@ def run_training():
             # 统计当前epoch中不同阶段一共接纳了多少目标样本
             agreement_num += agree_count
             confidence_accept_num += int(confidence_mask.sum().item())
-            energy_pass_num += int((agreement_mask & energy_mask).sum().item())
-            energy_rescue_num += int(rescue_mask.sum().item())
+            knn_pass_num += int(reliability_mask.sum().item())
+            knn_rescue_num += int(rescue_mask.sum().item())
             final_accept_num += int(final_mask.sum().item())
 
-            # 确实成功计算出有限energy的样本进行统计
-            finite_energy = agreement_mask & torch.isfinite(log_energy)
-            if finite_energy.any():
-                energy_sum += float(log_energy[finite_energy].sum().item())
-                energy_count += int(finite_energy.sum().item())
+            if knn_result is not None:
+                checked = knn_result['checked_mask']
+                score_sum += float(knn_result['score'][checked].sum().item())
+                density_sum += float(knn_result['density'][checked].sum().item())
+                knn_checked_num += int(checked.sum().item())
+                dense_num += int(knn_result['dense_mask'].sum().item())
             # 累计prototype诊断指标
             prototype_agree_num += proto_agree
             prototype_checked_num += proto_checked
@@ -733,14 +780,16 @@ def run_training():
             prototype_similarity_sum / float(prototype_checked_num)
             if prototype_checked_num > 0 else 0.0
         )
-        # 整个 epoch 的平均log energy
-        mean_log_energy = energy_sum / float(energy_count) if energy_count > 0 else 0.0
+        mean_score = score_sum / max(knn_checked_num, 1)
+        mean_density = density_sum / max(knn_checked_num, 1)
 
         print('[Target Epoch %d] Agreement_Num: %d Confidence_Accept_Num: %d '
-              'Energy_Pass_Num: %d Energy_Rescue_Num: %d Final_Accept_Num: %d '
-              'Mean_Agreed_LogEnergy: %.4f' %
-              (i, agreement_num, confidence_accept_num, energy_pass_num,
-               energy_rescue_num, final_accept_num, mean_log_energy))
+              'KNN_Pass_Num: %d KNN_Rescue_Num: %d Final_Accept_Num: %d '
+              'Mean_Reliability: %.4f Mean_Density: %.4f '
+              'KNN_Checked_Num: %d Dense_Num: %d Sparse_Num: %d' %
+              (i, agreement_num, confidence_accept_num, knn_pass_num,
+               knn_rescue_num, final_accept_num, mean_score, mean_density,
+               knn_checked_num, dense_num, knn_checked_num - dense_num))
         print('[Target Epoch %d] Pseudo_Distribution_Confidence: %s' %
               (i, np.array2string(pseudo_distribution_confidence, separator=', ')))
         print('[Target Epoch %d] Pseudo_Distribution_Rescued: %s' %
@@ -771,6 +820,7 @@ def run_training():
                 target_best_path, model, optimizer, scheduler, i,
                 best_target_val_acc, args, teacher=teacher,
                 prototype_bank=prototype_bank,
+                reliability_bank=reliability_bank,
             )
             print('best target-stage validation accuracy %.4f' % best_target_val_acc)
 
