@@ -13,7 +13,11 @@ def points(angles):
 def ready_bank(k=2, **kwargs):
     bank = KNNReliabilityBank(2, 2, k=k, score_threshold=0.6, **kwargs)
     bank.begin_source_refresh(torch.tensor([[1., 0.], [-1., 0.]]), torch.tensor([True, True]))
-    # Independent fixed radial scale for synthetic geometry tests.
+    # Independent diagonal Gaussians and local bandwidth for geometry tests.
+    bank.class_means.copy_(bank.prototypes)
+    bank.class_variances.fill_(0.02)
+    bank.distribution_initialized.fill_(True)
+    bank.prototype_in_distribution.fill_(True)
     bank.global_var.fill_(0.04)
     bank.sigma_initialized.fill_(True)
     return bank
@@ -70,7 +74,7 @@ class ReliabilityTests(unittest.TestCase):
         fill(bank, [0., 0.], ids=[42, 43])
         self.assertGreater(query(bank, sample_id=42)['score'].item(), 0.99)
 
-    def test_query_and_neighbors_must_be_in_assigned_prototype_region(self):
+    def test_query_and_neighbors_must_be_in_assigned_class_distribution(self):
         bank = ready_bank()
         fill(bank, [0.7, 0.71])
         result = query(bank, angle=0.7)
@@ -79,9 +83,9 @@ class ReliabilityTests(unittest.TestCase):
         result = query(bank)
         self.assertEqual(result['support_fraction'].item(), 0.)
 
-    def test_interval_lambda_changes_region_membership(self):
-        tight = ready_bank(interval_lambda=1.)
-        wide = ready_bank(interval_lambda=2.)
+    def test_distribution_mass_changes_region_membership(self):
+        tight = ready_bank(distribution_mass=0.5)
+        wide = ready_bank(distribution_mass=0.99)
         fill(tight, [0.25, -0.25])
         fill(wide, [0.25, -0.25])
         self.assertEqual(query(tight)['score'].item(), 0.)
@@ -96,7 +100,7 @@ class ReliabilityTests(unittest.TestCase):
         bank.sigma_initialized.fill_(False)
         self.assertFalse(query(bank)['pass_mask'].item())
         bank.sigma_initialized.fill_(True)
-        bank.prototype_initialized[0] = False
+        bank.distribution_initialized[0] = False
         self.assertFalse(query(bank)['pass_mask'].item())
 
     def test_nonfinite_memory_and_queries_do_not_produce_nan_scores(self):
@@ -115,20 +119,72 @@ class ReliabilityTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             fill(ready_bank(), [0., 0.01], ids=[3, 3])
 
-    def test_source_variance_is_global_sample_weighted_and_ema_updated(self):
+    def test_class_means_variances_and_moment_ema(self):
         bank = KNNReliabilityBank(2, 2, sigma_momentum=0.9)
         centers = torch.tensor([[1., 0.], [-1., 0.]])
         initialized = torch.tensor([True, True])
+        x = points([0., 0.2, -0.1, 2.8, 3., 3.2])
+        labels = torch.tensor([0, 0, 0, 1, 1, 1])
         bank.begin_source_refresh(centers, initialized)
-        bank.accumulate_source(torch.tensor([[1., 0.]]), torch.tensor([0]))
-        bank.accumulate_source(torch.tensor([[0., 1.], [-1., 0.]]), torch.tensor([0, 0]))
+        bank.accumulate_source(x[:2], labels[:2])
+        bank.accumulate_source(x[2:], labels[2:])
         bank.finalize_source()
-        self.assertAlmostEqual(bank.global_var.item(), 2., places=6)
-        self.assertEqual(bank.source_count.item(), 3)
+        means = torch.stack([x[:3].mean(0), x[3:].mean(0)])
+        variances = torch.stack([x[:3].var(0, unbiased=False), x[3:].var(0, unbiased=False)])
+        self.assertTrue(torch.allclose(bank.class_means, means, atol=1e-6))
+        self.assertTrue(torch.allclose(bank.class_variances, variances.clamp_min(1e-4), atol=1e-6))
+        old_variances = bank.class_variances.clone()
+        self.assertEqual(bank.class_source_counts.tolist(), [3, 3])
+        shifted = points([0.3, 0.5, 0.2, 2.5, 2.7, 2.9])
+        new_means = torch.stack([shifted[:3].mean(0), shifted[3:].mean(0)])
+        new_variances = torch.stack([shifted[:3].var(0, unbiased=False), shifted[3:].var(0, unbiased=False)])
         bank.begin_source_refresh(centers, initialized)
-        bank.accumulate_source(torch.tensor([[1., 0.], [-1., 0.]]), torch.tensor([0, 1]))
+        bank.accumulate_source(shifted, labels)
         bank.finalize_source()
-        self.assertAlmostEqual(bank.global_var.item(), 1.8, places=6)
+        expected_var = (0.9 * old_variances + 0.1 * new_variances
+                        + 0.09 * (means - new_means).square()).clamp_min(1e-4)
+        self.assertTrue(torch.allclose(bank.class_means, 0.9 * means + 0.1 * new_means, atol=1e-6))
+        self.assertTrue(torch.allclose(bank.class_variances, expected_var, atol=1e-6))
+        self.assertAlmostEqual(bank.global_var.item(), expected_var.sum(1).mean().item(), places=6)
+
+    def test_chi_square_quantile_and_anisotropic_membership(self):
+        bank = ready_bank()
+        # Chi-square(2) quantile has the exact closed form -2 log(1-p).
+        self.assertAlmostEqual(bank.mahalanobis_threshold.item(), -2 * math.log(0.05), places=5)
+        bank.class_means[0].zero_()
+        bank.class_variances[0] = torch.tensor([1., 0.01])
+        z = torch.tensor([[1., 0.], [0., 1.]])
+        distances = bank.distribution_distance(z, torch.tensor([0, 0]))
+        self.assertTrue(torch.allclose(distances, torch.tensor([1., 100.])))
+        self.assertEqual(bank.in_distribution(z, torch.tensor([0, 0])).tolist(), [True, False])
+
+    def test_bad_mixed_prototype_prevents_rescue(self):
+        bank = KNNReliabilityBank(2, 2, k=1)
+        # Class 0 data are around +x, but its mixed prototype has drifted to -x.
+        bank.begin_source_refresh(points([math.pi, math.pi]), torch.tensor([True, True]))
+        bank.accumulate_source(points([-0.1, 0.1]), torch.tensor([0, 0]))
+        bank.finalize_source()
+        self.assertTrue(bank.in_distribution(points([0.]), torch.tensor([0])).item())
+        self.assertFalse(bank.prototype_in_distribution[0].item())
+        fill(bank, [0.01])
+        self.assertEqual(query(bank)['score'].item(), 0.)
+        self.assertFalse(query(bank)['pass_mask'].item())
+
+    def test_identical_features_and_missing_classes_fail_closed(self):
+        bank = KNNReliabilityBank(2, 2, k=1)
+        bank.begin_source_refresh(points([0., math.pi]), torch.tensor([True, True]))
+        bank.accumulate_source(points([0., 0., math.pi]), torch.tensor([0, 0, 1]))
+        bank.finalize_source()
+        self.assertEqual(bank.distribution_initialized.tolist(), [True, False])
+        self.assertTrue(torch.isfinite(bank.class_variances).all())
+        self.assertTrue((bank.class_variances >= bank.variance_floor).all())
+        fill(bank, [0.])
+        self.assertTrue(query(bank)['pass_mask'].item())
+        self.assertFalse(query(bank, angle=math.pi, label=1)['pass_mask'].item())
+        bank.begin_source_refresh(points([0., math.pi]), torch.tensor([True, True]))
+        bank.finalize_source()
+        self.assertFalse(bank.distribution_initialized.any())
+        self.assertFalse(bank.sigma_initialized.item())
 
     def test_centers_are_snapshots_and_memory_is_not_checkpointed(self):
         bank = ready_bank()
@@ -174,3 +230,4 @@ class ReliabilityTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

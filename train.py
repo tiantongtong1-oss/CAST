@@ -88,14 +88,16 @@ def parse_args(argv=None):
 
     parser.set_defaults(knn_gate=True)
     parser.add_argument('--knn_gate', dest='knn_gate', action='store_true',
-                        help='enable prototype-region/kNN OR rescue (default)')
+                        help='enable class-Gaussian/kNN OR rescue (default)')
     parser.add_argument('--no_knn_gate', dest='knn_gate', action='store_false',
                         help='strict dual-view confidence baseline without rescue')
     parser.add_argument('--knn_k', type=int, default=20)
-    parser.add_argument('--knn_interval_lambda', type=float, default=1.5,
-                        help='prototype confidence-region radius = lambda * sigma')
+    parser.add_argument('--knn_distribution_mass', type=float, default=0.95,
+                        help='nominal class Gaussian ellipsoid probability content')
+    parser.add_argument('--knn_variance_floor', type=float, default=1e-4,
+                        help='minimum per-coordinate class variance')
     parser.add_argument('--knn_sigma_momentum', type=float, default=0.9,
-                        help='global radial variance EMA, updated once per refresh')
+                        help='class Gaussian moment EMA, updated once per refresh')
     parser.add_argument('--knn_bandwidth_multiplier', type=float, default=1.0,
                         help='local Gaussian bandwidth = multiplier * sigma')
     parser.add_argument('--knn_score_threshold', type=float, default=0.5)
@@ -113,7 +115,9 @@ def parse_args(argv=None):
         parser.error('epoch counts must be nonnegative')
     if not 0 <= args.knn_sigma_momentum < 1:
         parser.error('knn_sigma_momentum must be in [0, 1)')
-    for name in ('knn_interval_lambda', 'knn_bandwidth_multiplier'):
+    if not 0 < args.knn_distribution_mass < 1:
+        parser.error('knn_distribution_mass must be in (0, 1)')
+    for name in ('knn_variance_floor', 'knn_bandwidth_multiplier'):
         if not np.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
             parser.error('%s must be finite and positive' % name)
     for name in ('knn_score_threshold', 'knn_density_threshold'):
@@ -341,12 +345,12 @@ def run_training():
     source_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_prototype_knn_v4_source_best.pth'
+        + '_prototype_gaussian_knn_v5_source_best.pth'
     )
     target_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_prototype_knn_v4_target_best.pth'
+        + '_prototype_gaussian_knn_v5_target_best.pth'
     )
 
     print('---------------------------------------------------------------------------------------')
@@ -361,9 +365,9 @@ def run_training():
     print('prototype weight:%s temp:%s momentum:%s source_anchor:%s warmup:%s ramp:%s' %
           (args.proto_weight, args.proto_temperature, args.proto_momentum,
            args.proto_source_anchor, args.proto_warmup_epochs, args.proto_ramp_epochs))
-    print('knn rescue:%s k:%s lambda:%s sigma_momentum:%s bandwidth:%s '
+    print('knn rescue:%s k:%s distribution_mass:%s moment_momentum:%s bandwidth:%s '
           'score_threshold:%s density_threshold:%s warmup:%s refresh_interval:%s' %
-          (args.knn_gate, args.knn_k, args.knn_interval_lambda,
+          (args.knn_gate, args.knn_k, args.knn_distribution_mass,
            args.knn_sigma_momentum, args.knn_bandwidth_multiplier,
            args.knn_score_threshold, args.knn_density_threshold,
            args.knn_warmup_epochs, args.knn_refresh_interval))
@@ -550,12 +554,13 @@ def run_training():
     print('source prototype counts: %s' %
           np.array2string(prototype_bank.source_counts.cpu().numpy(), separator=', '))
 
-    # 新的拯救模块：冻结的混合原型 + 全局 sigma EMA + 目标域全类别近邻库。
+    # 新的拯救模块：逐类高斯分布 + 混合原型归属检查 + 目标域全类别近邻库。
     reliability_bank = KNNReliabilityBank(
         class_num,
         model.fc.in_features,
         k=args.knn_k,
-        interval_lambda=args.knn_interval_lambda,
+        distribution_mass=args.knn_distribution_mass,
+        variance_floor=args.knn_variance_floor,
         sigma_momentum=args.knn_sigma_momentum,
         bandwidth_multiplier=args.knn_bandwidth_multiplier,
         score_threshold=args.knn_score_threshold,
@@ -587,6 +592,9 @@ def run_training():
                   (i, reliability_bank.source_count.item(),
                    reliability_bank.memory_ids.numel(), reliability_bank.sigma.item(),
                    reliability_bank.sigma_initialized.item()))
+            print('Gaussian class counts:%s prototype_membership:%s' %
+                  (reliability_bank.class_source_counts.tolist(),
+                   reliability_bank.prototype_in_distribution.tolist()))
         current_proto_weight = prototype_weight_for_epoch(
             i, args.proto_weight, args.proto_warmup_epochs, args.proto_ramp_epochs
         )
@@ -849,3 +857,4 @@ def run_training():
 
 if __name__ == '__main__':
     run_training()
+

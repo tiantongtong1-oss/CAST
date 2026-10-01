@@ -37,7 +37,9 @@ class IntegrationTests(unittest.TestCase):
         self.assertFalse(parse_args(['--no_knn_gate']).knn_gate)
         for argv in (['--knn_k', '0'], ['--knn_refresh_interval', '0'],
                      ['--knn_sigma_momentum', '1'], ['--knn_score_threshold', '0'],
-                     ['--knn_bandwidth_multiplier', 'nan'], ['--pre_epochs', '0']):
+                     ['--knn_bandwidth_multiplier', 'nan'],
+                     ['--knn_distribution_mass', '1'], ['--knn_distribution_mass', 'nan'],
+                     ['--knn_variance_floor', '0'], ['--knn_interval_lambda', '1.5'], ['--pre_epochs', '0']):
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 parse_args(argv)
         args = parse_args(['--pre_epochs', '0', '--checkpoint', 'source.pth'])
@@ -110,9 +112,13 @@ class IntegrationTests(unittest.TestCase):
             saved = torch.load(path, map_location='cpu')
         self.assertIn('reliability_bank', saved)
         self.assertIn('global_var', saved['reliability_bank'])
+        for key in ('class_means', 'class_variances', 'distribution_initialized',
+                    'mahalanobis_threshold', 'prototype_in_distribution'):
+            self.assertIn(key, saved['reliability_bank'])
         self.assertNotIn('memory_features', saved['reliability_bank'])
         self.assertEqual(saved['args']['knn_k'], 20)
 
 
 if __name__ == '__main__':
     unittest.main()
+

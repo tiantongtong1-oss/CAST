@@ -1,9 +1,8 @@
-"""Prototype confidence regions and target-neighborhood support for OR rescue.
+"""Class-conditional diagonal Gaussian membership and target kNN OR rescue.
 
-All statistics and scores are detached. Sigma is a pooled radial RMS scale,
-not a per-coordinate Gaussian standard deviation or a calibrated probability.
-Target memory contains every valid training feature, including low-confidence
-predictions; confidence is checked after kNN retrieval, not before retrieval.
+Source means and per-coordinate variances define each class distribution.
+Prototype, query and neighbor membership use the same Mahalanobis ellipsoid.
+Gaussian model coverage is nominal; the final support score is not a posterior.
 """
 
 import math
@@ -14,14 +13,14 @@ import torch.nn.functional as F
 
 
 class KNNReliabilityBank(nn.Module):
-    def __init__(self, num_classes, feature_dim, k=20, interval_lambda=1.5,
+    def __init__(self, num_classes, feature_dim, k=20, distribution_mass=0.95,
                  sigma_momentum=0.9, bandwidth_multiplier=1.0,
                  score_threshold=0.5, density_threshold=0.5,
-                 query_chunk_size=128, eps=1e-8):
+                 query_chunk_size=128, variance_floor=1e-4, eps=1e-8):
         super().__init__()
         if num_classes < 1 or feature_dim < 1 or k < 1 or query_chunk_size < 1:
             raise ValueError('class count, feature dimension, k and chunk size must be positive')
-        for name, value in [('interval_lambda', interval_lambda),
+        for name, value in [('variance_floor', variance_floor),
                             ('bandwidth_multiplier', bandwidth_multiplier), ('eps', eps)]:
             if not math.isfinite(value) or value <= 0:
                 raise ValueError('%s must be finite and positive' % name)
@@ -32,7 +31,10 @@ class KNNReliabilityBank(nn.Module):
         self.num_classes = int(num_classes)
         self.feature_dim = int(feature_dim)
         self.k = int(k)
-        self.interval_lambda = float(interval_lambda)
+        if not 0 < distribution_mass < 1:
+            raise ValueError('distribution_mass must be in (0, 1)')
+        self.distribution_mass = float(distribution_mass)
+        self.variance_floor = float(variance_floor)
         self.sigma_momentum = float(sigma_momentum)
         self.bandwidth_multiplier = float(bandwidth_multiplier)
         self.score_threshold = float(score_threshold)
@@ -42,12 +44,34 @@ class KNNReliabilityBank(nn.Module):
 
         self.register_buffer('prototypes', torch.zeros(num_classes, feature_dim))
         self.register_buffer('prototype_initialized', torch.zeros(num_classes, dtype=torch.bool))
+        self.register_buffer('class_means', torch.zeros(num_classes, feature_dim))
+        self.register_buffer('class_variances', torch.ones(num_classes, feature_dim))
+        self.register_buffer('distribution_initialized', torch.zeros(num_classes, dtype=torch.bool))
+        self.register_buffer('class_source_counts', torch.zeros(num_classes, dtype=torch.long))
+        self.register_buffer('prototype_in_distribution', torch.zeros(num_classes, dtype=torch.bool))
+        # A chi-square quantile gives a nominal Gaussian probability-content region.
+        # Compute on CPU in float64 once, without adding a SciPy dependency.
+        shape = torch.tensor(feature_dim / 2.0, dtype=torch.float64)
+        low, high = 0.0, float(max(feature_dim, 1))
+        def cdf(value):
+            return torch.special.gammainc(shape, shape.new_tensor(value / 2.0)).item()
+        while cdf(high) < distribution_mass:
+            high *= 2.0
+        for _ in range(80):
+            mid = (low + high) / 2.0
+            if cdf(mid) < distribution_mass:
+                low = mid
+            else:
+                high = mid
+        self.register_buffer('mahalanobis_threshold', torch.tensor((low + high) / 2.0))
+        # Pooled trace of class variances controls only the local distance kernel.
         self.register_buffer('global_var', torch.zeros(()))
         self.register_buffer('sigma_initialized', torch.tensor(False))
         self.register_buffer('source_count', torch.zeros((), dtype=torch.long))
         # Source accumulators and target memory are rebuilt, never restored as stale features.
-        self.register_buffer('_source_sum', torch.zeros((), dtype=torch.float64), persistent=False)
-        self.register_buffer('_source_count', torch.zeros((), dtype=torch.long), persistent=False)
+        self.register_buffer('_source_sum', torch.zeros(num_classes, feature_dim, dtype=torch.float64), persistent=False)
+        self.register_buffer('_source_sq_sum', torch.zeros(num_classes, feature_dim, dtype=torch.float64), persistent=False)
+        self.register_buffer('_source_count', torch.zeros(num_classes, dtype=torch.long), persistent=False)
         self.register_buffer('memory_features', torch.empty(0, feature_dim), persistent=False)
         self.register_buffer('memory_labels', torch.empty(0, dtype=torch.long), persistent=False)
         self.register_buffer('memory_confidences', torch.empty(0), persistent=False)
@@ -59,7 +83,7 @@ class KNNReliabilityBank(nn.Module):
 
     @torch.no_grad()
     def begin_source_refresh(self, prototypes, initialized):
-        """Freeze scoring centers until the next refresh; retain the variance EMA."""
+        """Snapshot mixed prototypes and reset source statistics for a complete refresh."""
         if prototypes.shape != self.prototypes.shape or initialized.shape != self.prototype_initialized.shape:
             raise ValueError('prototype shapes do not match the reliability bank')
         prototypes = prototypes.detach().to(self.prototypes)
@@ -67,6 +91,8 @@ class KNNReliabilityBank(nn.Module):
         self.prototypes.copy_(F.normalize(torch.nan_to_num(prototypes), dim=1))
         self.prototype_initialized.copy_(initialized.to(self.prototype_initialized) & valid)
         self._source_sum.zero_()
+        self._source_sq_sum.zero_()
+        self.prototype_in_distribution.zero_()
         self._source_count.zero_()
         # The refreshed centers must not be scored until the new scan is finalized.
         self.clear_target_memory()
@@ -78,34 +104,71 @@ class KNNReliabilityBank(nn.Module):
         valid = torch.isfinite(features).all(dim=1) & (features.norm(dim=1) > self.eps)
         valid &= (labels >= 0) & (labels < self.num_classes)
         features, labels = features[valid], labels[valid]
-        ready = self.prototype_initialized[labels]
-        features, labels = features[ready], labels[ready]
         if features.size(0) == 0:
             return
-        z = F.normalize(features, dim=1)
-        residual_sq = (z - self.prototypes[labels]).square().sum(dim=1)
-        self._source_sum.add_(residual_sq.double().sum())
-        self._source_count.add_(residual_sq.numel())
+        z = F.normalize(features, dim=1).double()
+        self._source_sum.index_add_(0, labels, z)
+        self._source_sq_sum.index_add_(0, labels, z.square())
+        self._source_count.add_(torch.bincount(labels, minlength=self.num_classes))
 
     @torch.no_grad()
     def finalize_source(self):
-        """One sample-weighted global variance update per complete source scan."""
-        self.source_count.copy_(self._source_count)
-        if self._source_count.item() < 2:
-            self.sigma_initialized.fill_(False)
-            return
-        observed_var = (self._source_sum / self._source_count).to(self.global_var)
-        if not torch.isfinite(observed_var):
-            self.sigma_initialized.fill_(False)
-            return
-        observed_var = observed_var.clamp_min(self.eps)
-        if self.sigma_initialized.item():
-            self.global_var.mul_(self.sigma_momentum).add_(
-                observed_var, alpha=1.0 - self.sigma_momentum
-            )
+        """Fit each Gaussian; EMA uses moment matching, including mean drift."""
+        self.class_source_counts.copy_(self._source_count)
+        self.source_count.copy_(self._source_count.sum())
+        ready = self._source_count >= 2
+        counts = self._source_count.clamp_min(1).double().unsqueeze(1)
+        means = self._source_sum / counts
+        # Gaussian MLE diagonal variance, accumulated in float64 for stability.
+        variances = (self._source_sq_sum / counts - means.square()).clamp_min(0)
+        ready &= torch.isfinite(means).all(dim=1) & torch.isfinite(variances).all(dim=1)
+        for c in ready.nonzero(as_tuple=False).flatten().tolist():
+            mean = means[c].to(self.class_means)
+            var = variances[c].to(self.class_variances)
+            if self.distribution_initialized[c]:
+                beta = self.sigma_momentum
+                # Variance of a mixture: within-component variance + mean shift.
+                delta = self.class_means[c] - mean
+                var = (beta * self.class_variances[c] + (1 - beta) * var
+                       + beta * (1 - beta) * delta.square())
+                mean = beta * self.class_means[c] + (1 - beta) * mean
+            self.class_means[c].copy_(mean)
+            self.class_variances[c].copy_(var.clamp_min(self.variance_floor))
+        # A class missing in the current scan cannot rescue using stale statistics.
+        self.distribution_initialized.copy_(ready)
+        self.sigma_initialized.copy_(ready.any())
+        if ready.any():
+            weights = self._source_count[ready].to(self.global_var)
+            self.global_var.copy_((self.class_variances[ready].sum(dim=1) * weights).sum()
+                                  / weights.sum())
         else:
-            self.global_var.copy_(observed_var)
-        self.sigma_initialized.fill_(True)
+            self.global_var.zero_()
+        labels = torch.arange(self.num_classes, device=self.prototypes.device)
+        self.prototype_in_distribution.copy_(
+            self.prototype_initialized & self.in_distribution(self.prototypes, labels)
+        )
+
+    @torch.no_grad()
+    def distribution_distance(self, features, labels):
+        """Squared diagonal Mahalanobis distance for normalized features.
+
+        Accepts [B,D] or [B,K,D] with labels [B] or [B,K]. Missing classes
+        and invalid vectors return infinity, so all callers fail closed.
+        """
+        features = features.detach().to(self.class_means)
+        labels = labels.detach().to(device=features.device, dtype=torch.long)
+        valid_labels = (labels >= 0) & (labels < self.num_classes)
+        safe_labels = labels.clamp(0, self.num_classes - 1)
+        valid = valid_labels & self.distribution_initialized[safe_labels]
+        valid &= torch.isfinite(features).all(dim=-1) & (features.norm(dim=-1) > self.eps)
+        z = F.normalize(torch.nan_to_num(features), dim=-1)
+        distance = ((z - self.class_means[safe_labels]).square()
+                    / self.class_variances[safe_labels].clamp_min(self.variance_floor)).sum(dim=-1)
+        return distance.masked_fill(~valid, float('inf'))
+
+    @torch.no_grad()
+    def in_distribution(self, features, labels):
+        return self.distribution_distance(features, labels) <= self.mahalanobis_threshold
 
     @torch.no_grad()
     def clear_target_memory(self):
@@ -140,7 +203,7 @@ class KNNReliabilityBank(nn.Module):
         """Score agreed candidates. Missing statistics/neighbors cannot rescue.
 
         density = mean(exp(-distance_sq / (2 * h^2)))
-        score = self_in_region * mean(kernel * same_class * confident * in_region)
+        score = prototype_in_distribution * self_in_distribution * mean(kernel * same_class * confident * in_distribution)
         h = bandwidth_multiplier * sigma; density is a support index, not a PDF.
         """
         features = features.detach().to(self.prototypes)
@@ -158,6 +221,8 @@ class KNNReliabilityBank(nn.Module):
             raise ValueError('thresholds must be a finite vector with one value per class')
         result = {
             'score': features.new_zeros(n),
+            'mahalanobis_sq': features.new_full((n,), float('inf')),
+            'in_distribution': torch.zeros(n, dtype=torch.bool, device=device),
             'density': features.new_zeros(n),
             'support_fraction': features.new_zeros(n),
             'checked_mask': torch.zeros(n, dtype=torch.bool, device=device),
@@ -172,14 +237,13 @@ class KNNReliabilityBank(nn.Module):
         valid &= features.norm(dim=1) > self.eps
         valid &= (pseudo_targets >= 0) & (pseudo_targets < self.num_classes)
         rows = valid.nonzero(as_tuple=False).flatten()
-        rows = rows[self.prototype_initialized[pseudo_targets[rows]]]
-        radius_sq = self.interval_lambda ** 2 * self.global_var
+        rows = rows[self.distribution_initialized[pseudo_targets[rows]]
+                    & self.prototype_in_distribution[pseudo_targets[rows]]]
         h_sq = (self.bandwidth_multiplier ** 2 * self.global_var).clamp_min(self.eps)
         for start in range(0, rows.numel(), self.query_chunk_size):
             idx = rows[start:start + self.query_chunk_size]
             z = F.normalize(features[idx], dim=1)
             labels = pseudo_targets[idx]
-            centers = self.prototypes[labels]
             # Allocate [chunk, N], never the full [N, N] target distance matrix.
             distances = (2.0 - 2.0 * z.mm(self.memory_features.t())).clamp_min(0)
             distances.masked_fill_(sample_ids[idx, None].eq(self.memory_ids[None, :]), float('inf'))
@@ -187,12 +251,15 @@ class KNNReliabilityBank(nn.Module):
             enough_neighbors = torch.isfinite(nn_dist).all(dim=1)
             nn_labels = self.memory_labels[nn_idx]
             nn_features = self.memory_features[nn_idx]
-            neighbor_in_region = (
-                (nn_features - centers[:, None, :]).square().sum(dim=2) <= radius_sq
+            neighbor_in_region = self.in_distribution(
+                nn_features, labels[:, None].expand_as(nn_labels)
             )
             neighbor_confident = self.memory_confidences[nn_idx] >= thresholds[nn_labels]
             support = nn_labels.eq(labels[:, None]) & neighbor_confident & neighbor_in_region
-            self_in_region = (z - centers).square().sum(dim=1) <= radius_sq
+            mahalanobis_sq = self.distribution_distance(z, labels)
+            self_in_region = mahalanobis_sq <= self.mahalanobis_threshold
+            result['mahalanobis_sq'][idx] = mahalanobis_sq
+            result['in_distribution'][idx] = self_in_region
             weights = torch.exp(-nn_dist / (2.0 * h_sq))
             # Dividing by sum(weights) would remove the sparse-neighborhood penalty.
             score = (weights * support.float()).mean(dim=1) * self_in_region.float()
@@ -213,3 +280,4 @@ def combine_rescue_masks(confidence_mask, agreement_mask, reliability_mask, enab
     if enabled:
         rescue_mask = agreement_mask.bool() & reliability_mask.bool() & ~confidence_mask
     return confidence_mask | rescue_mask, rescue_mask
+
