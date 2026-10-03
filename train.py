@@ -108,7 +108,7 @@ def parse_args(argv=None):
                         help='local Gaussian bandwidth = multiplier * sigma')
     parser.add_argument('--knn_score_threshold', type=float, default=0.5)
     parser.add_argument('--knn_density_threshold', type=float, default=0.5,
-                        help='dense/sparse diagnostic cutoff; not an extra gate')
+                        help='dense/sparse cutoff used by the reliability score')
     parser.add_argument('--knn_warmup_epochs', type=int, default=3)
     parser.add_argument('--knn_refresh_interval', type=int, default=1)
     parser.add_argument('--knn_query_chunk_size', type=int, default=128,
@@ -382,12 +382,12 @@ def run_training():
     source_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_sample_gaussian_knn_v6_source_best.pth'
+        + '_source_global_gaussian_knn_v7_source_best.pth'
     )
     target_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_sample_gaussian_knn_v6_target_best.pth'
+        + '_source_global_gaussian_knn_v7_target_best.pth'
     )
 
     print('---------------------------------------------------------------------------------------')
