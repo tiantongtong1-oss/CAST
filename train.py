@@ -402,11 +402,13 @@ def run_training():
     print('prototype weight:%s temp:%s momentum:%s source_anchor:%s warmup:%s ramp:%s' %
           (args.proto_weight, args.proto_temperature, args.proto_momentum,
            args.proto_source_anchor, args.proto_warmup_epochs, args.proto_ramp_epochs))
-    print('knn rescue:%s k:%s distribution_mass:%s moment_momentum:%s bandwidth:%s '
-          'score_threshold:%s density_threshold:%s warmup:%s refresh_interval:%s' %
+    print('knn rescue:%s k:%s distribution_mass:%s global_momentum:[%s->%s] ramp:%s '
+          'bandwidth:%s score_threshold:%s density_threshold:%s sparse_penalty:%s '
+          'warmup:%s refresh_interval:%s' %
           (args.knn_gate, args.knn_k, args.knn_distribution_mass,
-           args.knn_sigma_momentum, args.knn_bandwidth_multiplier,
-           args.knn_score_threshold, args.knn_density_threshold,
+           args.knn_sigma_momentum, args.knn_sigma_momentum_end,
+           args.knn_sigma_momentum_ramp_refreshes, args.knn_bandwidth_multiplier,
+           args.knn_score_threshold, args.knn_density_threshold, args.knn_sparse_penalty,
            args.knn_warmup_epochs, args.knn_refresh_interval))
     print('---------------------------------------------------------------------------------------')
 
@@ -628,9 +630,12 @@ def run_training():
                 memory_loader_target, reliability_bank,
             )
             print('[Target Epoch %d] KNN Source_Count: %d Target_Memory_Count: %d '
-                  'Global_Sigma: %.6f Sigma_Ready: %s' %
+                  'Global_Sigma: %.6f Observed_Global_Var: %.8f EMA_Momentum: %.4f '
+                  'Sigma_Ready: %s' %
                   (i, reliability_bank.source_count.item(),
                    reliability_bank.memory_ids.numel(), reliability_bank.sigma.item(),
+                   reliability_bank.current_observed_global_var.item(),
+                   reliability_bank.current_global_momentum.item(),
                    reliability_bank.sigma_initialized.item()))
             log_gaussian_means(reliability_bank)
         current_proto_weight = prototype_weight_for_epoch(
