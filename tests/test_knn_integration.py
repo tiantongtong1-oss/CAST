@@ -13,7 +13,7 @@ from torchvision import transforms
 from dataset import FER
 from knn_reliability import KNNReliabilityBank
 from prototype_utils import FeatureHook, PrototypeBank
-from train import parse_args, refresh_reliability_bank, save_checkpoint
+from train import parse_args, refresh_reliability_bank, save_checkpoint, log_gaussian_means
 
 
 class TinyTeacher(nn.Module):
@@ -44,6 +44,26 @@ class IntegrationTests(unittest.TestCase):
                 parse_args(argv)
         args = parse_args(['--pre_epochs', '0', '--checkpoint', 'source.pth'])
         self.assertEqual(args.checkpoint, 'source.pth')
+
+    def test_mu_logging_is_complete_and_flags_large_values(self):
+        bank = KNNReliabilityBank(2, 1200)
+        bank.distribution_initialized[0] = True
+        bank.class_source_counts[0] = 12
+        bank.class_means[0].fill_(0.01)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            log_gaussian_means(bank)
+        text = out.getvalue()
+        self.assertIn('bound_ok=True', text)
+        self.assertIn('class=1 count=0 ready=False', text)
+        self.assertNotIn('...', text)
+        vector = text.split('mu=[', 1)[1].split(']', 1)[0]
+        self.assertEqual(len(vector.split(',')), 1200)
+        bank.class_means[0, 0] = 2.
+        with contextlib.redirect_stdout(out):
+            log_gaussian_means(bank)
+        self.assertIn('bound_ok=False', out.getvalue())
+        self.assertIn('WARNING', out.getvalue())
 
     def test_dataset_ids_match_across_views_and_default_interface_is_preserved(self):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as root:
@@ -92,7 +112,7 @@ class IntegrationTests(unittest.TestCase):
         for fake_labels in (torch.tensor([999, -999, 999]), torch.tensor([1, 0, 1])):
             bank = KNNReliabilityBank(2, 2, k=1)
             refresh_reliability_bank(teacher, hook, source_loader, [(target, fake_labels, ids)],
-                                     prototypes, bank)
+                                     bank)
             banks.append(bank)
         self.assertTrue(torch.equal(banks[0].memory_labels, torch.tensor([0, 1, 0])))
         self.assertTrue(torch.equal(banks[0].memory_labels, banks[1].memory_labels))
@@ -113,7 +133,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn('reliability_bank', saved)
         self.assertIn('global_var', saved['reliability_bank'])
         for key in ('class_means', 'class_variances', 'distribution_initialized',
-                    'mahalanobis_threshold', 'prototype_in_distribution'):
+                    'mahalanobis_threshold'):
             self.assertIn(key, saved['reliability_bank'])
         self.assertNotIn('memory_features', saved['reliability_bank'])
         self.assertEqual(saved['args']['knn_k'], 20)

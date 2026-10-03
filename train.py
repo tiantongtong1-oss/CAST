@@ -301,19 +301,42 @@ def initialize_source_prototypes(teacher, feature_hook, loader, prototype_bank):
     prototype_bank.finalize_source()
 
 
+def log_gaussian_means(reliability_bank):
+    """Print complete per-class mu vectors and scale diagnostics once per refresh."""
+    means = reliability_bank.class_means.detach().cpu().numpy()
+    ready = reliability_bank.distribution_initialized.detach().cpu().tolist()
+    counts = reliability_bank.class_source_counts.detach().cpu().tolist()
+    for c, mu in enumerate(means):
+        if not ready[c]:
+            print('[Gaussian mu] class=%d count=%d ready=False (no valid distribution)' %
+                  (c, counts[c]), flush=True)
+            continue
+        norm = float(np.linalg.norm(mu))
+        abs_max = float(np.abs(mu).max())
+        finite = bool(np.isfinite(mu).all())
+        # Means of unit vectors and their convex EMA have norm <= 1.
+        bound_ok = finite and norm <= 1.00001 and abs_max <= 1.00001
+        print('[Gaussian mu] class=%d count=%d ready=True l2=%.8g abs_max=%.8g '
+              'finite=%s bound_ok=%s' %
+              (c, counts[c], norm, abs_max, finite, bound_ok), flush=True)
+        print('[Gaussian mu values] class=%d mu=%s' %
+              (c, np.array2string(mu, precision=8, threshold=mu.size,
+                                 max_line_width=1000000, separator=', ')), flush=True)
+        if not bound_ok:
+            print('[Gaussian mu WARNING] class=%d exceeds normalized-mean bounds; '
+                  'check features/statistics/checkpoint.' % c, flush=True)
+
+
 @torch.no_grad()
 def refresh_reliability_bank(teacher, feature_hook, source_loader, target_loader,
-                             prototype_bank, reliability_bank):
+                             reliability_bank):
     """Refresh source scale and target-train memory in the same teacher space.
 
     Target labels from the dataset are intentionally ignored. A deterministic
     view is used for memory; only the two training weak views decide agreement.
     """
     device = next(teacher.parameters()).device
-    reliability_bank.begin_source_refresh(
-        prototype_bank.blended_prototypes(),
-        prototype_bank.source_initialized | prototype_bank.target_initialized,
-    )
+    reliability_bank.begin_source_refresh()
     teacher.eval()
     for imgs, targets in source_loader:
         imgs = imgs.to(device, non_blocking=True)
@@ -345,12 +368,12 @@ def run_training():
     source_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_prototype_gaussian_knn_v5_source_best.pth'
+        + '_sample_gaussian_knn_v6_source_best.pth'
     )
     target_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_prototype_gaussian_knn_v5_target_best.pth'
+        + '_sample_gaussian_knn_v6_target_best.pth'
     )
 
     print('---------------------------------------------------------------------------------------')
@@ -554,7 +577,7 @@ def run_training():
     print('source prototype counts: %s' %
           np.array2string(prototype_bank.source_counts.cpu().numpy(), separator=', '))
 
-    # 新的拯救模块：逐类高斯分布 + 混合原型归属检查 + 目标域全类别近邻库。
+    # 新的拯救模块：逐类源域高斯分布 + 逐样本归属检查 + 目标域全类别近邻库。
     reliability_bank = KNNReliabilityBank(
         class_num,
         model.fc.in_features,
@@ -585,16 +608,14 @@ def run_training():
         if args.knn_gate and i % args.knn_refresh_interval == 0:
             refresh_reliability_bank(
                 teacher, teacher_feature_hook, prototype_loader_source,
-                memory_loader_target, prototype_bank, reliability_bank,
+                memory_loader_target, reliability_bank,
             )
             print('[Target Epoch %d] KNN Source_Count: %d Target_Memory_Count: %d '
                   'Global_Sigma: %.6f Sigma_Ready: %s' %
                   (i, reliability_bank.source_count.item(),
                    reliability_bank.memory_ids.numel(), reliability_bank.sigma.item(),
                    reliability_bank.sigma_initialized.item()))
-            print('Gaussian class counts:%s prototype_membership:%s' %
-                  (reliability_bank.class_source_counts.tolist(),
-                   reliability_bank.prototype_in_distribution.tolist()))
+            log_gaussian_means(reliability_bank)
         current_proto_weight = prototype_weight_for_epoch(
             i, args.proto_weight, args.proto_warmup_epochs, args.proto_ramp_epochs
         )

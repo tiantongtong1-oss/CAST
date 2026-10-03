@@ -1,5 +1,7 @@
 # Prototype Gaussian KNN Reliability v5
 
+> 本文为历史 v5 设计。当前分支采用 [v6 逐样本分布判定](EXPERIMENT_SAMPLE_GAUSSIAN_KNN_V6.md)，已移除混合原型归属门控并增加完整 mu 日志。
+
 基于 `experiment/prototype-knn-reliability-v4`。将统一球形范围替换为逐类对角高斯分布，分别判断伪标签对应的混合类别原型、候选样本和 k 近邻是否受到该类别分布支持，再计算可靠性分数。
 
 ## 类别分布

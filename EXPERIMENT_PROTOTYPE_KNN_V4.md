@@ -1,6 +1,6 @@
 # Prototype KNN Reliability v4
 
-> 本文保留 v4 历史设计。本分支当前训练逻辑已升级为逐类高斯分布判定，参数、评分公式及运行方式见 [EXPERIMENT_PROTOTYPE_GAUSSIAN_KNN_V5.md](EXPERIMENT_PROTOTYPE_GAUSSIAN_KNN_V5.md)。
+> 本文保留 v4 历史设计。当前训练逻辑、参数、评分公式及运行方式见 [EXPERIMENT_SAMPLE_GAUSSIAN_KNN_V6.md](EXPERIMENT_SAMPLE_GAUSSIAN_KNN_V6.md)。
 
 基于 `experiment/prototype-consistency-v3`，将能量拯救替换为原型置信域与目标域 k 近邻支持评分。保留 EMA Teacher、双弱视图一致性、类别自适应置信度阈值、原型一致性损失及 v3 的 OR 拯救规则。
 

@@ -1,7 +1,7 @@
 """Class-conditional diagonal Gaussian membership and target kNN OR rescue.
 
 Source means and per-coordinate variances define each class distribution.
-Prototype, query and neighbor membership use the same Mahalanobis ellipsoid.
+Query and neighbor membership use the same source-class Mahalanobis ellipsoid.
 Gaussian model coverage is nominal; the final support score is not a posterior.
 """
 
@@ -42,13 +42,10 @@ class KNNReliabilityBank(nn.Module):
         self.query_chunk_size = int(query_chunk_size)
         self.eps = float(eps)
 
-        self.register_buffer('prototypes', torch.zeros(num_classes, feature_dim))
-        self.register_buffer('prototype_initialized', torch.zeros(num_classes, dtype=torch.bool))
         self.register_buffer('class_means', torch.zeros(num_classes, feature_dim))
         self.register_buffer('class_variances', torch.ones(num_classes, feature_dim))
         self.register_buffer('distribution_initialized', torch.zeros(num_classes, dtype=torch.bool))
         self.register_buffer('class_source_counts', torch.zeros(num_classes, dtype=torch.long))
-        self.register_buffer('prototype_in_distribution', torch.zeros(num_classes, dtype=torch.bool))
         # A chi-square quantile gives a nominal Gaussian probability-content region.
         # Compute on CPU in float64 once, without adding a SciPy dependency.
         shape = torch.tensor(feature_dim / 2.0, dtype=torch.float64)
@@ -82,24 +79,17 @@ class KNNReliabilityBank(nn.Module):
         return self.global_var.clamp_min(self.eps).sqrt()
 
     @torch.no_grad()
-    def begin_source_refresh(self, prototypes, initialized):
-        """Snapshot mixed prototypes and reset source statistics for a complete refresh."""
-        if prototypes.shape != self.prototypes.shape or initialized.shape != self.prototype_initialized.shape:
-            raise ValueError('prototype shapes do not match the reliability bank')
-        prototypes = prototypes.detach().to(self.prototypes)
-        valid = torch.isfinite(prototypes).all(dim=1) & (prototypes.norm(dim=1) > self.eps)
-        self.prototypes.copy_(F.normalize(torch.nan_to_num(prototypes), dim=1))
-        self.prototype_initialized.copy_(initialized.to(self.prototype_initialized) & valid)
+    def begin_source_refresh(self):
+        """Reset source accumulators independently of the training prototypes."""
         self._source_sum.zero_()
         self._source_sq_sum.zero_()
-        self.prototype_in_distribution.zero_()
         self._source_count.zero_()
         # The refreshed centers must not be scored until the new scan is finalized.
         self.clear_target_memory()
 
     @torch.no_grad()
     def accumulate_source(self, features, labels):
-        features = features.detach().to(self.prototypes)
+        features = features.detach().to(self.class_means)
         labels = labels.detach().to(device=features.device, dtype=torch.long)
         valid = torch.isfinite(features).all(dim=1) & (features.norm(dim=1) > self.eps)
         valid &= (labels >= 0) & (labels < self.num_classes)
@@ -143,11 +133,6 @@ class KNNReliabilityBank(nn.Module):
                                   / weights.sum())
         else:
             self.global_var.zero_()
-        labels = torch.arange(self.num_classes, device=self.prototypes.device)
-        self.prototype_in_distribution.copy_(
-            self.prototype_initialized & self.in_distribution(self.prototypes, labels)
-        )
-
     @torch.no_grad()
     def distribution_distance(self, features, labels):
         """Squared diagonal Mahalanobis distance for normalized features.
@@ -172,8 +157,8 @@ class KNNReliabilityBank(nn.Module):
 
     @torch.no_grad()
     def clear_target_memory(self):
-        self.memory_features = self.prototypes.new_empty((0, self.feature_dim))
-        self.memory_labels = self.prototype_initialized.new_empty((0,), dtype=torch.long)
+        self.memory_features = self.class_means.new_empty((0, self.feature_dim))
+        self.memory_labels = self.distribution_initialized.new_empty((0,), dtype=torch.long)
         self.memory_confidences = self.global_var.new_empty((0,))
         self.memory_ids = self.memory_labels.clone()
 
@@ -184,7 +169,7 @@ class KNNReliabilityBank(nn.Module):
         n = features.size(0)
         if any(t.shape != (n,) for t in (labels, confidences, sample_ids)):
             raise ValueError('target memory vectors must have shape [N]')
-        features = features.detach().to(self.prototypes)
+        features = features.detach().to(self.class_means)
         labels = labels.detach().to(device=features.device, dtype=torch.long)
         confidences = confidences.detach().to(self.global_var)
         sample_ids = sample_ids.detach().to(device=features.device, dtype=torch.long)
@@ -203,10 +188,10 @@ class KNNReliabilityBank(nn.Module):
         """Score agreed candidates. Missing statistics/neighbors cannot rescue.
 
         density = mean(exp(-distance_sq / (2 * h^2)))
-        score = prototype_in_distribution * self_in_distribution * mean(kernel * same_class * confident * in_distribution)
+        score = self_in_distribution * mean(kernel * same_class * confident * in_distribution)
         h = bandwidth_multiplier * sigma; density is a support index, not a PDF.
         """
-        features = features.detach().to(self.prototypes)
+        features = features.detach().to(self.class_means)
         n = features.size(0)
         if features.shape != (n, self.feature_dim):
             raise ValueError('query features must have shape [B, feature_dim]')
@@ -237,8 +222,7 @@ class KNNReliabilityBank(nn.Module):
         valid &= features.norm(dim=1) > self.eps
         valid &= (pseudo_targets >= 0) & (pseudo_targets < self.num_classes)
         rows = valid.nonzero(as_tuple=False).flatten()
-        rows = rows[self.distribution_initialized[pseudo_targets[rows]]
-                    & self.prototype_in_distribution[pseudo_targets[rows]]]
+        rows = rows[self.distribution_initialized[pseudo_targets[rows]]]
         h_sq = (self.bandwidth_multiplier ** 2 * self.global_var).clamp_min(self.eps)
         for start in range(0, rows.numel(), self.query_chunk_size):
             idx = rows[start:start + self.query_chunk_size]
