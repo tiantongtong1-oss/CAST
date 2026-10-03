@@ -12,7 +12,7 @@ import Networks
 from dataset import RafDataSet, FER
 from ema_utils import create_ema_teacher, select_dual_view_pseudo_labels, update_ema_teacher
 from prototype_utils import FeatureHook, PrototypeBank, prototype_weight_for_epoch
-from knn_reliability import KNNReliabilityBank, combine_rescue_masks
+from global_gaussian_knn_reliability import GlobalGaussianKNNReliabilityBank, combine_rescue_masks
 import image_utils as util
 from randaugment import RandAugmentMC
 # 总训练入口与调度器。串起数据、Source 预训练、EMA Teacher、
@@ -96,8 +96,14 @@ def parse_args(argv=None):
                         help='nominal class Gaussian ellipsoid probability content')
     parser.add_argument('--knn_variance_floor', type=float, default=1e-4,
                         help='minimum per-coordinate class variance')
-    parser.add_argument('--knn_sigma_momentum', type=float, default=0.9,
-                        help='class Gaussian moment EMA, updated once per refresh')
+    parser.add_argument('--knn_sigma_momentum', type=float, default=0.70,
+                        help='starting EMA momentum for the pooled source global variance')
+    parser.add_argument('--knn_sigma_momentum_end', type=float, default=0.95,
+                        help='final EMA momentum for the pooled source global variance')
+    parser.add_argument('--knn_sigma_momentum_ramp_refreshes', type=int, default=30,
+                        help='number of source refreshes used to increase global variance momentum')
+    parser.add_argument('--knn_sparse_penalty', type=float, default=0.5,
+                        help='multiplicative score penalty for sparse kNN neighborhoods')
     parser.add_argument('--knn_bandwidth_multiplier', type=float, default=1.0,
                         help='local Gaussian bandwidth = multiplier * sigma')
     parser.add_argument('--knn_score_threshold', type=float, default=0.5)
@@ -115,6 +121,14 @@ def parse_args(argv=None):
         parser.error('epoch counts must be nonnegative')
     if not 0 <= args.knn_sigma_momentum < 1:
         parser.error('knn_sigma_momentum must be in [0, 1)')
+    if not 0 <= args.knn_sigma_momentum_end < 1:
+        parser.error('knn_sigma_momentum_end must be in [0, 1)')
+    if args.knn_sigma_momentum_end < args.knn_sigma_momentum:
+        parser.error('knn_sigma_momentum_end must be >= knn_sigma_momentum')
+    if args.knn_sigma_momentum_ramp_refreshes < 1:
+        parser.error('knn_sigma_momentum_ramp_refreshes must be positive')
+    if not 0 < args.knn_sparse_penalty <= 1:
+        parser.error('knn_sparse_penalty must be in (0, 1]')
     if not 0 < args.knn_distribution_mass < 1:
         parser.error('knn_distribution_mass must be in (0, 1)')
     for name in ('knn_variance_floor', 'knn_bandwidth_multiplier'):
@@ -578,13 +592,16 @@ def run_training():
           np.array2string(prototype_bank.source_counts.cpu().numpy(), separator=', '))
 
     # 新的拯救模块：逐类源域高斯分布 + 逐样本归属检查 + 目标域全类别近邻库。
-    reliability_bank = KNNReliabilityBank(
+    reliability_bank = GlobalGaussianKNNReliabilityBank(
         class_num,
         model.fc.in_features,
         k=args.knn_k,
         distribution_mass=args.knn_distribution_mass,
         variance_floor=args.knn_variance_floor,
         sigma_momentum=args.knn_sigma_momentum,
+        global_momentum_end=args.knn_sigma_momentum_end,
+        global_momentum_ramp_refreshes=args.knn_sigma_momentum_ramp_refreshes,
+        sparse_penalty=args.knn_sparse_penalty,
         bandwidth_multiplier=args.knn_bandwidth_multiplier,
         score_threshold=args.knn_score_threshold,
         density_threshold=args.knn_density_threshold,
