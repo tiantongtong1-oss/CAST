@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torchvision import transforms
 
 import Networks
+from pseudo_audit import PredictionAudit, target_training_mask
 from dataset import RafDataSet, FER
 from ema_utils import create_ema_teacher, select_dual_view_pseudo_labels, update_ema_teacher
 from prototype_utils import FeatureHook, PrototypeBank, prototype_weight_for_epoch
@@ -114,7 +115,18 @@ def parse_args(argv=None):
     parser.add_argument('--knn_query_chunk_size', type=int, default=128,
                         help='bound temporary kNN distance matrix memory')
 
+    parser.add_argument('--exclude_target_disgust', action='store_true',
+                        help='exclude target pseudo class 2 from losses and prototype updates')
+    parser.add_argument('--audit_only', action='store_true',
+                        help='audit loaded source weights before target training, then exit')
+    parser.add_argument('--run_name', default='', type=str,
+                        help='optional separate output subdirectory under models/source_target')
     args = parser.parse_args(argv)
+    if args.run_name and (os.path.basename(args.run_name) != args.run_name
+                          or args.run_name in {'.', '..'}):
+        parser.error('run_name must be a single directory name')
+    if args.audit_only and (args.pre_epochs != 0 or not args.checkpoint):
+        parser.error('--audit_only requires --pre_epochs 0 and --checkpoint')
     if args.knn_k < 1 or args.knn_query_chunk_size < 1 or args.knn_refresh_interval < 1:
         parser.error('knn_k, knn_query_chunk_size and knn_refresh_interval must be positive')
     if args.knn_warmup_epochs < 0 or args.pre_epochs < 0 or args.epochs < 0:
@@ -277,6 +289,9 @@ def evaluate(model, loader, criterion, num_samples, epoch, split_name):
     print('[Epoch %d] Target %s accuracy: %.4f. Loss: %.3f' %
           (epoch, split_name, acc, avg_loss))
     util.make_confucion_matrix(preds, labels)
+    audit = PredictionAudit()
+    audit.add(torch.cat(labels).numpy(), torch.cat(preds).numpy())
+    audit.report('%s/Epoch %d' % (split_name, epoch))
     return acc
 
 
@@ -377,6 +392,8 @@ def refresh_reliability_bank(teacher, feature_hook, source_loader, target_loader
 def run_training():
     args = parse_args()
     model_path = os.path.join('./models', args.data1 + '_' + args.data2)
+    if args.run_name:
+        model_path = os.path.join(model_path, args.run_name)
     os.makedirs(model_path, exist_ok=True)
 
     source_best_path = os.path.join(
@@ -461,6 +478,11 @@ def run_training():
         strong_transform=None
     )
 
+    target_audit = FER(args.target_path, phase='train', transform=test_transform,
+                       basic_aug=False)
+    audit_loader = torch.utils.data.DataLoader(
+        target_audit, batch_size=test_batch, shuffle=False, num_workers=args.workers,
+    )
     class_num = 7
 
     train_loader_source = torch.utils.data.DataLoader(
@@ -570,6 +592,35 @@ def run_training():
             model, val_loader_target, criterion, len(target_val), -1, 'Validation'
         )
 
+    # Fixed-view baseline BEFORE any target optimizer step. Preserve RNG state
+    # so the diagnostic pass does not alter training augmentations or shuffling.
+    rng_state = (random.getstate(), np.random.get_state(), torch.get_rng_state(),
+                 torch.cuda.get_rng_state_all())
+    try:
+        audit_thresholds, _, _, _ = calculate_target_thresholds(
+            model, audit_loader, class_num, args.threshold_base, args.threshold_beta,
+            args.threshold_margin, args.threshold_min, args.threshold_max,
+        )
+        print('[PRE-TARGET] fixed single-view thresholds:', audit_thresholds.tolist())
+        before_audit = PredictionAudit()
+        model.eval()
+        with torch.no_grad():
+            for imgs, targets in audit_loader:
+                logits, _ = model(imgs.cuda(non_blocking=True), None, None,
+                                  mode='test', task='target')
+                conf, pred = F.softmax(logits, dim=1).max(dim=1)
+                mask = conf >= audit_thresholds.to(pred.device)[pred]
+                before_audit.add(targets.numpy(), pred.cpu().numpy(),
+                                 {'confidence': mask.cpu().numpy()})
+        before_audit.report('PRE-TARGET/fixed-single-view')
+    finally:
+        random.setstate(rng_state[0])
+        np.random.set_state(rng_state[1])
+        torch.set_rng_state(rng_state[2])
+        torch.cuda.set_rng_state_all(rng_state[3])
+    if args.audit_only:
+        return None
+
     # 构建 EMA 教师模型
     teacher = create_ema_teacher(model).cuda()
 
@@ -675,7 +726,8 @@ def run_training():
         pseudo_distribution_rescued = np.zeros(class_num, dtype=np.int64)
         pseudo_distribution_final = np.zeros(class_num, dtype=np.int64)
 
-        for weak1, weak2, strong, _, sample_ids in train_loader_target:
+        epoch_audit = PredictionAudit()
+        for weak1, weak2, strong, audit_targets, sample_ids in train_loader_target:
             try:
                 source_imgs, source_targets = next(source_train_iter)
             except StopIteration:
@@ -723,7 +775,23 @@ def run_training():
                     confidence_mask, agreement_mask, reliability_mask, enable_knn_rescue
                 )
                 # Networks.forward selects idx == 1: retain a binary mask here.
-                con_idx = final_mask.float()
+                train_mask = target_training_mask(
+                    final_mask, pseudo_targets, args.exclude_target_disgust,
+                )
+                con_idx = train_mask.float()
+                audit_masks = {
+                    'confidence': confidence_mask,
+                    'final': final_mask,
+                    'training': train_mask,
+                }
+                if knn_result is not None:
+                    audit_masks['confidence_AND_KNN'] = confidence_mask & reliability_mask
+                    audit_masks['rescue'] = rescue_mask
+                # Ground-truth target labels are used ONLY by this CPU diagnostic.
+                epoch_audit.add(
+                    audit_targets.numpy(), pseudo_targets.cpu().numpy(),
+                    {name: mask.cpu().numpy() for name, mask in audit_masks.items()},
+                )
 
                 # 评估函数，用来统计在“可靠样本”上，模型特征与原型之间的预测一致性和相似度，会只检查 con_idx=1 的最终可靠目标样本
                 proto_agree, proto_checked, proto_similarity = (
@@ -820,6 +888,7 @@ def run_training():
             train_loss3 += weight_loss.item()
             train_proto_loss += proto_loss.item()
             batch_count += 1
+        epoch_audit.report('Target Epoch %d/online-dual-view' % i)
         # 更新学习率
         scheduler.step()
         # 求均值
@@ -900,4 +969,5 @@ def run_training():
 
 if __name__ == '__main__':
     run_training()
+
 
