@@ -8,6 +8,9 @@ import torch
 import torch.nn.functional as F
 from torchvision import transforms
 
+from multi_prototypes import class_multi_prototypes
+from multi_source_margin import multi_prototype_margin_loss
+
 import Networks
 from pseudo_audit import PredictionAudit, target_training_mask
 from image_audit import ImageAudit
@@ -49,6 +52,12 @@ def parse_args(argv=None):
                         help='mobilenet_v2, resnet18 or resnet50')
     parser.add_argument('--lr', type=float, default=0.001)
     parser.add_argument('--workers', default=10, type=int)
+    # v8: source-only multi-prototype hinge, matching v7 full-source selection.
+    parser.add_argument('--source_margin_weight', type=float, default=0.1)
+    parser.add_argument('--source_margin', type=float, default=0.2)
+    parser.add_argument('--source_prototypes_per_class', type=int, default=3)
+    parser.add_argument('--source_cluster_iterations', type=int, default=20)
+    parser.add_argument('--source_only', action='store_true', help='exit after source checkpoint selection')
     parser.add_argument('--pre_epochs', type=int, default=30,
                         help='source-domain pre-training epochs')
     parser.add_argument('--epochs', type=int, default=30,
@@ -133,6 +142,12 @@ def parse_args(argv=None):
     parser.add_argument('--audit_images_per_subset', type=int, default=30,
                         help='images per group in each high-confidence/random subset')
     args = parser.parse_args(argv)
+    if (not np.isfinite(args.source_margin_weight) or args.source_margin_weight < 0
+            or not np.isfinite(args.source_margin) or not 0 <= args.source_margin <= 2
+            or args.source_prototypes_per_class < 1 or args.source_cluster_iterations < 1):
+        parser.error('invalid source margin or prototype settings')
+    if args.source_only and args.pre_epochs < 1:
+        parser.error('--source_only requires --pre_epochs > 0')
     if args.audit_source_knn and not args.export_audit_images:
         parser.error('--audit_source_knn requires --export_audit_images')
     if args.audit_source_knn_k < 1:
@@ -413,6 +428,30 @@ def refresh_reliability_bank(teacher, feature_hook, source_loader, target_loader
         )
 
 
+@torch.no_grad()
+def refresh_source_margin_prototypes(model, hook, loader, args):
+    # Restore RNG consumed by the extra DataLoader pass for a matched baseline.
+    rng = (random.getstate(), np.random.get_state(), torch.get_rng_state(),
+           torch.cuda.get_rng_state_all())
+    was_training = model.training
+    try:
+        model.eval()
+        features, labels = [], []
+        for images, targets in loader:
+            model(images.cuda(non_blocking=True), None, None, mode='test', task='source')
+            features.append(hook.output.detach().cpu().numpy())
+            labels.extend(targets.tolist())
+        centers, counts = class_multi_prototypes(
+            np.concatenate(features), labels, args.source_prototypes_per_class,
+            args.source_cluster_iterations)
+        print('[v8 SOURCE prototype counts] %s' % counts, flush=True)
+        return torch.from_numpy(centers).cuda()
+    finally:
+        model.train(was_training)
+        random.setstate(rng[0]); np.random.set_state(rng[1])
+        torch.set_rng_state(rng[2]); torch.cuda.set_rng_state_all(rng[3])
+
+
 def run_training():
     args = parse_args()
     model_path = os.path.join('./new_models', args.data1 + '_' + args.data2)
@@ -552,9 +591,17 @@ def run_training():
         checkpoint = torch.load(args.checkpoint, map_location='cuda')
         model.load_state_dict(checkpoint['model'], strict=True)
 
+    print('[v8] full RAFDB source; selection=FER validation accuracy; '
+          'source margin=%g weight=%g K=%d' %
+          (args.source_margin, args.source_margin_weight, args.source_prototypes_per_class), flush=True)
+    source_margin_hook = FeatureHook(model.feature) if args.source_margin_weight else None
     best_source_val_acc = -1.0
     for i in range(args.pre_epochs):
+        source_margin_prototypes = (refresh_source_margin_prototypes(
+            model, source_margin_hook, prototype_loader_source, args)
+            if source_margin_hook is not None else None)
         model.train()
+        train_margin_loss = 0.0
         train_loss1 = 0.0
         train_loss2 = 0.0
         train_loss3 = 0.0
@@ -571,7 +618,12 @@ def run_training():
             cls_loss = torch.mean(criterion(output[0], targets))
             aff_loss = output[1]
             weight_loss = classifier_modulation_loss(model)
-            loss = cls_loss * args.w1 + aff_loss * args.w2 + weight_loss * args.w3
+            source_margin_loss = (multi_prototype_margin_loss(
+                source_margin_hook.output, targets, source_margin_prototypes, args.source_margin)
+                if source_margin_hook is not None else cls_loss.new_zeros(()))
+            loss = (cls_loss * args.w1 + aff_loss * args.w2 + weight_loss * args.w3
+                    + args.source_margin_weight * source_margin_loss)
+            train_margin_loss += source_margin_loss.item()
             # 反向传播
             loss.backward()
             # 更新参数
@@ -594,7 +646,9 @@ def run_training():
                train_loss2 / max(batch_count, 1),
                train_loss3 / max(batch_count, 1),
                optimizer.param_groups[0]['lr']))
-        # 保存最佳的model
+        print('[v8 Source Epoch %d] Margin Loss: %.6f' %
+              (i, train_margin_loss / max(batch_count, 1)), flush=True)
+        # Save by FER validation accuracy, exactly as the v7 source stage.
         val_acc = evaluate(
             model, val_loader_target, criterion, len(target_val), i, 'Validation'
         )
@@ -603,6 +657,8 @@ def run_training():
             save_checkpoint(source_best_path, model, optimizer, scheduler, i,
                             best_source_val_acc, args)
             print('best source-stage validation accuracy %.4f' % best_source_val_acc)
+    if source_margin_hook is not None:
+        source_margin_hook.close()
     # --checkpoint is weights initialization, not a full target-stage resume.
     if args.pre_epochs > 0:
         checkpoint = torch.load(source_best_path, map_location='cuda')
@@ -615,6 +671,11 @@ def run_training():
         best_source_val_acc = evaluate(
             model, val_loader_target, criterion, len(target_val), -1, 'Validation'
         )
+
+    if args.source_only:
+        print('[v8 SOURCE ONLY] best FER validation accuracy %.6f checkpoint=%s' %
+              (best_source_val_acc, source_best_path), flush=True)
+        return best_source_val_acc
 
     # Fixed-view baseline BEFORE any target optimizer step. Preserve RNG state
     # so the diagnostic pass does not alter training augmentations or shuffling.
