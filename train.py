@@ -415,7 +415,7 @@ def refresh_reliability_bank(teacher, feature_hook, source_loader, target_loader
 
 def run_training():
     args = parse_args()
-    model_path = os.path.join('./models', args.data1 + '_' + args.data2)
+    model_path = os.path.join('./new_models', args.data1 + '_' + args.data2)
     if args.run_name:
         model_path = os.path.join(model_path, args.run_name)
     os.makedirs(model_path, exist_ok=True)
