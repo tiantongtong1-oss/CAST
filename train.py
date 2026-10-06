@@ -11,6 +11,7 @@ from torchvision import transforms
 import Networks
 from pseudo_audit import PredictionAudit, target_training_mask
 from image_audit import ImageAudit
+from source_knn_audit import SourceKNNAudit
 from dataset import RafDataSet, FER
 from ema_utils import create_ema_teacher, select_dual_view_pseudo_labels, update_ema_teacher
 from prototype_utils import FeatureHook, PrototypeBank, prototype_weight_for_epoch
@@ -124,11 +125,18 @@ def parse_args(argv=None):
                         help='optional separate output subdirectory under models/source_target')
     parser.add_argument('--export_audit_images', action='store_true',
                         help='export FER train diagnostic images; requires audit_only')
+    parser.add_argument('--audit_source_knn', action='store_true',
+                        help='export seven probabilities and source-only KNN; requires image export')
+    parser.add_argument('--audit_source_knn_k', type=int, default=20)
     parser.add_argument('--audit_image_dir', default=None,
                         help='new output directory (default image_audit/run_name)')
     parser.add_argument('--audit_images_per_subset', type=int, default=30,
                         help='images per group in each high-confidence/random subset')
     args = parser.parse_args(argv)
+    if args.audit_source_knn and not args.export_audit_images:
+        parser.error('--audit_source_knn requires --export_audit_images')
+    if args.audit_source_knn_k < 1:
+        parser.error('--audit_source_knn_k must be positive')
     if args.export_audit_images and not args.audit_only:
         parser.error('--export_audit_images requires --audit_only')
     if args.audit_images_per_subset < 1:
@@ -612,7 +620,24 @@ def run_training():
     # so the diagnostic pass does not alter training augmentations or shuffling.
     rng_state = (random.getstate(), np.random.get_state(), torch.get_rng_state(),
                  torch.cuda.get_rng_state_all())
+    audit_feature_hook = None
     try:
+        source_knn = None
+        if args.audit_source_knn:
+            audit_feature_hook = FeatureHook(model.feature)
+            source_features, source_labels = [], []
+            model.eval()
+            with torch.no_grad():
+                for imgs, targets in prototype_loader_source:
+                    model(imgs.cuda(non_blocking=True), None, None,
+                          mode='test', task='source')
+                    source_features.append(audit_feature_hook.output.detach().cpu().numpy())
+                    source_labels.extend(targets.tolist())
+            source_knn = SourceKNNAudit(
+                np.concatenate(source_features), source_labels,
+                source_prototype.file_paths, args.audit_source_knn_k)
+            print('[SOURCE KNN AUDIT] counts=%s balanced_per_class=%d k=%d' %
+                  (source_knn.counts, source_knn.per_class, source_knn.k), flush=True)
         audit_thresholds, _, _, _ = calculate_target_thresholds(
             model, audit_loader, class_num, args.threshold_base, args.threshold_beta,
             args.threshold_margin, args.threshold_min, args.threshold_max,
@@ -631,12 +656,23 @@ def run_training():
                 before_audit.add(targets.numpy(), pred.cpu().numpy(),
                                  {'confidence': mask.cpu().numpy()})
                 if image_audit is not None:
+                    diagnostics, neighbors = (None, None)
+                    if source_knn is not None:
+                        diagnostics, neighbors = source_knn.query(
+                            audit_feature_hook.output.detach().cpu().numpy(), pred.cpu().tolist())
                     image_audit.add(targets.tolist(), pred.cpu().tolist(),
-                                    conf.cpu().tolist(), mask.cpu().tolist())
+                                    conf.cpu().tolist(), mask.cpu().tolist(),
+                                    probabilities=F.softmax(logits, dim=1).cpu().tolist(),
+                                    diagnostics=diagnostics, neighbors=neighbors)
         before_audit.report('PRE-TARGET/fixed-single-view')
         if image_audit is not None:
-            image_audit.save(args.audit_image_dir, args.checkpoint)
+            image_audit.save(args.audit_image_dir, args.checkpoint,
+                             source_metadata=(dict(counts=source_knn.counts,
+                                                   balanced_per_class=source_knn.per_class,
+                                                   k=source_knn.k) if source_knn else None))
     finally:
+        if audit_feature_hook is not None:
+            audit_feature_hook.close()
         random.setstate(rng_state[0])
         np.random.set_state(rng_state[1])
         torch.set_rng_state(rng_state[2])

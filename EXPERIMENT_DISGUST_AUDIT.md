@@ -73,3 +73,26 @@ across checkpoint runs; confidence_accepted records fixed-view threshold passage
 metadata.json records checkpoint and inference-view details. Images are originals,
 not augmented/model-input crops. Target truth is diagnostic only. Export is opt-in
 and cannot run during training. These are student predictions, not EMA predictions.
+
+## Source-only KNN and probability audit
+
+Add `--audit_source_knn --audit_source_knn_k 20` to image-export audit commands.
+Use a NEW run_name, e.g. source_knn_images. The loaded student checkpoint builds
+both RAFDB and FER features with fixed views and the same pre-classifier feature
+layer. The source bank contains only RAFDB train genuine labels, never target
+labels or target pseudo-labels. Features are L2-normalized; neighbors use cosine
+similarity and unweighted votes. CPU queries use chunks of at most 64 targets.
+
+Group samples.csv now includes all seven p_* columns, source_support_* columns,
+source_knn_pred/source_knn_agrees/source_mean_neighbor_cosine. balanced_source_*
+columns repeat the query against a reproducible equal-count-per-class source
+subset (seed 2000, minimum source class size). Summary fractions are computed
+on ALL group members, not only copied images. summary.json reports per-group
+angry/disgust prediction fractions, agreement fractions, and median disgust
+support. Empty groups have count=0 and no rates. neighbors.csv lists the raw-bank
+nearest source paths, labels and similarities for every matching target sample.
+Metadata records source counts, k, and balanced subset size. Vote ties use the
+lowest class ID; support is a vote fraction, not a calibrated probability.
+No additional acceptance gate is applied: agreement is diagnostic only. Compare
+angry_to_disgust rejection against disgust_correct retention before implementing
+any training gate. Full CUDA extraction requires validation on the training server.

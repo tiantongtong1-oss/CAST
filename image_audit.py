@@ -4,6 +4,8 @@ import json
 import random
 import shutil
 from pathlib import Path
+import numpy as np
+from source_knn_audit import NAMES
 
 
 class ImageAudit:
@@ -14,12 +16,17 @@ class ImageAudit:
         self.paths = paths
         self.offset = 0
         self.per_subset = per_subset
+        self.neighbors = {name: [] for name in self.GROUPS.values()}
         self.rows = {name: [] for name in self.GROUPS.values()}
 
-    def add(self, targets, predictions, confidences, accepted):
+    def add(self, targets, predictions, confidences, accepted,
+            probabilities=None, diagnostics=None, neighbors=None):
         n = len(targets)
         if not all(len(values) == n for values in (predictions, confidences, accepted)):
             raise ValueError('Image audit batch lengths differ')
+        for extra in (probabilities, diagnostics, neighbors):
+            if extra is not None and len(extra) != n:
+                raise ValueError('diagnostics must align with batch')
         if self.offset + n > len(self.paths):
             raise ValueError('Image audit exceeds dataset paths')
         for j, (true, pred, conf, passed) in enumerate(zip(
@@ -31,9 +38,19 @@ class ImageAudit:
                     path=str(Path(self.paths[self.offset + j]).resolve()),
                     true=int(true), pred=int(pred), confidence=float(conf),
                     confidence_accepted=bool(passed)))
+                row = self.rows[group][-1]
+                if probabilities is not None:
+                    row.update({'p_' + name: float(probabilities[j][c])
+                                for c, name in enumerate(NAMES)})
+                if diagnostics is not None:
+                    row.update(diagnostics[j])
+                if neighbors is not None:
+                    self.neighbors[group].extend(
+                        dict(target_sample_id=self.offset + j, **neighbor)
+                        for neighbor in neighbors[j])
         self.offset += n
 
-    def save(self, directory, checkpoint):
+    def save(self, directory, checkpoint, source_metadata=None):
         if self.offset != len(self.paths):
             raise ValueError('Image audit did not cover the complete dataset')
         root = Path(directory)
@@ -44,11 +61,18 @@ class ImageAudit:
         for name, rows in self.rows.items():
             folder = root / name
             folder.mkdir()
+            group_fields = fields + sorted({key for row in rows for key in row} - set(fields))
             rows = sorted(rows, key=lambda r: (-r['confidence'], r['sample_id']))
             with (folder / 'samples.csv').open('w', newline='', encoding='utf-8-sig') as f:
-                writer = csv.DictWriter(f, fieldnames=fields)
+                writer = csv.DictWriter(f, fieldnames=group_fields)
                 writer.writeheader()
                 writer.writerows(rows)
+            if source_metadata is not None:
+                with (folder / 'neighbors.csv').open('w', newline='', encoding='utf-8-sig') as f:
+                    writer = csv.DictWriter(f, fieldnames=[
+                        'target_sample_id', 'rank', 'source_path', 'source_true', 'cosine'])
+                    writer.writeheader()
+                    writer.writerows(self.neighbors[name])
             high = rows[:self.per_subset]
             rest = rows[self.per_subset:]
             selected = random.Random(2000).sample(rest, min(self.per_subset, len(rest)))
@@ -67,5 +91,20 @@ class ImageAudit:
                         sample_count=self.offset, per_subset=self.per_subset,
                         class_order=['surprise', 'fear', 'disgust', 'happy',
                                      'sad', 'angry', 'neutral'])
+        metadata['source_knn'] = source_metadata
+        summary = {}
+        for name, rows in self.rows.items():
+            stats = dict(count=len(rows))
+            if rows and source_metadata is not None:
+                for prefix in ('source', 'balanced_source'):
+                    for c in (2, 5):
+                        stats[prefix + '_predict_' + NAMES[c] + '_fraction'] = float(
+                            np.mean([r[prefix + '_knn_pred'] == c for r in rows]))
+                    stats[prefix + '_agreement_fraction'] = float(np.mean([
+                        r[prefix + '_knn_agrees'] for r in rows]))
+                    stats[prefix + '_median_disgust_support'] = float(np.median([
+                        r[prefix + '_support_disgust'] for r in rows]))
+            summary[name] = stats
+        (root / 'summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
         (root / 'metadata.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
         print('[IMAGE AUDIT] saved to %s' % root.resolve(), flush=True)
