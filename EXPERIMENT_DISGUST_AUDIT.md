@@ -59,3 +59,17 @@ python -m py_compile train.py pseudo_audit.py
 Full GPU training and dataset/checkpoint validation must be run on the training
 server. Review baseline versus exclusion validation disgust precision, recall,
 macro-F1 and accuracy, then repeat promising comparisons across random seeds.
+
+## Export diagnostic images
+
+Run with `--audit_only --export_audit_images --run_name source_images` and the
+source checkpoint. Repeat using the exclusion target-best checkpoint and
+`--run_name excluded_images`. Default outputs: image_audit/<run_name>.
+An existing output directory is rejected; use a new --audit_image_dir to repeat.
+Each group (angry_to_disgust, disgust_correct, disgust_to_sad, disgust_to_angry)
+contains all matching records in samples.csv, plus up to 30 high-confidence and
+30 random remaining original images. CSV IDs identify the same FER train paths
+across checkpoint runs; confidence_accepted records fixed-view threshold passage.
+metadata.json records checkpoint and inference-view details. Images are originals,
+not augmented/model-input crops. Target truth is diagnostic only. Export is opt-in
+and cannot run during training. These are student predictions, not EMA predictions.

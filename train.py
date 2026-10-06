@@ -10,6 +10,7 @@ from torchvision import transforms
 
 import Networks
 from pseudo_audit import PredictionAudit, target_training_mask
+from image_audit import ImageAudit
 from dataset import RafDataSet, FER
 from ema_utils import create_ema_teacher, select_dual_view_pseudo_labels, update_ema_teacher
 from prototype_utils import FeatureHook, PrototypeBank, prototype_weight_for_epoch
@@ -121,7 +122,22 @@ def parse_args(argv=None):
                         help='audit loaded source weights before target training, then exit')
     parser.add_argument('--run_name', default='', type=str,
                         help='optional separate output subdirectory under models/source_target')
+    parser.add_argument('--export_audit_images', action='store_true',
+                        help='export FER train diagnostic images; requires audit_only')
+    parser.add_argument('--audit_image_dir', default=None,
+                        help='new output directory (default image_audit/run_name)')
+    parser.add_argument('--audit_images_per_subset', type=int, default=30,
+                        help='images per group in each high-confidence/random subset')
     args = parser.parse_args(argv)
+    if args.export_audit_images and not args.audit_only:
+        parser.error('--export_audit_images requires --audit_only')
+    if args.audit_images_per_subset < 1:
+        parser.error('--audit_images_per_subset must be positive')
+    if args.export_audit_images:
+        args.audit_image_dir = args.audit_image_dir or os.path.join(
+            'image_audit', args.run_name or 'audit')
+        if os.path.exists(args.audit_image_dir):
+            parser.error('image export directory already exists; choose a new --audit_image_dir')
     if args.run_name and (os.path.basename(args.run_name) != args.run_name
                           or args.run_name in {'.', '..'}):
         parser.error('run_name must be a single directory name')
@@ -603,6 +619,8 @@ def run_training():
         )
         print('[PRE-TARGET] fixed single-view thresholds:', audit_thresholds.tolist())
         before_audit = PredictionAudit()
+        image_audit = (ImageAudit(target_audit.file_paths, args.audit_images_per_subset)
+                       if args.export_audit_images else None)
         model.eval()
         with torch.no_grad():
             for imgs, targets in audit_loader:
@@ -612,7 +630,12 @@ def run_training():
                 mask = conf >= audit_thresholds.to(pred.device)[pred]
                 before_audit.add(targets.numpy(), pred.cpu().numpy(),
                                  {'confidence': mask.cpu().numpy()})
+                if image_audit is not None:
+                    image_audit.add(targets.tolist(), pred.cpu().tolist(),
+                                    conf.cpu().tolist(), mask.cpu().tolist())
         before_audit.report('PRE-TARGET/fixed-single-view')
+        if image_audit is not None:
+            image_audit.save(args.audit_image_dir, args.checkpoint)
     finally:
         random.setstate(rng_state[0])
         np.random.set_state(rng_state[1])
