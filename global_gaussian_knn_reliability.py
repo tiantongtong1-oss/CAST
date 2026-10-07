@@ -39,6 +39,7 @@ class GlobalGaussianKNNReliabilityBank(nn.Module):
         global_momentum_end=0.95,
         global_momentum_ramp_refreshes=30,
         sparse_penalty=0.5,
+        num_target_samples=0,
     ):
         super().__init__()
         if num_classes < 1 or feature_dim < 1 or k < 1 or query_chunk_size < 1:
@@ -80,6 +81,7 @@ class GlobalGaussianKNNReliabilityBank(nn.Module):
         self.query_chunk_size = int(query_chunk_size)
         self.eps = float(eps)
 
+        self.register_buffer("quarantined", torch.zeros(num_target_samples, dtype=torch.bool))
         self.register_buffer("class_means", torch.zeros(num_classes, feature_dim))
         # Kept for checkpoint diagnostics/compatibility. Every ready class receives
         # the same global isotropic variance after each refresh.
@@ -146,6 +148,50 @@ class GlobalGaussianKNNReliabilityBank(nn.Module):
         self.register_buffer(
             "memory_ids", torch.empty(0, dtype=torch.long), persistent=False
         )
+
+    @torch.no_grad()
+    def is_quarantined(self, sample_ids):
+        ids = sample_ids.to(device=self.quarantined.device, dtype=torch.long)
+        if ((ids < 0) | (ids >= self.quarantined.numel())).any():
+            raise ValueError("Target sample ID outside quarantine registry")
+        return self.quarantined[ids]
+
+    @torch.no_grad()
+    def quarantine(self, sample_ids):
+        ids = sample_ids.to(device=self.quarantined.device, dtype=torch.long)
+        self.is_quarantined(ids)  # validate before mutation
+        self.quarantined[ids] = True
+
+    @torch.no_grad()
+    def query_class_support(self, features, sample_ids, thresholds, candidate_labels,
+                            support_margin=0.2):
+        """Compare both view-predicted candidate classes without privileging view 1.
+
+        A class must pass the original Gaussian/density gate AND exceed the other
+        candidate's weighted neighbor support by support_margin.
+        """
+        n = features.size(0)
+        scores, supports, passes = [], [], []
+        active = torch.ones(n, dtype=torch.bool, device=features.device)
+        for c in range(self.num_classes):
+            labels = torch.full((n,), c, dtype=torch.long, device=features.device)
+            result = self.gate(features, labels, sample_ids, active, thresholds)
+            scores.append(result["score"])
+            supports.append(result["weighted_support"])
+            passes.append(result["pass_mask"])
+        scores = torch.stack(scores, dim=1)
+        supports = torch.stack(supports, dim=1)
+        passes = torch.stack(passes, dim=1)
+        allowed = torch.zeros_like(passes)
+        allowed.scatter_(1, candidate_labels.long(), True)
+        ranked = supports.masked_fill(~allowed, -1.0)
+        top = ranked.topk(2, dim=1)
+        label = top.indices[:, 0]
+        margin = top.values[:, 0] - top.values[:, 1]
+        reliable = passes.gather(1, label[:, None]).squeeze(1)
+        reliable &= margin >= support_margin
+        return {"labels": label, "reliable": reliable, "margin": margin,
+                "score": scores.gather(1, label[:, None]).squeeze(1)}
 
     @property
     def sigma(self):
@@ -308,6 +354,10 @@ class GlobalGaussianKNNReliabilityBank(nn.Module):
         valid &= (confidences >= 0) & (confidences <= 1)
         valid &= (labels >= 0) & (labels < self.num_classes)
 
+        if self.quarantined.numel() == 0 and valid.any():
+            self.quarantined = torch.zeros(int(sample_ids[valid].max().item()) + 1,
+                                           dtype=torch.bool, device=features.device)
+        self.is_quarantined(sample_ids[valid])
         self.memory_features = F.normalize(
             features[valid], dim=1
         ).contiguous()
@@ -450,6 +500,7 @@ class GlobalGaussianKNNReliabilityBank(nn.Module):
                 nn_labels.eq(candidate_labels)
                 & neighbor_confident
                 & neighbor_in_region
+                & ~self.is_quarantined(self.memory_ids[nn_idx])
             )
 
             mahalanobis_sq = self.distribution_distance(
