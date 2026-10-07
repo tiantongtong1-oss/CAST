@@ -86,6 +86,10 @@ def parse_args(argv=None):
     parser.add_argument('--proto_ramp_epochs', type=int, default=5,
                         help='epochs used to linearly ramp prototype loss to full weight')
 
+    parser.add_argument('--rescue_weight', type=float, default=0.2,
+                        help='classification weight for quarantined/rescued target samples')
+    parser.add_argument('--knn_support_margin', type=float, default=0.2,
+                        help='minimum neighbor support advantage for disagreement rescue')
     parser.set_defaults(knn_gate=True)
     parser.add_argument('--knn_gate', dest='knn_gate', action='store_true',
                         help='enable class-Gaussian/kNN OR rescue (default)')
@@ -115,6 +119,10 @@ def parse_args(argv=None):
                         help='bound temporary kNN distance matrix memory')
 
     args = parser.parse_args(argv)
+    if not 0 < args.rescue_weight <= 1:
+        parser.error('rescue_weight must be in (0, 1]')
+    if not 0 < args.knn_support_margin <= 1:
+        parser.error('knn_support_margin must be in (0, 1]')
     if args.knn_k < 1 or args.knn_query_chunk_size < 1 or args.knn_refresh_interval < 1:
         parser.error('knn_k, knn_query_chunk_size and knn_refresh_interval must be positive')
     if args.knn_warmup_epochs < 0 or args.pre_epochs < 0 or args.epochs < 0:
@@ -382,12 +390,12 @@ def run_training():
     source_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_source_global_gaussian_knn_v7_source_best.pth'
+        + '_source_global_gaussian_knn_v10_source_best.pth'
     )
     target_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_source_global_gaussian_knn_v7_target_best.pth'
+        + '_source_global_gaussian_knn_v10_target_best.pth'
     )
 
     print('---------------------------------------------------------------------------------------')
@@ -598,6 +606,7 @@ def run_training():
         class_num,
         model.fc.in_features,
         k=args.knn_k,
+        num_target_samples=len(target_train),
         distribution_mass=args.knn_distribution_mass,
         variance_floor=args.knn_variance_floor,
         sigma_momentum=args.knn_sigma_momentum,
@@ -664,6 +673,7 @@ def run_training():
         knn_pass_num = 0
         knn_rescue_num = 0
         final_accept_num = 0
+        disagreement_rescue_num = 0
         score_sum = 0.0
         density_sum = 0.0
         knn_checked_num = 0
@@ -685,6 +695,7 @@ def run_training():
             weak1 = weak1.cuda(non_blocking=True)
             weak2 = weak2.cuda(non_blocking=True)
             strong = strong.cuda(non_blocking=True)
+            sample_ids = sample_ids.cuda(non_blocking=True)
 
             teacher.eval()
             # 用EMA Teacher对目标域样本的两个弱增强视图进行预测，生成伪标签，并提取一个融合后的teacher 特征，供后面的
@@ -722,13 +733,40 @@ def run_training():
                 final_mask, rescue_mask = combine_rescue_masks(
                     confidence_mask, agreement_mask, reliability_mask, enable_knn_rescue
                 )
-                # Networks.forward selects idx == 1: retain a binary mask here.
+                # Query the two views independently for disagreeing predictions.
+                disagreement_rescue = torch.zeros_like(agreement_mask)
+                if enable_knn_rescue and (~agreement_mask).any():
+                    rows = (~agreement_mask).nonzero(as_tuple=False).flatten()
+                    candidates = torch.stack([
+                        logits1.argmax(dim=1)[rows], logits2.argmax(dim=1)[rows]
+                    ], dim=1)
+                    view1 = reliability_bank.query_class_support(
+                        teacher_features1[rows], sample_ids[rows], thresholds,
+                        candidates, args.knn_support_margin)
+                    view2 = reliability_bank.query_class_support(
+                        teacher_features2[rows], sample_ids[rows], thresholds,
+                        candidates, args.knn_support_margin)
+                    accept = (view1['reliable'] & view2['reliable']
+                              & view1['labels'].eq(view2['labels']))
+                    accepted_rows = rows[accept]
+                    disagreement_rescue[accepted_rows] = True
+                    pseudo_targets[accepted_rows] = view1['labels'][accept]
+                rescue_mask = rescue_mask | disagreement_rescue
+                final_mask = confidence_mask | rescue_mask
+                reliability_bank.quarantine(sample_ids[rescue_mask])
+                quarantined = reliability_bank.is_quarantined(sample_ids)
+                # Quarantine persists even if a later teacher becomes confident.
+                regular_mask = confidence_mask & ~quarantined
+                alignment_mask = regular_mask
+                prototype_mask = regular_mask.float()
+                target_weights = final_mask.float() * torch.where(
+                    quarantined, args.rescue_weight, 1.0)
                 con_idx = final_mask.float()
 
                 # 评估函数，用来统计在“可靠样本”上，模型特征与原型之间的预测一致性和相似度，会只检查 con_idx=1 的最终可靠目标样本
                 proto_agree, proto_checked, proto_similarity = (
                     prototype_bank.agreement_stats(
-                        teacher_mean_features, pseudo_targets, con_idx
+                        teacher_mean_features, pseudo_targets, prototype_mask
                     )
                 )
             # 统计当前epoch中不同阶段一共接纳了多少目标样本
@@ -737,6 +775,7 @@ def run_training():
             knn_pass_num += int(reliability_mask.sum().item())
             knn_rescue_num += int(rescue_mask.sum().item())
             final_accept_num += int(final_mask.sum().item())
+            disagreement_rescue_num += int(disagreement_rescue.sum().item())
 
             if knn_result is not None:
                 checked = knn_result['checked_mask']
@@ -772,7 +811,7 @@ def run_training():
             # 源域图像+目标域strong augmentation
             train_imgs = torch.cat((source_imgs, strong.cpu()), dim=0).cuda(non_blocking=True)
             train_targets = torch.cat((source_targets, pseudo_targets.cpu()), dim=0).cuda(non_blocking=True)
-            train_con_idx = torch.cat((source_con_idx, con_idx.cpu()), dim=0).cuda(non_blocking=True)
+            train_con_idx = torch.cat((source_con_idx, alignment_mask.float().cpu()), dim=0).cuda(non_blocking=True)
 
             # 清空模型参数的梯度
             optimizer.zero_grad()
@@ -781,9 +820,11 @@ def run_training():
                 source_count=source_imgs.shape[0],
             )
             # 分类损失
-            per_sample_loss = criterion(output[0], train_targets) * train_con_idx
-            # 对真正有效的源域和目标域样本求平均分类损失
-            cls_loss = per_sample_loss.sum() / train_con_idx.sum().clamp_min(1.0)
+            train_weights = torch.cat(
+                (source_con_idx, target_weights.cpu()), dim=0
+            ).cuda(non_blocking=True)
+            per_sample_loss = criterion(output[0], train_targets) * train_weights
+            cls_loss = per_sample_loss.sum() / train_weights.sum().clamp_min(1.0)
             aff_loss = output[1]
             # 分类器权重之间的正则项
             weight_loss = classifier_modulation_loss(model)
@@ -793,7 +834,7 @@ def run_training():
             proto_loss = prototype_bank.consistency_loss(
                 target_student_features,
                 pseudo_targets,
-                con_idx,
+                prototype_mask,
                 temperature=args.proto_temperature,
             )
             # 总损失
@@ -812,7 +853,7 @@ def run_training():
             update_ema_teacher(teacher, model, args.ema_decay, global_step)
             # 这是更新目标域prototype
             prototype_bank.update_target(
-                teacher_mean_features, pseudo_targets, con_idx
+                teacher_mean_features, pseudo_targets, prototype_mask
             )
 
             train_loss1 += cls_loss.item()
@@ -820,6 +861,10 @@ def run_training():
             train_loss3 += weight_loss.item()
             train_proto_loss += proto_loss.item()
             batch_count += 1
+        print('[Target Epoch %d] Disagreement_Rescue_Num: %d Quarantined_Total: %d '
+              'Rescue_Weight: %.3f' %
+              (i, disagreement_rescue_num, int(reliability_bank.quarantined.sum().item()),
+               args.rescue_weight))
         # 更新学习率
         scheduler.step()
         # 求均值
