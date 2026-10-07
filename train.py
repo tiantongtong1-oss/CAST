@@ -13,6 +13,7 @@ from dataset import RafDataSet, FER
 from ema_utils import create_ema_teacher, select_dual_view_pseudo_labels, update_ema_teacher
 from prototype_utils import FeatureHook, PrototypeBank, prototype_weight_for_epoch
 from global_gaussian_knn_reliability import GlobalGaussianKNNReliabilityBank, combine_rescue_masks
+from covariance_history import CovarianceHistory
 import image_utils as util
 from randaugment import RandAugmentMC
 # 总训练入口与调度器。串起数据、Source 预训练、EMA Teacher、
@@ -97,7 +98,7 @@ def parse_args(argv=None):
     parser.add_argument('--knn_variance_floor', type=float, default=1e-4,
                         help='minimum per-coordinate class variance')
     parser.add_argument('--knn_sigma_momentum', type=float, default=0.70,
-                        help='starting EMA momentum for the pooled source global variance')
+                        help='starting EMA momentum for the per-class diagonal source variances')
     parser.add_argument('--knn_sigma_momentum_end', type=float, default=0.95,
                         help='final EMA momentum for the pooled source global variance')
     parser.add_argument('--knn_sigma_momentum_ramp_refreshes', type=int, default=30,
@@ -382,16 +383,16 @@ def run_training():
     source_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_source_global_gaussian_knn_v7_source_best.pth'
+        + '_source_diagonal_gaussian_knn_v9_source_best.pth'
     )
     target_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_source_global_gaussian_knn_v7_target_best.pth'
+        + '_source_diagonal_gaussian_knn_v9_target_best.pth'
     )
 
     print('---------------------------------------------------------------------------------------')
-    print('EMA + Dual View + Stable CAT + Prototype KNN v4 + Confidence/KNN OR: '
+    print('V9 Diagonal covariance EMA + Dual View + Confidence/KNN OR: '
           '%s with source %s and target %s' %
           (args.backbone, args.data1, args.data2))
     print('alpha(w1):%s beta(w2):%s gamma(w3):%s ema:%s '
@@ -610,6 +611,7 @@ def run_training():
         query_chunk_size=args.knn_query_chunk_size,
     ).cuda()
 
+    covariance_history = CovarianceHistory(os.path.join(model_path, args.backbone + '_v9_covariance'))
     best_target_val_acc = -1.0
     global_step = 0
 
@@ -638,6 +640,7 @@ def run_training():
                    reliability_bank.current_global_momentum.item(),
                    reliability_bank.sigma_initialized.item()))
             log_gaussian_means(reliability_bank)
+            covariance_history.record(reliability_bank, i)
         current_proto_weight = prototype_weight_for_epoch(
             i, args.proto_weight, args.proto_warmup_epochs, args.proto_ramp_epochs
         )
