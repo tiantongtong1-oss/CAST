@@ -1,7 +1,7 @@
 """Source-labeled class Gaussian reliability with global variance EMA.
 
-Each class has a source-only center mu_c. All classes share one isotropic within-class
-variance estimated from correctly labeled source features. The scalar variance is
+Each class has a source-only center mu_c. Each class has its own diagonal covariance estimated from ground-truth source
+labels. Each coordinate variance is
 updated by a momentum schedule that increases across source refreshes.
 
 A pseudo-label candidate must fall inside the chi-square confidence region of its
@@ -81,9 +81,12 @@ class GlobalGaussianKNNReliabilityBank(nn.Module):
         self.eps = float(eps)
 
         self.register_buffer("class_means", torch.zeros(num_classes, feature_dim))
-        # Kept for checkpoint diagnostics/compatibility. Every ready class receives
-        # the same global isotropic variance after each refresh.
+        # Per-class diagonal covariance; global_var only scales the Euclidean kNN kernel.
         self.register_buffer("class_variances", torch.ones(num_classes, feature_dim))
+        self.register_buffer("covariance_initialized", torch.zeros(num_classes, dtype=torch.bool))
+        self.register_buffer("previous_covariance_initialized", torch.zeros(num_classes, dtype=torch.bool))
+        self.register_buffer("observed_class_variances", torch.zeros(num_classes, feature_dim))
+        self.register_buffer("previous_class_variances", torch.zeros(num_classes, feature_dim))
         self.register_buffer(
             "distribution_initialized", torch.zeros(num_classes, dtype=torch.bool)
         )
@@ -191,7 +194,7 @@ class GlobalGaussianKNNReliabilityBank(nn.Module):
 
     @torch.no_grad()
     def finalize_source(self):
-        """Fit class means and update one pooled within-class variance by EMA."""
+        """Refit source means and EMA-update each class diagonal covariance."""
         self.class_source_counts.copy_(self._source_count)
         self.source_count.copy_(self._source_count.sum())
 
@@ -199,8 +202,7 @@ class GlobalGaussianKNNReliabilityBank(nn.Module):
         counts = self._source_count.clamp_min(1).double().unsqueeze(1)
         means = self._source_sum / counts
 
-        # Per-coordinate within-class MLE variance only for estimating the pooled
-        # source variance. The final Gaussian uses one shared scalar variance.
+        # Per-class, per-coordinate population variance from normalized features.
         raw_class_variances = (
             self._source_sq_sum / counts - means.square()
         ).clamp_min(0)
@@ -214,8 +216,20 @@ class GlobalGaussianKNNReliabilityBank(nn.Module):
             self.current_observed_global_var.zero_()
             return
 
+        beta = float(self.momentum_for_refresh())
+        self.previous_covariance_initialized.copy_(self.covariance_initialized)
+        self.previous_class_variances.copy_(self.class_variances)
+        self.observed_class_variances.zero_()
         for c in ready.nonzero(as_tuple=False).flatten().tolist():
             self.class_means[c].copy_(means[c].to(self.class_means))
+            observed_c = raw_class_variances[c].to(self.class_variances).clamp_min(self.variance_floor)
+            self.observed_class_variances[c].copy_(observed_c)
+            if self.covariance_initialized[c]:
+                self.class_variances[c].mul_(beta).add_(observed_c, alpha=1.0 - beta)
+            else:
+                self.class_variances[c].copy_(observed_c)
+                self.covariance_initialized[c] = True
+            self.class_variances[c].clamp_(min=self.variance_floor)
 
         # Isotropic Gaussian MLE variance:
         # sum_{c,d} N_c * var[c,d] / (sum_c N_c * D)
@@ -238,12 +252,11 @@ class GlobalGaussianKNNReliabilityBank(nn.Module):
             self.global_var.mul_(beta).add_(observed, alpha=1.0 - beta)
 
         self.global_var.clamp_(min=self.variance_floor)
-        self.class_variances[ready].fill_(float(self.global_var.item()))
         self.refresh_count.add_(1)
 
     @torch.no_grad()
     def distribution_distance(self, features, labels):
-        """Squared Mahalanobis distance under N(mu_c, global_var * I)."""
+        """Squared Mahalanobis distance under N(mu_c, diag(class_variances[c]))."""
         features = features.detach().to(self.class_means)
         labels = labels.detach().to(device=features.device, dtype=torch.long)
         valid_labels = (labels >= 0) & (labels < self.num_classes)
@@ -254,8 +267,9 @@ class GlobalGaussianKNNReliabilityBank(nn.Module):
         valid &= self.sigma_initialized
 
         z = F.normalize(torch.nan_to_num(features), dim=-1)
-        sq = (z - self.class_means[safe_labels]).square().sum(dim=-1)
-        distance = sq / self.global_var.clamp_min(self.variance_floor)
+        residual_sq = (z - self.class_means[safe_labels]).square()
+        variances = self.class_variances[safe_labels].clamp_min(self.variance_floor)
+        distance = (residual_sq / variances).sum(dim=-1)
         return distance.masked_fill(~valid, float("inf"))
 
     @torch.no_grad()
