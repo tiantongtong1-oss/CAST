@@ -13,6 +13,8 @@ from dataset import RafDataSet, FER
 from ema_utils import create_ema_teacher, select_dual_view_pseudo_labels, update_ema_teacher
 from prototype_utils import FeatureHook, PrototypeBank, prototype_weight_for_epoch
 from global_gaussian_knn_reliability import GlobalGaussianKNNReliabilityBank, combine_rescue_masks
+from sparse_reliable_knn import SparseReliableKNNBank
+from reliability_roles import ReliabilityRoles, neighbor_soft_targets, soft_supervision_loss
 import image_utils as util
 from randaugment import RandAugmentMC
 # 总训练入口与调度器。串起数据、Source 预训练、EMA Teacher、
@@ -114,6 +116,28 @@ def parse_args(argv=None):
     parser.add_argument('--knn_query_chunk_size', type=int, default=128,
                         help='bound temporary kNN distance matrix memory')
 
+    parser.set_defaults(role_separation=True)
+    parser.add_argument('--no_role_separation', dest='role_separation', action='store_false',
+                        help='ablation: accepted samples may immediately update prototypes')
+    parser.add_argument('--promotion_epochs', type=int, default=3,
+                        help='consecutive eligible epochs before anchor/sender promotion')
+    parser.add_argument('--knn_score_mode', choices=['support', 'v7'], default='support',
+                        help='support: sparse-safe score; v7: original density score')
+    parser.add_argument('--knn_min_support', type=int, default=3)
+    parser.add_argument('--knn_min_effective_support', type=float, default=2.0)
+    parser.add_argument('--knn_min_purity', type=float, default=0.8)
+    parser.add_argument('--knn_min_margin', type=float, default=0.2)
+    parser.add_argument('--knn_radius_multiplier', type=float, default=2.0,
+                        help='squared-distance cap = 2 * multiplier * D * source variance')
+    parser.add_argument('--neighbor_soft_labels', action='store_true',
+                        help='optional soft supervision for reliable conflicting neighborhoods')
+    parser.add_argument('--neighbor_soft_mix', type=float, default=0.5)
+    parser.add_argument('--neighbor_soft_weight', type=float, default=0.1)
+    parser.add_argument('--run_name', type=str, default='role_sparse_knn_v8',
+                        help='checkpoint suffix; use distinct names for ablations')
+    parser.add_argument('--device', choices=['cuda', 'cpu'], default='cuda',
+                        help='CPU is supported for smoke tests; CUDA recommended for FER training')
+
     args = parser.parse_args(argv)
     if args.knn_k < 1 or args.knn_query_chunk_size < 1 or args.knn_refresh_interval < 1:
         parser.error('knn_k, knn_query_chunk_size and knn_refresh_interval must be positive')
@@ -139,6 +163,22 @@ def parse_args(argv=None):
             parser.error('%s must be in (0, 1]' % name)
     if args.pre_epochs == 0 and not args.checkpoint:
         parser.error('--pre_epochs 0 requires --checkpoint with pretrained model weights')
+    if args.promotion_epochs < 1:
+        parser.error('--promotion_epochs must be positive')
+    if args.knn_min_support < 1 or (args.knn_score_mode == 'support' and args.knn_min_support > args.knn_k):
+        parser.error('--knn_min_support must be positive and <= knn_k in support mode')
+    if not np.isfinite(args.knn_min_effective_support) or not 1 <= args.knn_min_effective_support <= args.knn_k:
+        parser.error('--knn_min_effective_support must be finite and in [1, knn_k]')
+    if not 0 < args.knn_min_purity <= 1 or not 0 <= args.knn_min_margin <= 1:
+        parser.error('invalid support purity/margin')
+    if not np.isfinite(args.knn_radius_multiplier) or args.knn_radius_multiplier <= 0:
+        parser.error('--knn_radius_multiplier must be finite and positive')
+    if not 0 < args.neighbor_soft_mix <= 1 or not np.isfinite(args.neighbor_soft_weight) or args.neighbor_soft_weight <= 0:
+        parser.error('invalid soft-label mixing/weight')
+    if args.neighbor_soft_labels and (not args.knn_gate or args.knn_score_mode != 'support'):
+        parser.error('--neighbor_soft_labels requires knn_gate and support score mode')
+    if not args.run_name or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-' for c in args.run_name):
+        parser.error('--run_name must contain only letters, digits, underscores or hyphens')
     return args
 
 
@@ -199,13 +239,14 @@ def calculate_target_thresholds(model, loader, class_num, threshold_base,
     class_sum = torch.zeros(class_num, dtype=torch.float64)
     # 记录每个预测类别包含的样本数量
     class_count = torch.zeros(class_num, dtype=torch.float64)
+    device = next(model.parameters()).device
     # 切换到评估模式，关闭 Dropout、固定 BatchNorm 等
     model.eval()
 
     # 这里只进行推理，不计算梯度，减少显存和计算开销
     with torch.no_grad():
         for batch in loader:
-            imgs = batch[0].cuda(non_blocking=True)
+            imgs = batch[0].to(device, non_blocking=True)
 
             # 使用模型对目标域图像进行预测
             # logits：分类输出
@@ -256,12 +297,13 @@ def evaluate(model, loader, criterion, num_samples, epoch, split_name):
     iter_cnt = 0
     bingo_cnt = 0
     preds, labels = [], []
+    device = next(model.parameters()).device
 
     model.eval()
     with torch.no_grad():
         for imgs, targets in loader:
-            imgs = imgs.cuda(non_blocking=True)
-            targets = targets.cuda(non_blocking=True)
+            imgs = imgs.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
             out, _ = model(imgs, targets, None, mode='test')
             loss = torch.mean(criterion(out, targets))
             val_loss += loss.item()
@@ -277,11 +319,25 @@ def evaluate(model, loader, criterion, num_samples, epoch, split_name):
     print('[Epoch %d] Target %s accuracy: %.4f. Loss: %.3f' %
           (epoch, split_name, acc, avg_loss))
     util.make_confucion_matrix(preds, labels)
+    if preds:
+        pred = torch.cat(preds)
+        truth = torch.cat(labels)
+        classes = model.fc.out_features
+        cm = torch.bincount(truth * classes + pred, minlength=classes ** 2).reshape(classes, classes).float()
+        recall = cm.diag() / cm.sum(1).clamp_min(1)
+        f1 = 2 * cm.diag() / (cm.sum(1) + cm.sum(0)).clamp_min(1)
+        present = cm.sum(1) > 0
+        uar = recall[present].mean().item() if present.any() else 0.0
+        print('[Epoch %d] Target %s UAR(present classes): %.4f Macro_F1(all classes): %.4f '
+              'Recall: %s Support: %s' %
+              (epoch, split_name, uar, f1.mean().item(),
+               np.array2string(recall.numpy(), precision=4),
+               np.array2string(cm.sum(1).long().numpy())))
     return acc
 
 
 def save_checkpoint(path, model, optimizer, scheduler, epoch, best_val_acc, args,
-                    teacher=None, prototype_bank=None, reliability_bank=None):
+                    teacher=None, prototype_bank=None, reliability_bank=None, role_tracker=None):
     # 保存 Student、optimizer、scheduler、epoch 等；
     # 目标阶段还可保存 EMA Teacher 和 PrototypeBank
     state = {
@@ -298,6 +354,8 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch, best_val_acc, args
         state['prototype_bank'] = prototype_bank.state_dict()
     if reliability_bank is not None:
         state['reliability_bank'] = reliability_bank.state_dict()
+    if role_tracker is not None:
+        state['role_tracker'] = role_tracker.state_dict()
     torch.save(state, path)
 
 
@@ -306,10 +364,11 @@ def initialize_source_prototypes(teacher, feature_hook, loader, prototype_bank):
     # 用 Teacher 在确定性的 RAF-DB source view 上抽特征，创建固定 源域原型
 
     teacher.eval()
+    device = next(teacher.parameters()).device
     with torch.no_grad():
         for imgs, targets in loader:
-            imgs = imgs.cuda(non_blocking=True)
-            targets = targets.cuda(non_blocking=True)
+            imgs = imgs.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
             teacher(imgs, None, None, mode='test', task='source')
             prototype_bank.accumulate_source(feature_hook.output, targets)
     prototype_bank.finalize_source()
@@ -343,7 +402,7 @@ def log_gaussian_means(reliability_bank):
 
 @torch.no_grad()
 def refresh_reliability_bank(teacher, feature_hook, source_loader, target_loader,
-                             reliability_bank):
+                             reliability_bank, role_tracker=None, thresholds=None, epoch=0):
     """Refresh source scale and target-train memory in the same teacher space.
 
     Target labels from the dataset are intentionally ignored. A deterministic
@@ -372,26 +431,45 @@ def refresh_reliability_bank(teacher, feature_hook, source_loader, target_loader
         reliability_bank.set_target_memory(
             torch.cat(features), torch.cat(labels), torch.cat(confidences), torch.cat(sample_ids)
         )
+        if isinstance(reliability_bank, SparseReliableKNNBank):
+            if role_tracker is not None:
+                sender_scores = role_tracker.sender_scores(
+                    reliability_bank.memory_ids, reliability_bank.memory_labels,
+                    reliability_bank.memory_confidences, epoch,
+                )
+            else:
+                if thresholds is None:
+                    raise ValueError('sender snapshot requires thresholds or role history')
+                conf = reliability_bank.memory_confidences
+                cutoffs = thresholds.to(conf)[reliability_bank.memory_labels]
+                sender_scores = conf * (conf >= cutoffs).float()
+            sender_scores *= reliability_bank.in_distribution(
+                reliability_bank.memory_features, reliability_bank.memory_labels
+            ).float()
+            reliability_bank.set_sender_scores(sender_scores)
 
 
 def run_training():
     args = parse_args()
+    device = torch.device(args.device)
+    if device.type == 'cuda' and not torch.cuda.is_available():
+        raise RuntimeError('CUDA unavailable; use --device cpu for a smoke test')
     model_path = os.path.join('./models', args.data1 + '_' + args.data2)
     os.makedirs(model_path, exist_ok=True)
 
     source_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_source_global_gaussian_knn_v7_source_best.pth'
+        + '_' + args.run_name + '_source_best.pth'
     )
     target_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_source_global_gaussian_knn_v7_target_best.pth'
+        + '_' + args.run_name + '_target_best.pth'
     )
 
     print('---------------------------------------------------------------------------------------')
-    print('EMA + Dual View + Stable CAT + Prototype KNN v4 + Confidence/KNN OR: '
+    print('EMA + Dual View + Stable CAT + Role-separated Sparse KNN v8: '
           '%s with source %s and target %s' %
           (args.backbone, args.data1, args.data2))
     print('alpha(w1):%s beta(w2):%s gamma(w3):%s ema:%s '
@@ -411,6 +489,14 @@ def run_training():
            args.knn_score_threshold, args.knn_density_threshold, args.knn_sparse_penalty,
            args.knn_warmup_epochs, args.knn_refresh_interval))
     print('---------------------------------------------------------------------------------------')
+
+    print('role_separation:%s promotion_epochs:%d score_mode:%s '
+          'min_support:%d effective_support:%.2f purity:%.2f margin:%.2f '
+          'soft_labels:%s soft_mix:%.2f soft_weight:%.3f run_name:%s' %
+          (args.role_separation, args.promotion_epochs, args.knn_score_mode,
+           args.knn_min_support, args.knn_min_effective_support, args.knn_min_purity,
+           args.knn_min_margin, args.neighbor_soft_labels, args.neighbor_soft_mix,
+           args.neighbor_soft_weight, args.run_name))
 
     if args.backbone == 'resnet18':
         train_batch, test_batch = 128, 128
@@ -445,7 +531,7 @@ def run_training():
         strong_transform=None, basic_aug=False
     )
     target_memory = None
-    if args.knn_gate:
+    if args.knn_gate or args.role_separation:
         target_memory = FER(
             args.target_path, phase='train', transform=test_transform,
             basic_aug=False, return_index=True,
@@ -494,7 +580,7 @@ def run_training():
         shuffle=False, pin_memory=True,
     )
     # 输出分类 logits 和 source affinity loss
-    model = Networks.Model(backbone=args.backbone, num_classes=class_num).cuda()
+    model = Networks.Model(backbone=args.backbone, num_classes=class_num).to(device)
     # 训练组件初始化
     optimizer = torch.optim.Adam(model.parameters(), args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
@@ -503,7 +589,7 @@ def run_training():
 
     if args.checkpoint:
         print('Loading pretrained weights...', args.checkpoint)
-        checkpoint = torch.load(args.checkpoint, map_location='cuda')
+        checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint['model'], strict=True)
 
     best_source_val_acc = -1.0
@@ -517,8 +603,8 @@ def run_training():
         sample_count = 0
 
         for imgs, targets in train_loader_source:
-            imgs = imgs.cuda(non_blocking=True)
-            targets = targets.cuda(non_blocking=True)
+            imgs = imgs.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
             # 清空梯度
             optimizer.zero_grad()
             output = model(imgs, targets, None, 'train', 'source')
@@ -559,7 +645,7 @@ def run_training():
             print('best source-stage validation accuracy %.4f' % best_source_val_acc)
     # --checkpoint is weights initialization, not a full target-stage resume.
     if args.pre_epochs > 0:
-        checkpoint = torch.load(source_best_path, map_location='cuda')
+        checkpoint = torch.load(source_best_path, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint['model'])
         optimizer.load_state_dict(checkpoint['optimizer'])
         scheduler.load_state_dict(checkpoint['scheduler'])
@@ -571,7 +657,7 @@ def run_training():
         )
 
     # 构建 EMA 教师模型
-    teacher = create_ema_teacher(model).cuda()
+    teacher = create_ema_teacher(model).to(device)
 
     # 一个特征钩子，挂到 teacher.feature 和 model.feature 上
     # 作用：在前向传播时自动截获骨干网络的输出特征 fea，不需要改模型代码。
@@ -584,7 +670,7 @@ def run_training():
         model.fc.in_features,
         momentum=args.proto_momentum,
         source_anchor=args.proto_source_anchor,  #锚点权重
-    ).cuda()
+    ).to(device)
 
     # 源域数据初始化原型
     initialize_source_prototypes(
@@ -594,7 +680,7 @@ def run_training():
           np.array2string(prototype_bank.source_counts.cpu().numpy(), separator=', '))
 
     # 新的拯救模块：逐类源域高斯分布 + 逐样本归属检查 + 目标域全类别近邻库。
-    reliability_bank = GlobalGaussianKNNReliabilityBank(
+    reliability_bank = SparseReliableKNNBank(
         class_num,
         model.fc.in_features,
         k=args.knn_k,
@@ -608,7 +694,15 @@ def run_training():
         score_threshold=args.knn_score_threshold,
         density_threshold=args.knn_density_threshold,
         query_chunk_size=args.knn_query_chunk_size,
-    ).cuda()
+        score_mode=args.knn_score_mode,
+        min_support=args.knn_min_support,
+        min_effective_support=args.knn_min_effective_support,
+        min_purity=args.knn_min_purity,
+        min_margin=args.knn_min_margin,
+        radius_multiplier=args.knn_radius_multiplier,
+    ).to(device)
+    role_tracker = (ReliabilityRoles(len(target_train), args.promotion_epochs).to(device)
+                    if args.role_separation else None)
 
     best_target_val_acc = -1.0
     global_step = 0
@@ -624,10 +718,11 @@ def run_training():
             args.threshold_min,
             args.threshold_max,
         )
-        if args.knn_gate and i % args.knn_refresh_interval == 0:
+        if (args.knn_gate or args.role_separation) and i % args.knn_refresh_interval == 0:
             refresh_reliability_bank(
                 teacher, teacher_feature_hook, prototype_loader_source,
-                memory_loader_target, reliability_bank,
+                memory_loader_target, reliability_bank, role_tracker=role_tracker,
+                thresholds=thresholds, epoch=i,
             )
             print('[Target Epoch %d] KNN Source_Count: %d Target_Memory_Count: %d '
                   'Global_Sigma: %.6f Observed_Global_Var: %.8f EMA_Momentum: %.4f '
@@ -638,6 +733,9 @@ def run_training():
                    reliability_bank.current_global_momentum.item(),
                    reliability_bank.sigma_initialized.item()))
             log_gaussian_means(reliability_bank)
+            print('[Target Epoch %d] Stable_Senders: %d/%d' %
+                  (i, int((reliability_bank.memory_sender_scores > 0).sum().item()),
+                   reliability_bank.memory_ids.numel()))
         current_proto_weight = prototype_weight_for_epoch(
             i, args.proto_weight, args.proto_warmup_epochs, args.proto_ramp_epochs
         )
@@ -674,6 +772,9 @@ def run_training():
         pseudo_distribution_confidence = np.zeros(class_num, dtype=np.int64)
         pseudo_distribution_rescued = np.zeros(class_num, dtype=np.int64)
         pseudo_distribution_final = np.zeros(class_num, dtype=np.int64)
+        pseudo_distribution_anchors = np.zeros(class_num, dtype=np.int64)
+        anchor_num = sparse_rescue_num = soft_repair_num = 0
+        train_soft_loss = 0.0
 
         for weak1, weak2, strong, _, sample_ids in train_loader_target:
             try:
@@ -682,9 +783,9 @@ def run_training():
                 source_train_iter = iter(train_loader_source)
                 source_imgs, source_targets = next(source_train_iter)
 
-            weak1 = weak1.cuda(non_blocking=True)
-            weak2 = weak2.cuda(non_blocking=True)
-            strong = strong.cuda(non_blocking=True)
+            weak1 = weak1.to(device, non_blocking=True)
+            weak2 = weak2.to(device, non_blocking=True)
+            strong = strong.to(device, non_blocking=True)
 
             teacher.eval()
             # 用EMA Teacher对目标域样本的两个弱增强视图进行预测，生成伪标签，并提取一个融合后的teacher 特征，供后面的
@@ -722,8 +823,30 @@ def run_training():
                 final_mask, rescue_mask = combine_rescue_masks(
                     confidence_mask, agreement_mask, reliability_mask, enable_knn_rescue
                 )
-                # Networks.forward selects idx == 1: retain a binary mask here.
+                # Learning is distinct from updating shared class knowledge.
                 con_idx = final_mask.float()
+                if role_tracker is not None:
+                    gaussian_ok = reliability_bank.in_distribution(
+                        teacher_mean_features, pseudo_targets
+                    )
+                    conf1 = F.softmax(logits1, dim=1).max(dim=1).values
+                    conf2 = F.softmax(logits2, dim=1).max(dim=1).values
+                    anchor_mask = role_tracker.observe(
+                        sample_ids, pseudo_targets, final_mask & gaussian_ok,
+                        torch.minimum(conf1, conf2), epoch=i,
+                    )
+                else:
+                    anchor_mask = final_mask.clone()
+                # Binary mask required by Networks.forward(idx == 1).
+                anchor_idx = anchor_mask.float()
+                soft_mask = torch.zeros_like(final_mask)
+                soft_targets = None
+                if args.neighbor_soft_labels and enable_knn_rescue:
+                    teacher_probs = (F.softmax(logits1, dim=1) + F.softmax(logits2, dim=1)) / 2
+                    soft_mask, soft_targets = neighbor_soft_targets(
+                        teacher_probs, knn_result, agreement_mask, final_mask,
+                        mix=args.neighbor_soft_mix,
+                    )
 
                 # 评估函数，用来统计在“可靠样本”上，模型特征与原型之间的预测一致性和相似度，会只检查 con_idx=1 的最终可靠目标样本
                 proto_agree, proto_checked, proto_similarity = (
@@ -737,6 +860,11 @@ def run_training():
             knn_pass_num += int(reliability_mask.sum().item())
             knn_rescue_num += int(rescue_mask.sum().item())
             final_accept_num += int(final_mask.sum().item())
+            anchor_num += int(anchor_mask.sum().item())
+            soft_repair_num += int(soft_mask.sum().item())
+            pseudo_distribution_anchors += np.bincount(
+                pseudo_targets[anchor_mask].cpu().numpy(), minlength=class_num
+            ).astype(np.int64)
 
             if knn_result is not None:
                 checked = knn_result['checked_mask']
@@ -744,6 +872,7 @@ def run_training():
                 density_sum += float(knn_result['density'][checked].sum().item())
                 knn_checked_num += int(checked.sum().item())
                 dense_num += int(knn_result['dense_mask'].sum().item())
+                sparse_rescue_num += int((rescue_mask & knn_result['sparse_mask']).sum().item())
             # 累计prototype诊断指标
             prototype_agree_num += proto_agree
             prototype_checked_num += proto_checked
@@ -770,14 +899,15 @@ def run_training():
             # 给所有源域样本一个权重1，默认全可信
             source_con_idx = torch.ones(source_imgs.shape[0])
             # 源域图像+目标域strong augmentation
-            train_imgs = torch.cat((source_imgs, strong.cpu()), dim=0).cuda(non_blocking=True)
-            train_targets = torch.cat((source_targets, pseudo_targets.cpu()), dim=0).cuda(non_blocking=True)
-            train_con_idx = torch.cat((source_con_idx, con_idx.cpu()), dim=0).cuda(non_blocking=True)
+            train_imgs = torch.cat((source_imgs, strong.cpu()), dim=0).to(device, non_blocking=True)
+            train_targets = torch.cat((source_targets, pseudo_targets.cpu()), dim=0).to(device, non_blocking=True)
+            train_con_idx = torch.cat((source_con_idx, con_idx.cpu()), dim=0).to(device, non_blocking=True)
+            train_anchor_idx = torch.cat((source_con_idx, anchor_idx.cpu()), dim=0).to(device, non_blocking=True)
 
             # 清空模型参数的梯度
             optimizer.zero_grad()
             output = model(
-                train_imgs, train_targets, train_con_idx, 'train', 'target',
+                train_imgs, train_targets, train_anchor_idx, 'train', 'target',
                 source_count=source_imgs.shape[0],
             )
             # 分类损失
@@ -796,12 +926,19 @@ def run_training():
                 con_idx,
                 temperature=args.proto_temperature,
             )
+            # Soft recipients are excluded from hard CE, MMD and prototype updates.
+            soft_loss = output[0].sum() * 0.0
+            if soft_targets is not None:
+                soft_loss = soft_supervision_loss(
+                    output[0][source_imgs.shape[0]:], soft_targets, soft_mask
+                )
             # 总损失
             loss = (
                 cls_loss * args.w1
                 + aff_loss * args.w2
                 + weight_loss * args.w3
                 + proto_loss * current_proto_weight
+                + soft_loss * args.neighbor_soft_weight
             )
             #反向传播
             loss.backward()
@@ -812,13 +949,14 @@ def run_training():
             update_ema_teacher(teacher, model, args.ema_decay, global_step)
             # 这是更新目标域prototype
             prototype_bank.update_target(
-                teacher_mean_features, pseudo_targets, con_idx
+                teacher_mean_features, pseudo_targets, anchor_idx
             )
 
             train_loss1 += cls_loss.item()
             train_loss2 += aff_loss.item()
             train_loss3 += weight_loss.item()
             train_proto_loss += proto_loss.item()
+            train_soft_loss += soft_loss.item()
             batch_count += 1
         # 更新学习率
         scheduler.step()
@@ -847,6 +985,11 @@ def run_training():
               (i, np.array2string(pseudo_distribution_rescued, separator=', ')))
         print('[Target Epoch %d] Pseudo_Distribution_Final: %s' %
               (i, np.array2string(pseudo_distribution_final, separator=', ')))
+        print('[Target Epoch %d] Anchor_Num: %d Sparse_Rescue_Num: %d '
+              'Soft_Repair_Num: %d Soft_Loss: %.5f Anchor_Distribution: %s' %
+              (i, anchor_num, sparse_rescue_num, soft_repair_num,
+               train_soft_loss / max(batch_count, 1),
+               np.array2string(pseudo_distribution_anchors, separator=', ')))
         print('[Target Epoch %d] Prototype_Agreement: %d/%d (%.4f) '
               'Mean_Assigned_Cosine: %.4f Target_Prototype_Counts: %s' %
               (i, prototype_agree_num, prototype_checked_num,
@@ -872,15 +1015,16 @@ def run_training():
                 best_target_val_acc, args, teacher=teacher,
                 prototype_bank=prototype_bank,
                 reliability_bank=reliability_bank,
+                role_tracker=role_tracker,
             )
             print('best target-stage validation accuracy %.4f' % best_target_val_acc)
 
     if args.epochs > 0:
-        checkpoint = torch.load(target_best_path, map_location='cuda')
+        checkpoint = torch.load(target_best_path, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint['model'])
         selected_val_acc = best_target_val_acc
     else:
-        checkpoint = torch.load(source_best_path, map_location='cuda')
+        checkpoint = torch.load(source_best_path, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint['model'])
         selected_val_acc = best_source_val_acc
 
@@ -900,4 +1044,5 @@ def run_training():
 
 if __name__ == '__main__':
     run_training()
+
 

@@ -238,7 +238,7 @@ class GlobalGaussianKNNReliabilityBank(nn.Module):
             self.global_var.mul_(beta).add_(observed, alpha=1.0 - beta)
 
         self.global_var.clamp_(min=self.variance_floor)
-        self.class_variances[ready].fill_(float(self.global_var.item()))
+        self.class_variances[ready] = self.global_var
         self.refresh_count.add_(1)
 
     @torch.no_grad()
@@ -529,3 +529,4 @@ def combine_rescue_masks(
             & ~confidence_mask
         )
     return confidence_mask | rescue_mask, rescue_mask
+
