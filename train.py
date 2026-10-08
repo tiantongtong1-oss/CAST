@@ -319,10 +319,13 @@ def evaluate(model, loader, criterion, num_samples, epoch, split_name):
 
     avg_loss = val_loss / max(iter_cnt, 1)
     acc = float(bingo_cnt) / float(num_samples)
-    print('[Epoch %d] Target %s accuracy: %.4f. Loss: %.3f' %
-          (epoch, split_name, acc, avg_loss))
-    util.make_confucion_matrix(preds, labels)
-    if preds:
+    # Epoch indices are zero-based: report completed rounds 5, 10, 15, ...
+    report_metrics = epoch < 0 or split_name == 'Test' or (epoch + 1) % 5 == 0
+    if report_metrics:
+        print('[Epoch %d] Target %s accuracy: %.4f (%.2f%%). Loss: %.3f' %
+              (epoch, split_name, acc, acc * 100, avg_loss))
+        util.make_confucion_matrix(preds, labels)
+    if preds and report_metrics:
         pred = torch.cat(preds)
         truth = torch.cat(labels)
         classes = model.fc.out_features
@@ -336,6 +339,16 @@ def evaluate(model, loader, criterion, num_samples, epoch, split_name):
               (epoch, split_name, uar, f1.mean().item(),
                np.array2string(recall.numpy(), precision=4),
                np.array2string(cm.sum(1).long().numpy())))
+        precision = cm.diag() / cm.sum(0).clamp_min(1)
+        names = ['Surprise', 'Fear', 'Disgust', 'Happy', 'Sad', 'Angry', 'Neutral']
+        print('Class          Recall     Precision       F1    Support')
+        for c in range(classes):
+            name = names[c] if c < len(names) else str(c)
+            print('%-12s %8.2f%% %12.2f%% %8.2f%% %8d' %
+                  (name, recall[c].item() * 100, precision[c].item() * 100,
+                   f1[c].item() * 100, int(cm[c].sum().item())))
+        print('Recall = correct predictions / true class samples.')
+
     return acc
 
 
