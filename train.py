@@ -119,6 +119,9 @@ def parse_args(argv=None):
     parser.set_defaults(role_separation=True)
     parser.add_argument('--no_role_separation', dest='role_separation', action='store_false',
                         help='ablation: accepted samples may immediately update prototypes')
+    parser.add_argument('--immediate_knn_prototype_update', action='store_true',
+                        help='ablation: newly KNN-rescued samples update target prototypes '
+                             'immediately; MMD and sender promotion remain unchanged')
     parser.add_argument('--promotion_epochs', type=int, default=3,
                         help='consecutive eligible epochs before anchor/sender promotion')
     parser.add_argument('--knn_score_mode', choices=['support', 'v7'], default='support',
@@ -498,6 +501,8 @@ def run_training():
            args.knn_min_margin, args.neighbor_soft_labels, args.neighbor_soft_mix,
            args.neighbor_soft_weight, args.run_name))
 
+    print('immediate_knn_prototype_update:%s' % args.immediate_knn_prototype_update)
+
     if args.backbone == 'resnet18':
         train_batch, test_batch = 128, 128
     elif args.backbone == 'resnet50':
@@ -774,6 +779,7 @@ def run_training():
         pseudo_distribution_final = np.zeros(class_num, dtype=np.int64)
         pseudo_distribution_anchors = np.zeros(class_num, dtype=np.int64)
         anchor_num = sparse_rescue_num = soft_repair_num = 0
+        prototype_update_num = immediate_rescue_update_num = 0
         train_soft_loss = 0.0
 
         for weak1, weak2, strong, _, sample_ids in train_loader_target:
@@ -839,6 +845,10 @@ def run_training():
                     anchor_mask = final_mask.clone()
                 # Binary mask required by Networks.forward(idx == 1).
                 anchor_idx = anchor_mask.float()
+                # Only prototype writes are relaxed; do not mutate anchor_mask.
+                prototype_update_mask = anchor_mask.clone()
+                if args.immediate_knn_prototype_update:
+                    prototype_update_mask |= rescue_mask
                 soft_mask = torch.zeros_like(final_mask)
                 soft_targets = None
                 if args.neighbor_soft_labels and enable_knn_rescue:
@@ -861,6 +871,10 @@ def run_training():
             knn_rescue_num += int(rescue_mask.sum().item())
             final_accept_num += int(final_mask.sum().item())
             anchor_num += int(anchor_mask.sum().item())
+            prototype_update_num += int(prototype_update_mask.sum().item())
+            immediate_rescue_update_num += int(
+                (prototype_update_mask & rescue_mask & ~anchor_mask).sum().item()
+            )
             soft_repair_num += int(soft_mask.sum().item())
             pseudo_distribution_anchors += np.bincount(
                 pseudo_targets[anchor_mask].cpu().numpy(), minlength=class_num
@@ -949,7 +963,7 @@ def run_training():
             update_ema_teacher(teacher, model, args.ema_decay, global_step)
             # 这是更新目标域prototype
             prototype_bank.update_target(
-                teacher_mean_features, pseudo_targets, anchor_idx
+                teacher_mean_features, pseudo_targets, prototype_update_mask
             )
 
             train_loss1 += cls_loss.item()
@@ -990,6 +1004,8 @@ def run_training():
               (i, anchor_num, sparse_rescue_num, soft_repair_num,
                train_soft_loss / max(batch_count, 1),
                np.array2string(pseudo_distribution_anchors, separator=', ')))
+        print('[Target Epoch %d] Prototype_Update_Num: %d Immediate_Rescue_Update_Num: %d' %
+              (i, prototype_update_num, immediate_rescue_update_num))
         print('[Target Epoch %d] Prototype_Agreement: %d/%d (%.4f) '
               'Mean_Assigned_Cosine: %.4f Target_Prototype_Counts: %s' %
               (i, prototype_agree_num, prototype_checked_num,
