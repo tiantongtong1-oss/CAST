@@ -378,7 +378,7 @@ def initialize_source_prototypes(teacher, feature_hook, loader, prototype_bank):
 
 
 def log_gaussian_means(reliability_bank):
-    """Print complete per-class mu vectors and scale diagnostics once per refresh."""
+    """Print compact per-class scale diagnostics without dumping feature vectors."""
     means = reliability_bank.class_means.detach().cpu().numpy()
     ready = reliability_bank.distribution_initialized.detach().cpu().tolist()
     counts = reliability_bank.class_source_counts.detach().cpu().tolist()
@@ -395,9 +395,6 @@ def log_gaussian_means(reliability_bank):
         print('[Gaussian mu] class=%d count=%d ready=True l2=%.8g abs_max=%.8g '
               'finite=%s bound_ok=%s' %
               (c, counts[c], norm, abs_max, finite, bound_ok), flush=True)
-        print('[Gaussian mu values] class=%d mu=%s' %
-              (c, np.array2string(mu, precision=8, threshold=mu.size,
-                                 max_line_width=1000000, separator=', ')), flush=True)
         if not bound_ok:
             print('[Gaussian mu WARNING] class=%d exceeds normalized-mean bounds; '
                   'check features/statistics/checkpoint.' % c, flush=True)
