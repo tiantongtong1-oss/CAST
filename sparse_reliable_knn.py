@@ -80,24 +80,25 @@ class SparseReliableKNNBank(GlobalGaussianKNNReliabilityBank):
         valid = candidates & torch.isfinite(features).all(1) & (features.norm(dim=1) > self.eps)
         valid &= (labels >= 0) & (labels < self.num_classes)
         rows = valid.nonzero(as_tuple=False).flatten()
-        # Source Gaussian uses per-coordinate variance. Pair distance needs a
-        # vector-scale bandwidth, decoupled from the chi-square region test.
-        vector_var = (self.feature_dim * self.global_var).clamp_min(self.eps)
-        h_sq = self.bandwidth_multiplier ** 2 * vector_var
-        radius_sq = 2.0 * self.radius_multiplier * vector_var
+        rows = rows[self.distribution_initialized[labels[rows]]]
         k = min(self.k, self.memory_ids.numel())
         memory_region = self.in_distribution(self.memory_features, self.memory_labels)
         for start in range(0, rows.numel(), self.query_chunk_size):
             idx = rows[start:start + self.query_chunk_size]
             z = F.normalize(features[idx], dim=1)
+            # A sender contributes on its own class scale, including competing
+            # classes in the vote used for purity and optional soft labels.
+            vector_var = (self.feature_dim * self.class_var[self.memory_labels]).clamp_min(self.eps)
+            h_sq = self.bandwidth_multiplier ** 2 * vector_var
+            radius_sq = 2.0 * self.radius_multiplier * vector_var
             distance = (2 - 2 * z.mm(self.memory_features.t())).clamp_min(0)
             distance.masked_fill_(ids[idx, None].eq(self.memory_ids[None, :]), float('inf'))
             nn_dist, nn_idx = distance.topk(k, dim=1, largest=False)
             finite = torch.isfinite(nn_dist)
-            weights = torch.exp(-nn_dist / (2 * h_sq))
+            weights = torch.exp(-nn_dist / (2 * h_sq[nn_idx]))
             nn_labels = self.memory_labels[nn_idx]
             reliability = self.memory_sender_scores[nn_idx]
-            reliable = finite & (nn_dist <= radius_sq) & memory_region[nn_idx]
+            reliable = finite & (nn_dist <= radius_sq[nn_idx]) & memory_region[nn_idx]
             reliable &= reliability > 0
             vote_weights = weights * reliability * reliable.float()
             votes = features.new_zeros(idx.numel(), self.num_classes)
@@ -155,3 +156,4 @@ class SparseReliableKNNBank(GlobalGaussianKNNReliabilityBank):
             result['sparse_mask'][idx] = enough & (density < self.density_threshold)
             result['pass_mask'][idx] = accepted
         return result
+

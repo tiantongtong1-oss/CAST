@@ -21,6 +21,7 @@ def bank_with_memory(angles, labels=None, sender_scores=None, score_mode='suppor
     bank = SparseReliableKNNBank(2, 2, k=20, score_mode=score_mode, query_chunk_size=chunk)
     bank.class_means.copy_(torch.tensor([[1., 0.], [1., 0.]]))
     bank.global_var.fill_(0.04)
+    bank.class_variances.fill_(0.04)
     bank.distribution_initialized.fill_(True)
     bank.sigma_initialized.fill_(True)
     n = len(angles)
@@ -34,6 +35,23 @@ def bank_with_memory(angles, labels=None, sender_scores=None, score_mode='suppor
 def query(bank, angle=0., label=0, sample_id=99):
     return bank.gate(points([angle]), torch.tensor([label]), torch.tensor([sample_id]),
                      torch.tensor([True]), torch.tensor([0.8, 0.8]))
+
+
+class ClassVarianceScaleTests(unittest.TestCase):
+    def test_sender_class_controls_kernel_and_radius(self):
+        bank = bank_with_memory([.1, .1, .1, .1, .1, .1],
+                                labels=torch.tensor([0, 0, 0, 1, 1, 1]))
+        bank.class_variances[0].fill_(.001)
+        bank.class_variances[1].fill_(.1)
+        # All senders lie in their own region; only class 0's radius excludes them.
+        bank.class_means[:] = points([.1])[0]
+        result = query(bank, label=1)
+        self.assertEqual(result['support_count'].item(), 3)
+        self.assertEqual(result['neighbor_probs'][0, 0].item(), 0)
+        self.assertEqual(result['neighbor_probs'][0, 1].item(), 1)
+        bank.global_var.fill_(999)
+        again = query(bank, label=1)
+        self.assertTrue(torch.equal(result['neighbor_probs'], again['neighbor_probs']))
 
 
 class RoleTests(unittest.TestCase):
@@ -190,3 +208,4 @@ class SoftRepairTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

@@ -45,7 +45,7 @@ class IntegrationTests(unittest.TestCase):
         args = parse_args(['--pre_epochs', '0', '--checkpoint', 'source.pth'])
         self.assertEqual(args.checkpoint, 'source.pth')
 
-    def test_mu_logging_is_complete_and_flags_large_values(self):
+    def test_mu_logging_is_compact_and_flags_large_values(self):
         bank = KNNReliabilityBank(2, 1200)
         bank.distribution_initialized[0] = True
         bank.class_source_counts[0] = 12
@@ -57,8 +57,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn('bound_ok=True', text)
         self.assertIn('class=1 count=0 ready=False', text)
         self.assertNotIn('...', text)
-        vector = text.split('mu=[', 1)[1].split(']', 1)[0]
-        self.assertEqual(len(vector.split(',')), 1200)
+        self.assertNotIn('mu=[', text)
         bank.class_means[0, 0] = 2.
         with contextlib.redirect_stdout(out):
             log_gaussian_means(bank)
@@ -141,4 +140,5 @@ class IntegrationTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
 

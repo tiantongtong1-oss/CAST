@@ -1,18 +1,8 @@
-"""Source-labeled class Gaussian reliability with global variance EMA.
+"""Source-only class Gaussian reliability with independent isotropic variance EMA.
 
-Each class has a source-only center mu_c. All classes share one isotropic within-class
-variance estimated from correctly labeled source features. The scalar variance is
-updated by a momentum schedule that increases across source refreshes.
-
-A pseudo-label candidate must fall inside the chi-square confidence region of its
-predicted class. Its k nearest target-memory neighbors are then checked for:
-1) same predicted class,
-2) sufficient teacher confidence,
-3) membership in the candidate class Gaussian region.
-
-Neighborhood density is estimated with a Gaussian distance kernel. Sparse
-neighborhoods receive an additional configurable penalty in the final reliability
-score. Target ground-truth labels are never used.
+Each class fits its own center and scalar within-class variance. Historical
+Global names/buffers are retained for API compatibility and aggregate diagnostics;
+they do not determine Gaussian membership or neighborhood scales.
 """
 
 import math
@@ -81,8 +71,7 @@ class GlobalGaussianKNNReliabilityBank(nn.Module):
         self.eps = float(eps)
 
         self.register_buffer("class_means", torch.zeros(num_classes, feature_dim))
-        # Kept for checkpoint diagnostics/compatibility. Every ready class receives
-        # the same global isotropic variance after each refresh.
+        # Each row repeats that class isotropic variance across feature coordinates.
         self.register_buffer("class_variances", torch.ones(num_classes, feature_dim))
         self.register_buffer(
             "distribution_initialized", torch.zeros(num_classes, dtype=torch.bool)
@@ -111,6 +100,7 @@ class GlobalGaussianKNNReliabilityBank(nn.Module):
             "mahalanobis_threshold", torch.tensor((low + high) / 2.0)
         )
 
+        self.register_buffer("current_observed_class_var", torch.zeros(num_classes))
         self.register_buffer("global_var", torch.zeros(()))
         self.register_buffer("current_observed_global_var", torch.zeros(()))
         self.register_buffer("current_global_momentum", torch.tensor(self.sigma_momentum))
@@ -150,6 +140,10 @@ class GlobalGaussianKNNReliabilityBank(nn.Module):
     @property
     def sigma(self):
         return self.global_var.clamp_min(self.eps).sqrt()
+
+    @property
+    def class_var(self):
+        return self.class_variances.mean(dim=1)
 
     def momentum_for_refresh(self):
         if self.global_momentum_ramp_refreshes <= 1:
@@ -191,7 +185,8 @@ class GlobalGaussianKNNReliabilityBank(nn.Module):
 
     @torch.no_grad()
     def finalize_source(self):
-        """Fit class means and update one pooled within-class variance by EMA."""
+        """Fit each class mean and independently update its isotropic variance."""
+        previously_ready = self.distribution_initialized.clone()
         self.class_source_counts.copy_(self._source_count)
         self.source_count.copy_(self._source_count.sum())
 
@@ -199,8 +194,7 @@ class GlobalGaussianKNNReliabilityBank(nn.Module):
         counts = self._source_count.clamp_min(1).double().unsqueeze(1)
         means = self._source_sum / counts
 
-        # Per-coordinate within-class MLE variance only for estimating the pooled
-        # source variance. The final Gaussian uses one shared scalar variance.
+        # Within-class MLE coordinate variances, averaged separately per class.
         raw_class_variances = (
             self._source_sq_sum / counts - means.square()
         ).clamp_min(0)
@@ -209,6 +203,7 @@ class GlobalGaussianKNNReliabilityBank(nn.Module):
 
         self.distribution_initialized.copy_(ready)
         if not ready.any():
+            self.current_observed_class_var.zero_()
             self.sigma_initialized.fill_(False)
             self.global_var.zero_()
             self.current_observed_global_var.zero_()
@@ -217,33 +212,28 @@ class GlobalGaussianKNNReliabilityBank(nn.Module):
         for c in ready.nonzero(as_tuple=False).flatten().tolist():
             self.class_means[c].copy_(means[c].to(self.class_means))
 
-        # Isotropic Gaussian MLE variance:
-        # sum_{c,d} N_c * var[c,d] / (sum_c N_c * D)
-        # This is the pooled mean squared within-class residual per coordinate.
-        weights = self._source_count[ready].double().unsqueeze(1)
-        pooled_var = (
-            (raw_class_variances[ready] * weights).sum()
-            / (weights.sum() * self.feature_dim)
-        )
-        pooled_var = pooled_var.clamp_min(self.variance_floor)
-        observed = pooled_var.to(self.global_var)
-        self.current_observed_global_var.copy_(observed)
-
+        observed = raw_class_variances.mean(dim=1).clamp_min(self.variance_floor)
+        self.current_observed_class_var.zero_()
+        self.current_observed_class_var[ready] = observed[ready].to(self.class_means)
         beta = float(self.momentum_for_refresh())
         self.current_global_momentum.fill_(beta)
-        if not self.sigma_initialized.item():
-            self.global_var.copy_(observed)
-            self.sigma_initialized.fill_(True)
-        else:
-            self.global_var.mul_(beta).add_(observed, alpha=1.0 - beta)
-
-        self.global_var.clamp_(min=self.variance_floor)
-        self.class_variances[ready] = self.global_var
+        for c in ready.nonzero(as_tuple=False).flatten().tolist():
+            value = observed[c].to(self.class_means)
+            if previously_ready[c]:
+                value = beta * self.class_var[c] + (1.0 - beta) * value
+            self.class_variances[c].fill_(value.clamp_min(self.variance_floor))
+        self.sigma_initialized.fill_(True)
+        # Weighted summaries retained only for historical diagnostic consumers.
+        weights = self._source_count[ready].to(self.class_means)
+        self.global_var.copy_((self.class_var[ready] * weights).sum() / weights.sum())
+        self.current_observed_global_var.copy_(
+            (self.current_observed_class_var[ready] * weights).sum() / weights.sum()
+        )
         self.refresh_count.add_(1)
 
     @torch.no_grad()
     def distribution_distance(self, features, labels):
-        """Squared Mahalanobis distance under N(mu_c, global_var * I)."""
+        """Squared Mahalanobis distance under N(mu_c, class_var[c] * I)."""
         features = features.detach().to(self.class_means)
         labels = labels.detach().to(device=features.device, dtype=torch.long)
         valid_labels = (labels >= 0) & (labels < self.num_classes)
@@ -255,7 +245,7 @@ class GlobalGaussianKNNReliabilityBank(nn.Module):
 
         z = F.normalize(torch.nan_to_num(features), dim=-1)
         sq = (z - self.class_means[safe_labels]).square().sum(dim=-1)
-        distance = sq / self.global_var.clamp_min(self.variance_floor)
+        distance = sq / self.class_var[safe_labels].clamp_min(self.variance_floor)
         return distance.masked_fill(~valid, float("inf"))
 
     @torch.no_grad()
@@ -394,12 +384,6 @@ class GlobalGaussianKNNReliabilityBank(nn.Module):
             or self.memory_features.size(0) < self.k
         ):
             return result
-        if (
-            not torch.isfinite(self.global_var)
-            or self.global_var.item() <= 0
-        ):
-            return result
-
         valid = candidate_mask & torch.isfinite(features).all(dim=1)
         valid &= features.norm(dim=1) > self.eps
         valid &= (pseudo_targets >= 0) & (
@@ -410,14 +394,11 @@ class GlobalGaussianKNNReliabilityBank(nn.Module):
             self.distribution_initialized[pseudo_targets[rows]]
         ]
 
-        h_sq = (
-            self.bandwidth_multiplier ** 2 * self.global_var
-        ).clamp_min(self.eps)
-
         for start in range(0, rows.numel(), self.query_chunk_size):
             idx = rows[start : start + self.query_chunk_size]
             z = F.normalize(features[idx], dim=1)
             labels = pseudo_targets[idx]
+            h_sq = (self.bandwidth_multiplier ** 2 * self.class_var[labels]).clamp_min(self.eps)[:, None]
 
             distances = (
                 2.0 - 2.0 * z.mm(self.memory_features.t())
@@ -529,4 +510,5 @@ def combine_rescue_masks(
             & ~confidence_mask
         )
     return confidence_mask | rescue_mask, rescue_mask
+
 

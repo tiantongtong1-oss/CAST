@@ -99,11 +99,11 @@ def parse_args(argv=None):
     parser.add_argument('--knn_variance_floor', type=float, default=1e-4,
                         help='minimum per-coordinate class variance')
     parser.add_argument('--knn_sigma_momentum', type=float, default=0.70,
-                        help='starting EMA momentum for the pooled source global variance')
+                        help='starting EMA momentum for the per-class source variance')
     parser.add_argument('--knn_sigma_momentum_end', type=float, default=0.95,
-                        help='final EMA momentum for the pooled source global variance')
+                        help='final EMA momentum for the per-class source variance')
     parser.add_argument('--knn_sigma_momentum_ramp_refreshes', type=int, default=30,
-                        help='number of source refreshes used to increase global variance momentum')
+                        help='number of source refreshes used to increase per-class variance momentum')
     parser.add_argument('--knn_sparse_penalty', type=float, default=0.5,
                         help='multiplicative score penalty for sparse kNN neighborhoods')
     parser.add_argument('--knn_bandwidth_multiplier', type=float, default=1.0,
@@ -493,7 +493,7 @@ def run_training():
     print('prototype weight:%s temp:%s momentum:%s source_anchor:%s warmup:%s ramp:%s' %
           (args.proto_weight, args.proto_temperature, args.proto_momentum,
            args.proto_source_anchor, args.proto_warmup_epochs, args.proto_ramp_epochs))
-    print('knn rescue:%s k:%s distribution_mass:%s global_momentum:[%s->%s] ramp:%s '
+    print('knn rescue:%s k:%s distribution_mass:%s class_variance_momentum:[%s->%s] ramp:%s '
           'bandwidth:%s score_threshold:%s density_threshold:%s sparse_penalty:%s '
           'warmup:%s refresh_interval:%s' %
           (args.knn_gate, args.knn_k, args.knn_distribution_mass,
@@ -740,13 +740,14 @@ def run_training():
                 thresholds=thresholds, epoch=i,
             )
             print('[Target Epoch %d] KNN Source_Count: %d Target_Memory_Count: %d '
-                  'Global_Sigma: %.6f Observed_Global_Var: %.8f EMA_Momentum: %.4f '
-                  'Sigma_Ready: %s' %
+                  'Class_Variances: %s Observed_Class_Variances: %s EMA_Momentum: %.4f '
+                  'Classes_Ready: %s' %
                   (i, reliability_bank.source_count.item(),
-                   reliability_bank.memory_ids.numel(), reliability_bank.sigma.item(),
-                   reliability_bank.current_observed_global_var.item(),
+                   reliability_bank.memory_ids.numel(),
+                   np.array2string(reliability_bank.class_var.cpu().numpy(), precision=8),
+                   np.array2string(reliability_bank.current_observed_class_var.cpu().numpy(), precision=8),
                    reliability_bank.current_global_momentum.item(),
-                   reliability_bank.sigma_initialized.item()))
+                   reliability_bank.distribution_initialized.cpu().tolist()))
             log_gaussian_means(reliability_bank)
             print('[Target Epoch %d] Stable_Senders: %d/%d' %
                   (i, int((reliability_bank.memory_sender_scores > 0).sum().item()),
@@ -1070,5 +1071,6 @@ def run_training():
 
 if __name__ == '__main__':
     run_training()
+
 
 

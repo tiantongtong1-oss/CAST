@@ -14,7 +14,7 @@ def points(angles):
 
 
 class GlobalGaussianReliabilityTests(unittest.TestCase):
-    def test_source_true_labels_build_class_centers_and_one_shared_variance(self):
+    def test_source_true_labels_build_independent_class_variances(self):
         bank = GlobalGaussianKNNReliabilityBank(
             2, 2, k=1, sigma_momentum=0.5,
             global_momentum_end=0.9,
@@ -38,12 +38,52 @@ class GlobalGaussianReliabilityTests(unittest.TestCase):
         self.assertAlmostEqual(bank.global_var.item(), expected_global.item(), places=6)
         self.assertTrue(torch.allclose(
             bank.class_variances[0],
-            torch.full((2,), bank.global_var.item()),
+            torch.full((2,), class_vars[0].mean().item()),
         ))
         self.assertTrue(torch.allclose(
             bank.class_variances[1],
-            torch.full((2,), bank.global_var.item()),
+            torch.full((2,), class_vars[1].mean().item()),
         ))
+
+    def test_missing_class_is_disabled_and_reinitialized_on_return(self):
+        bank = GlobalGaussianKNNReliabilityBank(2, 2, k=1)
+        for angles, labels in [([0., .2, 2.5, 3.5], [0, 0, 1, 1]),
+                               ([0., .2], [0, 0]),
+                               ([0., .2, 2.9, 3.1], [0, 0, 1, 1])]:
+            x = points(angles)
+            bank.begin_source_refresh()
+            bank.accumulate_source(x, torch.tensor(labels))
+            bank.finalize_source()
+            self.assertEqual(bank.distribution_initialized[1].item(), len(labels) == 4)
+        expected = x[2:].var(0, unbiased=False).mean().clamp_min(bank.variance_floor)
+        self.assertTrue(torch.allclose(bank.class_var[1], expected, atol=1e-6))
+
+    def test_membership_uses_assigned_class_variance_not_summary(self):
+        bank = GlobalGaussianKNNReliabilityBank(2, 2, k=1)
+        bank.class_means[:] = torch.tensor([1., 0.])
+        bank.class_variances[0].fill_(.001)
+        bank.class_variances[1].fill_(.1)
+        bank.distribution_initialized.fill_(True)
+        bank.sigma_initialized.fill_(True)
+        x = points([.3, .3])
+        distance = bank.distribution_distance(x, torch.tensor([0, 1]))
+        self.assertAlmostEqual((distance[0] / distance[1]).item(), 100., places=4)
+        self.assertEqual(bank.in_distribution(x, torch.tensor([0, 1])).tolist(), [False, True])
+        bank.global_var.fill_(999.)
+        self.assertTrue(torch.equal(distance, bank.distribution_distance(x, torch.tensor([0, 1]))))
+
+    def test_each_class_ema_uses_its_own_previous_variance(self):
+        bank = GlobalGaussianKNNReliabilityBank(2, 2, k=1, sigma_momentum=.5,
+                                              global_momentum_end=.5)
+        for angles in ([0., .1, 2., 3.], [0., .5, 2.8, 3.]):
+            old = bank.class_var.clone()
+            initialized = bank.distribution_initialized.clone()
+            bank.begin_source_refresh()
+            bank.accumulate_source(points(angles), torch.tensor([0, 0, 1, 1]))
+            bank.finalize_source()
+            observed = bank.current_observed_class_var
+            expected = .5 * old + .5 * observed if initialized.all() else observed
+            self.assertTrue(torch.allclose(bank.class_var, expected, atol=1e-6))
 
     def test_global_variance_uses_increasing_momentum(self):
         bank = GlobalGaussianKNNReliabilityBank(
@@ -158,3 +198,4 @@ class GlobalGaussianReliabilityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
