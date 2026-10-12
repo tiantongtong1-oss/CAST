@@ -92,8 +92,8 @@ def parse_args(argv=None):
     parser.add_argument('--no_radius_rescue', dest='radius_rescue', action='store_false',
                         help='ablation: use only dual-view high-confidence pseudo-labels')
     parser.set_defaults(radius_rescue=True)
-    parser.add_argument('--source_radius_k', type=int, default=11,
-                        help='mean of the farthest k source-to-prototype Euclidean distances')
+    parser.add_argument('--source_radius_quantile', type=float, default=0.90,
+                        help='per-class quantile of all source-to-prototype Euclidean distances; 0 < q <= 1')
     parser.add_argument('--source_refresh_interval', type=int, default=1,
                         help='refresh source prototypes and radii every N target epochs')
     parser.set_defaults(role_separation=True)
@@ -104,14 +104,16 @@ def parse_args(argv=None):
                              'MMD anchor promotion is unchanged')
     parser.add_argument('--promotion_epochs', type=int, default=3,
                         help='consecutive eligible epochs before anchor promotion')
-    parser.add_argument('--run_name', type=str, default='confidence_radius11_rescue',
+    parser.add_argument('--run_name', type=str, default='confidence_radius_quantile_rescue',
                         help='checkpoint suffix; use distinct names for ablations')
     parser.add_argument('--device', choices=['cuda', 'cpu'], default='cuda',
                         help='CPU is supported for smoke tests; CUDA recommended for FER training')
 
     args = parser.parse_args(argv)
-    if args.source_radius_k < 1 or args.source_refresh_interval < 1:
-        parser.error('source_radius_k and source_refresh_interval must be positive')
+    if not np.isfinite(args.source_radius_quantile) or not 0 < args.source_radius_quantile <= 1:
+        parser.error('source_radius_quantile must be finite and in (0, 1]')
+    if args.source_refresh_interval < 1:
+        parser.error('source_refresh_interval must be positive')
     if args.pre_epochs < 0 or args.epochs < 0 or args.radius_rescue_warmup_epochs < 0:
         parser.error('epoch counts must be nonnegative')
     if args.pre_epochs == 0 and not args.checkpoint:
@@ -397,9 +399,9 @@ def run_training():
     print('prototype weight:%s temp:%s momentum:%s source_anchor:%s warmup:%s ramp:%s' %
           (args.proto_weight, args.proto_temperature, args.proto_momentum,
            args.proto_source_anchor, args.proto_warmup_epochs, args.proto_ramp_epochs))
-    print('source_radius_k:%d source_refresh_interval:%d role_separation:%s '
+    print('source_radius_quantile:%.4f source_refresh_interval:%d role_separation:%s '
           'promotion_epochs:%d immediate_prototype_update:%s run_name:%s' %
-          (args.source_radius_k, args.source_refresh_interval, args.role_separation,
+          (args.source_radius_quantile, args.source_refresh_interval, args.role_separation,
            args.promotion_epochs, args.immediate_prototype_update, args.run_name))
 
     print('confidence threshold base:%s beta:%s margin:%s range:[%s,%s] '
@@ -577,7 +579,7 @@ def run_training():
 
     # Source-only geometric gate: no target neighbors, voting or variance.
     reliability_bank = SourcePrototypeRadiusBank(
-        class_num, model.fc.in_features, source_radius_k=args.source_radius_k,
+        class_num, model.fc.in_features, source_radius_quantile=args.source_radius_quantile,
     ).to(device)
     role_tracker = (ReliabilityRoles(len(target_train), args.promotion_epochs).to(device)
                     if args.role_separation else None)
