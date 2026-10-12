@@ -17,7 +17,7 @@
 
 例如第 6 类，只比较第 6 类的原型和 R_6，不使用其他类别的阈值。
 类别编号沿用数据集现有映射；代码索引从 0 开始，“第六类”对应索引 5。
-`--source_radius_k 20` 独立于目标域邻居数 `--knn_k 20`。
+`--source_radius_k 11` 独立于目标域邻居数 `--knn_k 20`。
 少于 k 个源域样本时使用全部有效样本；类别缺失则本次刷新禁用该类别区域。
 单样本或完全重合特征的 R_c=0，严格小于规则不接纳任何样本，不额外放宽阈值。
 非有限特征、零向量和越界标签均不能通过。
@@ -59,7 +59,7 @@ python -u train.py \
   --target_path /path/to/fer2013 \
   --data1 rafdb --data2 fer \
   --backbone mobilenet_v2 --pre_epochs 0 --epochs 30 \
-  --source_radius_k 20 --knn_k 20 \
+  --source_radius_k 11 --knn_k 20 \
   --immediate_knn_prototype_update \
   --run_name role_sparse_v8_03_prototype_radius
 ```
@@ -78,3 +78,5 @@ python -m unittest discover -s tests -v
 真实 RAF→FER 训练需要用户数据与 GPU；合成测试不代表性能改善。
 
 验证结果：55 项 CPU 单元与合成训练测试全部通过，Python 语法检查通过。
+
+源域半径默认使用最远 11 个距离；目标域邻居数 `--knn_k` 仍默认 20。本次数量调整未运行测试。

@@ -94,7 +94,7 @@ def parse_args(argv=None):
     parser.add_argument('--no_knn_gate', dest='knn_gate', action='store_false',
                         help='strict dual-view confidence baseline without rescue')
     parser.add_argument('--knn_k', type=int, default=20)
-    parser.add_argument('--source_radius_k', type=int, default=20,
+    parser.add_argument('--source_radius_k', type=int, default=11,
                         help='mean of the farthest k source-to-prototype Euclidean distances')
     parser.add_argument('--knn_sparse_penalty', type=float, default=0.5,
                         help='multiplicative score penalty for sparse kNN neighborhoods')

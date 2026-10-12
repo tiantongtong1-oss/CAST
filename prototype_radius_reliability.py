@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 
 class PrototypeRadiusKNNReliabilityBank(nn.Module):
-    def __init__(self, num_classes, feature_dim, k=20, source_radius_k=20,
+    def __init__(self, num_classes, feature_dim, k=20, source_radius_k=11,
                  bandwidth_multiplier=1.0, score_threshold=0.5,
                  density_threshold=0.5, query_chunk_size=128,
                  sparse_penalty=0.5, eps=1e-8):
