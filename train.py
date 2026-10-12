@@ -10,11 +10,10 @@ from torchvision import transforms
 
 import Networks
 from dataset import RafDataSet, FER
-from ema_utils import create_ema_teacher, select_dual_view_pseudo_labels, update_ema_teacher
+from ema_utils import create_ema_teacher, update_ema_teacher
 from prototype_utils import FeatureHook, PrototypeBank, prototype_weight_for_epoch
-from prototype_radius_reliability import combine_rescue_masks
-from sparse_reliable_knn import SparseReliableKNNBank
-from reliability_roles import ReliabilityRoles, neighbor_soft_targets, soft_supervision_loss
+from source_prototype_radius import SourcePrototypeRadiusBank
+from reliability_roles import ReliabilityRoles
 import image_utils as util
 from randaugment import RandAugmentMC
 # 总训练入口与调度器。串起数据、Source 预训练、EMA Teacher、
@@ -60,20 +59,9 @@ def parse_args(argv=None):
                         help='gamma: classifier modulation loss weight')
     parser.add_argument('--phi', type=float, default=1.4,
                         help='legacy CAST threshold arg retained for CLI compatibility; '
-                             'not used by the stable relative threshold')
+                             'unused by direct prototype-radius selection')
     parser.add_argument('--ema_decay', type=float, default=0.999,
                         help='fixed EMA decay for teacher parameters and floating buffers')
-    parser.add_argument('--threshold_base', type=float, default=0.85,
-                        help='minimum global center of the adaptive threshold')
-    parser.add_argument('--threshold_beta', type=float, default=0.5,
-                        help='strength of per-class confidence deviation')
-    parser.add_argument('--threshold_margin', type=float, default=0.02,
-                        help='margin added above teacher global mean confidence')
-    parser.add_argument('--threshold_min', type=float, default=0.80,
-                        help='minimum class-adaptive threshold')
-    parser.add_argument('--threshold_max', type=float, default=0.95,
-                        help='maximum class-adaptive threshold')
-
     # Prototype-consistency regularizer retained from v1/v2.
     parser.add_argument('--proto_weight', type=float, default=0.10,
                         help='maximum prototype-consistency loss weight')
@@ -88,81 +76,32 @@ def parse_args(argv=None):
     parser.add_argument('--proto_ramp_epochs', type=int, default=5,
                         help='epochs used to linearly ramp prototype loss to full weight')
 
-    parser.set_defaults(knn_gate=True)
-    parser.add_argument('--knn_gate', dest='knn_gate', action='store_true',
-                        help='enable prototype-radius/kNN OR rescue (default)')
-    parser.add_argument('--no_knn_gate', dest='knn_gate', action='store_false',
-                        help='strict dual-view confidence baseline without rescue')
-    parser.add_argument('--knn_k', type=int, default=20)
     parser.add_argument('--source_radius_k', type=int, default=11,
                         help='mean of the farthest k source-to-prototype Euclidean distances')
-    parser.add_argument('--knn_sparse_penalty', type=float, default=0.5,
-                        help='multiplicative score penalty for sparse kNN neighborhoods')
-    parser.add_argument('--knn_bandwidth_multiplier', type=float, default=1.0,
-                        help='neighbor kernel bandwidth = multiplier * class radius')
-    parser.add_argument('--knn_score_threshold', type=float, default=0.5)
-    parser.add_argument('--knn_density_threshold', type=float, default=0.5,
-                        help='dense/sparse cutoff used by the reliability score')
-    parser.add_argument('--knn_warmup_epochs', type=int, default=3)
-    parser.add_argument('--knn_refresh_interval', type=int, default=1)
-    parser.add_argument('--knn_query_chunk_size', type=int, default=128,
-                        help='bound temporary kNN distance matrix memory')
-
+    parser.add_argument('--source_refresh_interval', type=int, default=1,
+                        help='refresh source prototypes and radii every N target epochs')
     parser.set_defaults(role_separation=True)
     parser.add_argument('--no_role_separation', dest='role_separation', action='store_false',
-                        help='ablation: accepted samples may immediately update prototypes')
-    parser.add_argument('--immediate_knn_prototype_update', action='store_true',
-                        help='ablation: newly KNN-rescued samples update target prototypes '
-                             'immediately; MMD and sender promotion remain unchanged')
+                        help='accepted samples may immediately update shared knowledge')
+    parser.add_argument('--immediate_prototype_update', action='store_true',
+                        help='all distance-accepted samples immediately update target prototypes; '
+                             'MMD anchor promotion is unchanged')
     parser.add_argument('--promotion_epochs', type=int, default=3,
-                        help='consecutive eligible epochs before anchor/sender promotion')
-    parser.add_argument('--knn_score_mode', choices=['support', 'v7'], default='support',
-                        help='support: sparse-safe score; v7: original density score')
-    parser.add_argument('--knn_min_support', type=int, default=3)
-    parser.add_argument('--knn_min_effective_support', type=float, default=2.0)
-    parser.add_argument('--knn_min_purity', type=float, default=0.8)
-    parser.add_argument('--knn_min_margin', type=float, default=0.2)
-    parser.add_argument('--knn_radius_multiplier', type=float, default=2.0,
-                        help='neighbor Euclidean-distance cap = multiplier * class radius')
-    parser.add_argument('--neighbor_soft_labels', action='store_true',
-                        help='optional soft supervision for reliable conflicting neighborhoods')
-    parser.add_argument('--neighbor_soft_mix', type=float, default=0.5)
-    parser.add_argument('--neighbor_soft_weight', type=float, default=0.1)
-    parser.add_argument('--run_name', type=str, default='role_sparse_knn_v8_03_radius',
+                        help='consecutive eligible epochs before anchor promotion')
+    parser.add_argument('--run_name', type=str, default='source_radius11_direct',
                         help='checkpoint suffix; use distinct names for ablations')
     parser.add_argument('--device', choices=['cuda', 'cpu'], default='cuda',
                         help='CPU is supported for smoke tests; CUDA recommended for FER training')
 
     args = parser.parse_args(argv)
-    if args.knn_k < 1 or args.knn_query_chunk_size < 1 or args.knn_refresh_interval < 1:
-        parser.error('knn_k, knn_query_chunk_size and knn_refresh_interval must be positive')
-    if args.knn_warmup_epochs < 0 or args.pre_epochs < 0 or args.epochs < 0:
+    if args.source_radius_k < 1 or args.source_refresh_interval < 1:
+        parser.error('source_radius_k and source_refresh_interval must be positive')
+    if args.pre_epochs < 0 or args.epochs < 0:
         parser.error('epoch counts must be nonnegative')
-    if args.source_radius_k < 1:
-        parser.error('source_radius_k must be positive')
-    if not 0 < args.knn_sparse_penalty <= 1:
-        parser.error('knn_sparse_penalty must be in (0, 1]')
-    if not np.isfinite(args.knn_bandwidth_multiplier) or args.knn_bandwidth_multiplier <= 0:
-        parser.error('knn_bandwidth_multiplier must be finite and positive')
-    for name in ('knn_score_threshold', 'knn_density_threshold'):
-        if not 0 < getattr(args, name) <= 1:
-            parser.error('%s must be in (0, 1]' % name)
     if args.pre_epochs == 0 and not args.checkpoint:
         parser.error('--pre_epochs 0 requires --checkpoint with pretrained model weights')
     if args.promotion_epochs < 1:
         parser.error('--promotion_epochs must be positive')
-    if args.knn_min_support < 1 or (args.knn_score_mode == 'support' and args.knn_min_support > args.knn_k):
-        parser.error('--knn_min_support must be positive and <= knn_k in support mode')
-    if not np.isfinite(args.knn_min_effective_support) or not 1 <= args.knn_min_effective_support <= args.knn_k:
-        parser.error('--knn_min_effective_support must be finite and in [1, knn_k]')
-    if not 0 < args.knn_min_purity <= 1 or not 0 <= args.knn_min_margin <= 1:
-        parser.error('invalid support purity/margin')
-    if not np.isfinite(args.knn_radius_multiplier) or args.knn_radius_multiplier <= 0:
-        parser.error('--knn_radius_multiplier must be finite and positive')
-    if not 0 < args.neighbor_soft_mix <= 1 or not np.isfinite(args.neighbor_soft_weight) or args.neighbor_soft_weight <= 0:
-        parser.error('invalid soft-label mixing/weight')
-    if args.neighbor_soft_labels and (not args.knn_gate or args.knn_score_mode != 'support'):
-        parser.error('--neighbor_soft_labels requires knn_gate and support score mode')
     if not args.run_name or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-' for c in args.run_name):
         parser.error('--run_name must contain only letters, digits, underscores or hyphens')
     return args
@@ -214,67 +153,6 @@ def classifier_modulation_loss(model):
     cosine = weight.mm(weight.t()) / norm.mm(norm.t())
     matrix = cosine - torch.eye(weight.size(0), device=weight.device)
     return torch.mean((matrix + 1.0) / 2.0)
-
-
-def calculate_target_thresholds(model, loader, class_num, threshold_base,
-                                threshold_beta, threshold_margin,
-                                threshold_min, threshold_max):
-
-    # EMA Teacher 扫描整个target train，根据各预测类别平均confidence 生成类别自适应置信度阈值
-
-    class_sum = torch.zeros(class_num, dtype=torch.float64)
-    # 记录每个预测类别包含的样本数量
-    class_count = torch.zeros(class_num, dtype=torch.float64)
-    device = next(model.parameters()).device
-    # 切换到评估模式，关闭 Dropout、固定 BatchNorm 等
-    model.eval()
-
-    # 这里只进行推理，不计算梯度，减少显存和计算开销
-    with torch.no_grad():
-        for batch in loader:
-            imgs = batch[0].to(device, non_blocking=True)
-
-            # 使用模型对目标域图像进行预测
-            # logits：分类输出
-            # _：其他不需要使用的输出
-            logits, _ = model(imgs, None, None, mode='test', task='target')
-
-            #转化成类别概率
-            probs = F.softmax(logits, dim=1).cpu()
-            # 获取每个样本的最大预测概率和对应预测类别
-            # max_prob：模型预测的最高置信度
-            # pred_label：最高置信度对应的类别
-            max_prob, pred_label = torch.max(probs, dim=1)
-
-            class_sum.scatter_add_(0, pred_label, max_prob.double())
-            class_count.scatter_add_(
-                0, pred_label, torch.ones_like(max_prob, dtype=torch.float64)
-            )
-
-    valid = class_count > 0
-    class_mean = class_sum / class_count.clamp_min(1.0)
-    if torch.any(valid):
-        global_mean = class_mean[valid].mean()
-    else:
-        global_mean = class_mean.new_tensor(float(threshold_base))
-
-    threshold_center = max(
-        float(threshold_base),
-        float(global_mean.item()) + float(threshold_margin),
-    )
-    threshold_center = min(threshold_center, float(threshold_max))
-
-    thresholds = threshold_center + threshold_beta * (class_mean - global_mean)
-    thresholds = torch.clamp(
-        thresholds, min=threshold_min, max=threshold_max
-    ).float()
-    thresholds[~valid] = float(threshold_max)
-    return (
-        thresholds,
-        class_mean.float(),
-        float(global_mean.item()),
-        float(threshold_center),
-    )
 
 
 def evaluate(model, loader, criterion, num_samples, epoch, split_name):
@@ -397,52 +275,15 @@ def log_source_prototypes(reliability_bank):
 
 
 @torch.no_grad()
-def refresh_reliability_bank(teacher, feature_hook, source_loader, target_loader,
-                             reliability_bank, role_tracker=None, thresholds=None, epoch=0):
-    """Refresh source scale and target-train memory in the same teacher space.
-
-    Target labels from the dataset are intentionally ignored. A deterministic
-    view is used for memory; only the two training weak views decide agreement.
-    """
+def refresh_source_radius_bank(teacher, feature_hook, source_loader, reliability_bank):
+    """Fit source prototypes and radii from source labels only."""
     device = next(teacher.parameters()).device
     reliability_bank.begin_source_refresh()
     teacher.eval()
     for imgs, targets in source_loader:
-        imgs = imgs.to(device, non_blocking=True)
-        targets = targets.to(device, non_blocking=True)
-        teacher(imgs, None, None, mode='test', task='source')
-        reliability_bank.accumulate_source(feature_hook.output, targets)
+        teacher(imgs.to(device, non_blocking=True), None, None, mode='test', task='source')
+        reliability_bank.accumulate_source(feature_hook.output, targets.to(device))
     reliability_bank.finalize_source()
-
-    features, labels, confidences, sample_ids = [], [], [], []
-    for imgs, _, ids in target_loader:
-        logits, _ = teacher(imgs.to(device, non_blocking=True), None, None,
-                            mode='test', task='target')
-        conf, pred = F.softmax(logits, dim=1).max(dim=1)
-        features.append(feature_hook.output.detach().cpu())
-        labels.append(pred.cpu())
-        confidences.append(conf.cpu())
-        sample_ids.append(ids.cpu())
-    if features:
-        reliability_bank.set_target_memory(
-            torch.cat(features), torch.cat(labels), torch.cat(confidences), torch.cat(sample_ids)
-        )
-        if isinstance(reliability_bank, SparseReliableKNNBank):
-            if role_tracker is not None:
-                sender_scores = role_tracker.sender_scores(
-                    reliability_bank.memory_ids, reliability_bank.memory_labels,
-                    reliability_bank.memory_confidences, epoch,
-                )
-            else:
-                if thresholds is None:
-                    raise ValueError('sender snapshot requires thresholds or role history')
-                conf = reliability_bank.memory_confidences
-                cutoffs = thresholds.to(conf)[reliability_bank.memory_labels]
-                sender_scores = conf * (conf >= cutoffs).float()
-            sender_scores *= reliability_bank.in_distribution(
-                reliability_bank.memory_features, reliability_bank.memory_labels
-            ).float()
-            reliability_bank.set_sender_scores(sender_scores)
 
 
 def run_training():
@@ -465,31 +306,18 @@ def run_training():
     )
 
     print('---------------------------------------------------------------------------------------')
-    print('EMA + Dual View + Stable CAT + Role-separated Sparse KNN v8: '
+    print('EMA + Dual View + Direct Source Prototype Radius: '
           '%s with source %s and target %s' %
           (args.backbone, args.data1, args.data2))
-    print('alpha(w1):%s beta(w2):%s gamma(w3):%s ema:%s '
-          'tau0:%s threshold_beta:%s margin:%s threshold_range:[%s,%s]' %
-          (args.w1, args.w2, args.w3, args.ema_decay,
-           args.threshold_base, args.threshold_beta, args.threshold_margin,
-           args.threshold_min, args.threshold_max))
+    print('alpha(w1):%s beta(w2):%s gamma(w3):%s ema:%s' %
+          (args.w1, args.w2, args.w3, args.ema_decay))
     print('prototype weight:%s temp:%s momentum:%s source_anchor:%s warmup:%s ramp:%s' %
           (args.proto_weight, args.proto_temperature, args.proto_momentum,
            args.proto_source_anchor, args.proto_warmup_epochs, args.proto_ramp_epochs))
-    print('knn rescue:%s k:%s source_radius_k:%s bandwidth:%s refresh_interval:%s' %
-          (args.knn_gate, args.knn_k, args.source_radius_k,
-           args.knn_bandwidth_multiplier, args.knn_refresh_interval))
-    print('---------------------------------------------------------------------------------------')
-
-    print('role_separation:%s promotion_epochs:%d score_mode:%s '
-          'min_support:%d effective_support:%.2f purity:%.2f margin:%.2f '
-          'soft_labels:%s soft_mix:%.2f soft_weight:%.3f run_name:%s' %
-          (args.role_separation, args.promotion_epochs, args.knn_score_mode,
-           args.knn_min_support, args.knn_min_effective_support, args.knn_min_purity,
-           args.knn_min_margin, args.neighbor_soft_labels, args.neighbor_soft_mix,
-           args.neighbor_soft_weight, args.run_name))
-
-    print('immediate_knn_prototype_update:%s' % args.immediate_knn_prototype_update)
+    print('source_radius_k:%d source_refresh_interval:%d role_separation:%s '
+          'promotion_epochs:%d immediate_prototype_update:%s run_name:%s' %
+          (args.source_radius_k, args.source_refresh_interval, args.role_separation,
+           args.promotion_epochs, args.immediate_prototype_update, args.run_name))
 
     if args.backbone == 'resnet18':
         train_batch, test_batch = 128, 128
@@ -519,18 +347,6 @@ def run_training():
         weak2_transform=weak_transform, strong_transform=strong_transform,
         basic_aug=False, return_index=True
     )
-    target_threshold = FER(
-        args.target_path, phase='train', transform=weak_transform,
-        strong_transform=None, basic_aug=False
-    )
-    target_memory = None
-    if args.knn_gate or args.role_separation:
-        target_memory = FER(
-            args.target_path, phase='train', transform=test_transform,
-            basic_aug=False, return_index=True,
-        )
-        if target_train.file_paths != target_memory.file_paths:
-            raise RuntimeError('training and memory views must share identical sample IDs')
     target_val = FER(
         args.target_path, phase='val', transform=test_transform,
         strong_transform=None
@@ -554,16 +370,6 @@ def run_training():
         target_train, batch_size=train_batch, num_workers=args.workers,
         shuffle=True, pin_memory=True, worker_init_fn=_init_fn,
     )
-    threshold_loader_target = torch.utils.data.DataLoader(
-        target_threshold, batch_size=test_batch, num_workers=args.workers,
-        shuffle=False, pin_memory=True, worker_init_fn=_init_fn,
-    )
-    memory_loader_target = None
-    if target_memory is not None:
-        memory_loader_target = torch.utils.data.DataLoader(
-            target_memory, batch_size=test_batch, num_workers=args.workers,
-            shuffle=False, pin_memory=True, worker_init_fn=_init_fn,
-        )
     val_loader_target = torch.utils.data.DataLoader(
         target_val, batch_size=test_batch, num_workers=args.workers,
         shuffle=False, pin_memory=True,
@@ -672,23 +478,9 @@ def run_training():
     print('source prototype counts: %s' %
           np.array2string(prototype_bank.source_counts.cpu().numpy(), separator=', '))
 
-    # 新的拯救模块：逐类源域原型距离阈值 + 逐样本归属检查 + 目标域全类别近邻库。
-    reliability_bank = SparseReliableKNNBank(
-        class_num,
-        model.fc.in_features,
-        k=args.knn_k,
-        source_radius_k=args.source_radius_k,
-        sparse_penalty=args.knn_sparse_penalty,
-        bandwidth_multiplier=args.knn_bandwidth_multiplier,
-        score_threshold=args.knn_score_threshold,
-        density_threshold=args.knn_density_threshold,
-        query_chunk_size=args.knn_query_chunk_size,
-        score_mode=args.knn_score_mode,
-        min_support=args.knn_min_support,
-        min_effective_support=args.knn_min_effective_support,
-        min_purity=args.knn_min_purity,
-        min_margin=args.knn_min_margin,
-        radius_multiplier=args.knn_radius_multiplier,
+    # Source-only geometric gate: no target neighbors, voting or variance.
+    reliability_bank = SourcePrototypeRadiusBank(
+        class_num, model.fc.in_features, source_radius_k=args.source_radius_k,
     ).to(device)
     role_tracker = (ReliabilityRoles(len(target_train), args.promotion_epochs).to(device)
                     if args.role_separation else None)
@@ -697,46 +489,18 @@ def run_training():
     global_step = 0
 
     for i in range(args.epochs):
-        thresholds, class_mean, global_mean, threshold_center = calculate_target_thresholds(
-            teacher,
-            threshold_loader_target,
-            class_num,
-            args.threshold_base,
-            args.threshold_beta,
-            args.threshold_margin,
-            args.threshold_min,
-            args.threshold_max,
-        )
-        if (args.knn_gate or args.role_separation) and i % args.knn_refresh_interval == 0:
-            refresh_reliability_bank(
-                teacher, teacher_feature_hook, prototype_loader_source,
-                memory_loader_target, reliability_bank, role_tracker=role_tracker,
-                thresholds=thresholds, epoch=i,
+        if i % args.source_refresh_interval == 0:
+            refresh_source_radius_bank(
+                teacher, teacher_feature_hook, prototype_loader_source, reliability_bank,
             )
-            print('[Target Epoch %d] KNN Source_Count: %d Target_Memory_Count: %d '
-                  'Class_Radii: %s Classes_Ready: %s' %
+            print('[Target Epoch %d] Source_Count: %d Class_Radii: %s Classes_Ready: %s' %
                   (i, reliability_bank.source_count.item(),
-                   reliability_bank.memory_ids.numel(),
                    np.array2string(reliability_bank.class_radii.cpu().numpy(), precision=8),
                    reliability_bank.distribution_initialized.cpu().tolist()))
             log_source_prototypes(reliability_bank)
-            print('[Target Epoch %d] Stable_Senders: %d/%d' %
-                  (i, int((reliability_bank.memory_sender_scores > 0).sum().item()),
-                   reliability_bank.memory_ids.numel()))
         current_proto_weight = prototype_weight_for_epoch(
             i, args.proto_weight, args.proto_warmup_epochs, args.proto_ramp_epochs
         )
-        enable_knn_rescue = args.knn_gate and i >= args.knn_warmup_epochs
-
-        print('[Target Epoch %d] class mean confidence: %s global_mean: %.4f '
-              'threshold_center: %.4f' %
-              (i, np.array2string(class_mean.numpy(), precision=4),
-               global_mean, threshold_center))
-        print('[Target Epoch %d] class-adaptive thresholds: %s' %
-              (i, np.array2string(thresholds.numpy(), precision=4)))
-        print('[Target Epoch %d] KNN OR rescue enabled: %s' %
-              (i, enable_knn_rescue))
-
         model.train()
         source_train_iter = iter(train_loader_source)
         train_loss1 = 0.0
@@ -745,24 +509,15 @@ def run_training():
         train_proto_loss = 0.0
         batch_count = 0
         agreement_num = 0
-        confidence_accept_num = 0
-        knn_pass_num = 0
-        knn_rescue_num = 0
+        radius_pass_num = 0
         final_accept_num = 0
-        score_sum = 0.0
-        density_sum = 0.0
-        knn_checked_num = 0
-        dense_num = 0
         prototype_agree_num = 0
         prototype_checked_num = 0
         prototype_similarity_sum = 0.0
-        pseudo_distribution_confidence = np.zeros(class_num, dtype=np.int64)
-        pseudo_distribution_rescued = np.zeros(class_num, dtype=np.int64)
         pseudo_distribution_final = np.zeros(class_num, dtype=np.int64)
         pseudo_distribution_anchors = np.zeros(class_num, dtype=np.int64)
-        anchor_num = sparse_rescue_num = soft_repair_num = 0
-        prototype_update_num = immediate_rescue_update_num = 0
-        train_soft_loss = 0.0
+        anchor_num = 0
+        prototype_update_num = immediate_update_num = 0
 
         for weak1, weak2, strong, _, sample_ids in train_loader_target:
             try:
@@ -777,50 +532,33 @@ def run_training():
 
             teacher.eval()
             # 用EMA Teacher对目标域样本的两个弱增强视图进行预测，生成伪标签，并提取一个融合后的teacher 特征，供后面的
-            # kNN可靠性判断和prototype更新使用
+            # 原型距离判断和prototype更新使用
             with torch.no_grad():
                 logits1, _ = teacher(weak1, None, None, 'test', 'target')
                 teacher_features1 = teacher_feature_hook.output.detach()
                 logits2, _ = teacher(weak2, None, None, 'test', 'target')
                 teacher_features2 = teacher_feature_hook.output.detach()
-                pseudo_targets, confidence_idx, agree_count = select_dual_view_pseudo_labels(
-                    logits1, logits2, thresholds
-                )
+                pseudo_targets = logits1.argmax(dim=1)
+                agreement_mask = pseudo_targets.eq(logits2.argmax(dim=1))
+                agree_count = int(agreement_mask.sum().item())
                 teacher_mean_features = F.normalize(
                     F.normalize(teacher_features1, dim=1)
                     + F.normalize(teacher_features2, dim=1),
                     dim=1,
                 )
 
-                # 传统的高置信度伪标签
-                confidence_mask = confidence_idx.bool()
-
-
-                agreement_mask = torch.argmax(logits1, dim=1).eq(
-                    torch.argmax(logits2, dim=1)
+                region_ok = reliability_bank.in_distribution(
+                    teacher_mean_features, pseudo_targets
                 )
-                knn_result = None
-                reliability_mask = torch.zeros_like(agreement_mask)
-                if args.knn_gate:
-                    knn_result = reliability_bank.gate(
-                        teacher_mean_features, pseudo_targets, sample_ids,
-                        agreement_mask, thresholds,
-                    )
-                    reliability_mask = knn_result['pass_mask']
-
-                final_mask, rescue_mask = combine_rescue_masks(
-                    confidence_mask, agreement_mask, reliability_mask, enable_knn_rescue
-                )
+                # Every accepted pseudo-label must pass its predicted-class radius.
+                final_mask = agreement_mask & region_ok
                 # Learning is distinct from updating shared class knowledge.
                 con_idx = final_mask.float()
                 if role_tracker is not None:
-                    region_ok = reliability_bank.in_distribution(
-                        teacher_mean_features, pseudo_targets
-                    )
                     conf1 = F.softmax(logits1, dim=1).max(dim=1).values
                     conf2 = F.softmax(logits2, dim=1).max(dim=1).values
                     anchor_mask = role_tracker.observe(
-                        sample_ids, pseudo_targets, final_mask & region_ok,
+                        sample_ids, pseudo_targets, final_mask,
                         torch.minimum(conf1, conf2), epoch=i,
                     )
                 else:
@@ -829,16 +567,8 @@ def run_training():
                 anchor_idx = anchor_mask.float()
                 # Only prototype writes are relaxed; do not mutate anchor_mask.
                 prototype_update_mask = anchor_mask.clone()
-                if args.immediate_knn_prototype_update:
-                    prototype_update_mask |= rescue_mask
-                soft_mask = torch.zeros_like(final_mask)
-                soft_targets = None
-                if args.neighbor_soft_labels and enable_knn_rescue:
-                    teacher_probs = (F.softmax(logits1, dim=1) + F.softmax(logits2, dim=1)) / 2
-                    soft_mask, soft_targets = neighbor_soft_targets(
-                        teacher_probs, knn_result, agreement_mask, final_mask,
-                        mix=args.neighbor_soft_mix,
-                    )
+                if args.immediate_prototype_update:
+                    prototype_update_mask |= final_mask
 
                 # 评估函数，用来统计在“可靠样本”上，模型特征与原型之间的预测一致性和相似度，会只检查 con_idx=1 的最终可靠目标样本
                 proto_agree, proto_checked, proto_similarity = (
@@ -848,44 +578,22 @@ def run_training():
                 )
             # 统计当前epoch中不同阶段一共接纳了多少目标样本
             agreement_num += agree_count
-            confidence_accept_num += int(confidence_mask.sum().item())
-            knn_pass_num += int(reliability_mask.sum().item())
-            knn_rescue_num += int(rescue_mask.sum().item())
+            radius_pass_num += int(region_ok.sum().item())
             final_accept_num += int(final_mask.sum().item())
             anchor_num += int(anchor_mask.sum().item())
             prototype_update_num += int(prototype_update_mask.sum().item())
-            immediate_rescue_update_num += int(
-                (prototype_update_mask & rescue_mask & ~anchor_mask).sum().item()
-            )
-            soft_repair_num += int(soft_mask.sum().item())
+            immediate_update_num += int((prototype_update_mask & ~anchor_mask).sum().item())
             pseudo_distribution_anchors += np.bincount(
                 pseudo_targets[anchor_mask].cpu().numpy(), minlength=class_num
             ).astype(np.int64)
 
-            if knn_result is not None:
-                checked = knn_result['checked_mask']
-                score_sum += float(knn_result['score'][checked].sum().item())
-                density_sum += float(knn_result['density'][checked].sum().item())
-                knn_checked_num += int(checked.sum().item())
-                dense_num += int(knn_result['dense_mask'].sum().item())
-                sparse_rescue_num += int((rescue_mask & knn_result['sparse_mask']).sum().item())
             # 累计prototype诊断指标
             prototype_agree_num += proto_agree
             prototype_checked_num += proto_checked
             prototype_similarity_sum += proto_similarity * proto_checked
 
             # 统计伪标签在不同掩码筛选下的类别分布
-            confidence_labels = pseudo_targets[confidence_mask].cpu().numpy()
-            rescued_labels = pseudo_targets[rescue_mask].cpu().numpy()
             final_labels = pseudo_targets[final_mask].cpu().numpy()
-            if confidence_labels.size > 0:
-                pseudo_distribution_confidence += np.bincount(
-                    confidence_labels, minlength=class_num
-                ).astype(np.int64)
-            if rescued_labels.size > 0:
-                pseudo_distribution_rescued += np.bincount(
-                    rescued_labels, minlength=class_num
-                ).astype(np.int64)
             if final_labels.size > 0:
                 pseudo_distribution_final += np.bincount(
                     final_labels, minlength=class_num
@@ -922,19 +630,12 @@ def run_training():
                 con_idx,
                 temperature=args.proto_temperature,
             )
-            # Soft recipients are excluded from hard CE, MMD and prototype updates.
-            soft_loss = output[0].sum() * 0.0
-            if soft_targets is not None:
-                soft_loss = soft_supervision_loss(
-                    output[0][source_imgs.shape[0]:], soft_targets, soft_mask
-                )
             # 总损失
             loss = (
                 cls_loss * args.w1
                 + aff_loss * args.w2
                 + weight_loss * args.w3
                 + proto_loss * current_proto_weight
-                + soft_loss * args.neighbor_soft_weight
             )
             #反向传播
             loss.backward()
@@ -952,7 +653,6 @@ def run_training():
             train_loss2 += aff_loss.item()
             train_loss3 += weight_loss.item()
             train_proto_loss += proto_loss.item()
-            train_soft_loss += soft_loss.item()
             batch_count += 1
         # 更新学习率
         scheduler.step()
@@ -965,29 +665,14 @@ def run_training():
             prototype_similarity_sum / float(prototype_checked_num)
             if prototype_checked_num > 0 else 0.0
         )
-        mean_score = score_sum / max(knn_checked_num, 1)
-        mean_density = density_sum / max(knn_checked_num, 1)
-
-        print('[Target Epoch %d] Agreement_Num: %d Confidence_Accept_Num: %d '
-              'KNN_Pass_Num: %d KNN_Rescue_Num: %d Final_Accept_Num: %d '
-              'Mean_Reliability: %.4f Mean_Density: %.4f '
-              'KNN_Checked_Num: %d Dense_Num: %d Sparse_Num: %d' %
-              (i, agreement_num, confidence_accept_num, knn_pass_num,
-               knn_rescue_num, final_accept_num, mean_score, mean_density,
-               knn_checked_num, dense_num, knn_checked_num - dense_num))
-        print('[Target Epoch %d] Pseudo_Distribution_Confidence: %s' %
-              (i, np.array2string(pseudo_distribution_confidence, separator=', ')))
-        print('[Target Epoch %d] Pseudo_Distribution_Rescued: %s' %
-              (i, np.array2string(pseudo_distribution_rescued, separator=', ')))
+        print('[Target Epoch %d] Agreement_Num: %d Radius_Pass_Num: %d Final_Accept_Num: %d' %
+              (i, agreement_num, radius_pass_num, final_accept_num))
         print('[Target Epoch %d] Pseudo_Distribution_Final: %s' %
               (i, np.array2string(pseudo_distribution_final, separator=', ')))
-        print('[Target Epoch %d] Anchor_Num: %d Sparse_Rescue_Num: %d '
-              'Soft_Repair_Num: %d Soft_Loss: %.5f Anchor_Distribution: %s' %
-              (i, anchor_num, sparse_rescue_num, soft_repair_num,
-               train_soft_loss / max(batch_count, 1),
-               np.array2string(pseudo_distribution_anchors, separator=', ')))
-        print('[Target Epoch %d] Prototype_Update_Num: %d Immediate_Rescue_Update_Num: %d' %
-              (i, prototype_update_num, immediate_rescue_update_num))
+        print('[Target Epoch %d] Anchor_Num: %d Anchor_Distribution: %s' %
+              (i, anchor_num, np.array2string(pseudo_distribution_anchors, separator=', ')))
+        print('[Target Epoch %d] Prototype_Update_Num: %d Immediate_Update_Num: %d' %
+              (i, prototype_update_num, immediate_update_num))
         print('[Target Epoch %d] Prototype_Agreement: %d/%d (%.4f) '
               'Mean_Assigned_Cosine: %.4f Target_Prototype_Counts: %s' %
               (i, prototype_agree_num, prototype_checked_num,

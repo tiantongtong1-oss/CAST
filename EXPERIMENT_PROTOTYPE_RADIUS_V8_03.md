@@ -1,82 +1,81 @@
-# v8-03：源域原型 + 最远 k 个距离均值
+# v8-03：直接按预测类别原型距离筛选（无目标域邻居投票）
 
-基于 `experiment/role-separated-sparse-knn-v8-02` 的提交
-`d6224f5d87d09e119cd1c39dc51ea3ad49274458`。
-新分支：`experiment/role-separated-sparse-knn-v8-03-prototype-radius`。
+分支：`experiment/role-separated-sparse-knn-v8-03-prototype-radius`。
+本次更正此前保留目标域 kNN 投票的实现。当前入口 `train.py` 仅使用
+`source_prototype_radius.SourcePrototypeRadiusBank` 进行分布判断。
 
-## 实现
+## 类别阈值
 
-将“k(比如20)和最远的距离取平均”解释为：取最远的 k 个样本距离求均值。
-每次源域刷新，使用当前 EMA Teacher、原有确定性源域 loader 和源域真实标签：
+每次刷新，用当前 EMA Teacher 提取确定性视图的源域特征，按真实标签分组。
+令 z_i 为 L2 归一化后的源域特征：
 
-1. 对特征做 L2 归一化，得到 z_i。
-2. 每类原型 mu_c = mean(z_i | y_i=c)。mu_c 本身不再归一化，和原源域均值定义一致。
-3. 计算所有该类源域样本的欧氏距离 d_i = ||z_i - mu_c||_2。
-4. R_c = mean(topk_largest(d_i, min(source_radius_k, N_c)))。
-5. 伪标签为 c 的目标样本：只有 ||normalize(z_t) - mu_c||_2 < R_c 才属于该类区域。
+```text
+mu_c = mean(z_i | y_i=c)
+d_i = ||z_i - mu_c||_2
+R_c = mean(largest min(11, N_c) distances d_i)
+```
 
-例如第 6 类，只比较第 6 类的原型和 R_6，不使用其他类别的阈值。
-类别编号沿用数据集现有映射；代码索引从 0 开始，“第六类”对应索引 5。
-`--source_radius_k 11` 独立于目标域邻居数 `--knn_k 20`。
-少于 k 个源域样本时使用全部有效样本；类别缺失则本次刷新禁用该类别区域。
-单样本或完全重合特征的 R_c=0，严格小于规则不接纳任何样本，不额外放宽阈值。
-非有限特征、零向量和越界标签均不能通过。
+原型 mu_c 保持源域归一化特征的算术均值，不再单独归一化。
+最远的 11 个源域样本只用来确定 R_c；没有目标域近邻查询、投票、纯度或密度评分。
+少于 11 个有效源域样本时使用全部；缺失类别不能通过筛选。
+零半径、非有限特征、零向量和越界标签均不能通过严格小于判断。
+源域原型和阈值默认每个目标域 epoch 重新计算，不计算方差或方差 EMA。
 
-`prototype_radius_reliability.py` 是新的运行时分布库，源域归属不再计算方差、
-方差 EMA、卡方阈值或马氏距离。源域特征暂存在 CPU，确定最终均值后分批计算距离，
-每类只保留当前最远 k 个距离；刷新完成清理临时源域特征。
-阈值每次直接重估，不做 EMA。源域和目标域使用同一轮 Teacher 特征空间。
-目标域标签、目标域特征均不参与原型区域阈值拟合。
+## 伪标签接纳
 
-原 `PrototypeBank` 的源域/目标域原型、原型 EMA 和一致性损失保留。
-区域判断用当前源域均值，不使用目标域更新后的混合原型，避免伪标签改变自身接纳范围。
+Teacher 两个弱增强视图的预测类别相同，记为 c。保持原有双视图特征融合：
 
-## kNN 接线与接纳规则
+```text
+z_t = normalize(normalize(feature_weak1) + normalize(feature_weak2))
+d_t = ||z_t - mu_c||_2
+region_ok = d_t < R_c
+final_mask = two_view_agreement AND region_ok
+```
 
-保留原分支的双视图一致性、高置信度 OR kNN 拯救、稳定角色晋升及即时原型更新开关。
-新的区域判断替换原高斯判断，应用于 kNN 查询、邻居、sender 快照及 anchor 晋升。
-**高置信度路线仍沿用原规则，可直接学习；区域检查并不是全部伪标签 CE 的统一额外门槛。**
-属于区域仅表示满足几何条件；kNN 拯救还要满足支持数量、有效支持、纯度、margin 等原有条件。
+例如预测为第六类，仅比较到第六类源域原型的距离与 R_6。
+类别索引沿用数据集原有 0-based 映射。
+高置信度不再通过 OR 分支绕过距离判断，低置信度也不需要邻居支持。
+最终接纳样本参与目标域分类损失和原型一致性损失。
 
-kNN 权重也不再依赖方差：邻居所属类的带宽 h_c = bandwidth_multiplier * R_c；
-权重 exp(-||z-z_j||² / (2*h_c²))。support 模式邻居距离上限为 radius_multiplier * R_c
-（代码中比较平方值），默认 multiplier=2。极小尺度仅为权重除法提供 eps 保护；
-源域归属 R_c 本身没有 floor。v7 评分消融仍可用，带宽也改为候选类别 R_c。
-旧 `global_gaussian_knn_reliability.py`、`knn_reliability.py` 及对应历史测试保留用于历史实验，
-新 `train.py` 和 `SparseReliableKNNBank` 不再调用它们。
-日志输出 `Class_Radii`，checkpoint 保存 `class_means`、`class_radii` 和初始化状态。
+保留 `PrototypeBank` 的原型损失、目标域原型 EMA 和角色晋升机制。
+几何筛选始终使用源域原型；目标域混合原型用于损失，不改变源域阈值。
+默认连续 `--promotion_epochs 3` 轮通过后才成为共享知识更新的 anchor。
+`--immediate_prototype_update` 允许所有距离接纳样本立即更新目标域原型，
+不改变 MMD anchor 的晋升规则。
 
-## 运行命令
+## 参数与日志
 
-在已有 CAST 仓库根目录运行，替换数据与 checkpoint 路径：
+- `--source_radius_k 11`：源域每类最远距离的数量，默认 11。
+- `--source_refresh_interval 1`：源域原型与阈值刷新间隔，默认每个 epoch。
+- `--immediate_prototype_update`：即时更新目标域原型。
+- 删除训练入口的 `--knn_k`、邻居评分、邻居软标签和 kNN warmup 参数。
+- 原 `--immediate_knn_prototype_update` 改为 `--immediate_prototype_update`。
+- 日志输出 `Class_Radii`、`Agreement_Num`、`Radius_Pass_Num`、`Final_Accept_Num`。
+  `Radius_Pass_Num` 仅统计距离通过数，最终接纳还要求双视图一致。
+
+旧 kNN/Gaussian 模块保留为历史代码，当前训练入口不导入、不调用。
+旧测试中的部分训练入口和参数断言属于此前版本；本次按用户要求未运行或新增测试，
+此前“55 项通过”的结果不适用于本次修改。
+
+## 从源域预训练开始运行并保存日志
 
 ```bash
 git fetch origin
-git switch --track origin/experiment/role-separated-sparse-knn-v8-03-prototype-radius
+git switch experiment/role-separated-sparse-knn-v8-03-prototype-radius
+git pull --ff-only
+mkdir -p logs
+set -o pipefail
 python -u train.py \
-  --checkpoint /path/to/source_best.pth \
-  --source_path /path/to/raf-basic \
-  --target_path /path/to/fer2013 \
+  --source_path /workspace/ttt/code/test-upload-clean/datesets/raf-basic \
+  --target_path /workspace/ttt/code/data/fer2013 \
   --data1 rafdb --data2 fer \
-  --backbone mobilenet_v2 --pre_epochs 0 --epochs 30 \
-  --source_radius_k 11 --knn_k 20 \
-  --immediate_knn_prototype_update \
-  --run_name role_sparse_v8_03_prototype_radius
+  --backbone mobilenet_v2 \
+  --pre_epochs 30 --epochs 30 \
+  --source_radius_k 11 \
+  --immediate_prototype_update \
+  --run_name source_radius11_direct \
+  2>&1 | tee "logs/source_radius11_direct_$(date +%Y%m%d_%H%M%S).log"
 ```
 
-backbone 必须匹配 checkpoint。checkpoint 仅初始化模型权重，不是完整断点恢复。
-若从头预训练，删除 `--checkpoint` 并设 `--pre_epochs 30`。
-即时更新开关与 v8-02 文档示例一致；若对照实验没开该功能，这里也删去该开关。
-
-```bash
-python -m unittest discover -s tests -v
-```
-
-新增测试覆盖最远 k 个距离均值、分批一致性、少样本、零半径、严格边界、
-类别缺失和刷新替换、无效输入，以及新 checkpoint 无方差字段。
-更新 support 测试以使用原型半径，并保留合成数据训练与角色测试。
-真实 RAF→FER 训练需要用户数据与 GPU；合成测试不代表性能改善。
-
-验证结果：55 项 CPU 单元与合成训练测试全部通过，Python 语法检查通过。
-
-源域半径默认使用最远 11 个距离；目标域邻居数 `--knn_k` 仍默认 20。本次数量调整未运行测试。
+不传 checkpoint：先做 30 轮源域预训练，再做 30 轮目标域训练。
+本次未运行测试或真实数据训练，不报告准确率结果。
