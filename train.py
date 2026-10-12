@@ -10,14 +10,14 @@ from torchvision import transforms
 
 import Networks
 from dataset import RafDataSet, FER
-from ema_utils import create_ema_teacher, update_ema_teacher
+from ema_utils import create_ema_teacher, select_dual_view_pseudo_labels, update_ema_teacher
 from prototype_utils import FeatureHook, PrototypeBank, prototype_weight_for_epoch
 from source_prototype_radius import SourcePrototypeRadiusBank
 from reliability_roles import ReliabilityRoles
 import image_utils as util
 from randaugment import RandAugmentMC
 # 总训练入口与调度器。串起数据、Source 预训练、EMA Teacher、
-# 双视图伪标签、自适应阈值、KNN Reliability Rescue、Prototype Consistency、验证和测试
+# 双视图伪标签、自适应置信度阈值、Source Radius Rescue、Prototype Consistency、验证和测试
 
 #随机种子
 seed = 1314
@@ -59,9 +59,20 @@ def parse_args(argv=None):
                         help='gamma: classifier modulation loss weight')
     parser.add_argument('--phi', type=float, default=1.4,
                         help='legacy CAST threshold arg retained for CLI compatibility; '
-                             'unused by direct prototype-radius selection')
+                             'not used by the adaptive confidence threshold')
     parser.add_argument('--ema_decay', type=float, default=0.999,
                         help='fixed EMA decay for teacher parameters and floating buffers')
+    parser.add_argument('--threshold_base', type=float, default=0.85,
+                        help='minimum global center of the adaptive threshold')
+    parser.add_argument('--threshold_beta', type=float, default=0.5,
+                        help='strength of per-class confidence deviation')
+    parser.add_argument('--threshold_margin', type=float, default=0.02,
+                        help='margin added above teacher global mean confidence')
+    parser.add_argument('--threshold_min', type=float, default=0.80,
+                        help='minimum class-adaptive threshold')
+    parser.add_argument('--threshold_max', type=float, default=0.95,
+                        help='maximum class-adaptive threshold')
+
     # Prototype-consistency regularizer retained from v1/v2.
     parser.add_argument('--proto_weight', type=float, default=0.10,
                         help='maximum prototype-consistency loss weight')
@@ -76,6 +87,11 @@ def parse_args(argv=None):
     parser.add_argument('--proto_ramp_epochs', type=int, default=5,
                         help='epochs used to linearly ramp prototype loss to full weight')
 
+    parser.add_argument('--radius_rescue_warmup_epochs', type=int, default=3,
+                        help='initial target epochs using only dual-view high confidence')
+    parser.add_argument('--no_radius_rescue', dest='radius_rescue', action='store_false',
+                        help='ablation: use only dual-view high-confidence pseudo-labels')
+    parser.set_defaults(radius_rescue=True)
     parser.add_argument('--source_radius_k', type=int, default=11,
                         help='mean of the farthest k source-to-prototype Euclidean distances')
     parser.add_argument('--source_refresh_interval', type=int, default=1,
@@ -84,11 +100,11 @@ def parse_args(argv=None):
     parser.add_argument('--no_role_separation', dest='role_separation', action='store_false',
                         help='accepted samples may immediately update shared knowledge')
     parser.add_argument('--immediate_prototype_update', action='store_true',
-                        help='all distance-accepted samples immediately update target prototypes; '
+                        help='all finally accepted samples immediately update target prototypes; '
                              'MMD anchor promotion is unchanged')
     parser.add_argument('--promotion_epochs', type=int, default=3,
                         help='consecutive eligible epochs before anchor promotion')
-    parser.add_argument('--run_name', type=str, default='source_radius11_direct',
+    parser.add_argument('--run_name', type=str, default='confidence_radius11_rescue',
                         help='checkpoint suffix; use distinct names for ablations')
     parser.add_argument('--device', choices=['cuda', 'cpu'], default='cuda',
                         help='CPU is supported for smoke tests; CUDA recommended for FER training')
@@ -96,10 +112,16 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.source_radius_k < 1 or args.source_refresh_interval < 1:
         parser.error('source_radius_k and source_refresh_interval must be positive')
-    if args.pre_epochs < 0 or args.epochs < 0:
+    if args.pre_epochs < 0 or args.epochs < 0 or args.radius_rescue_warmup_epochs < 0:
         parser.error('epoch counts must be nonnegative')
     if args.pre_epochs == 0 and not args.checkpoint:
         parser.error('--pre_epochs 0 requires --checkpoint with pretrained model weights')
+    if not 0 < args.threshold_min <= args.threshold_base <= args.threshold_max <= 1:
+        parser.error('require 0 < threshold_min <= threshold_base <= threshold_max <= 1')
+    if not np.isfinite(args.threshold_beta) or args.threshold_beta < 0:
+        parser.error('threshold_beta must be finite and nonnegative')
+    if not np.isfinite(args.threshold_margin) or args.threshold_margin < 0:
+        parser.error('threshold_margin must be finite and nonnegative')
     if args.promotion_epochs < 1:
         parser.error('--promotion_epochs must be positive')
     if not args.run_name or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-' for c in args.run_name):
@@ -153,6 +175,67 @@ def classifier_modulation_loss(model):
     cosine = weight.mm(weight.t()) / norm.mm(norm.t())
     matrix = cosine - torch.eye(weight.size(0), device=weight.device)
     return torch.mean((matrix + 1.0) / 2.0)
+
+
+def calculate_target_thresholds(model, loader, class_num, threshold_base,
+                                threshold_beta, threshold_margin,
+                                threshold_min, threshold_max):
+
+    # EMA Teacher 扫描整个target train，根据各预测类别平均confidence 生成类别自适应置信度阈值
+
+    class_sum = torch.zeros(class_num, dtype=torch.float64)
+    # 记录每个预测类别包含的样本数量
+    class_count = torch.zeros(class_num, dtype=torch.float64)
+    device = next(model.parameters()).device
+    # 切换到评估模式，关闭 Dropout、固定 BatchNorm 等
+    model.eval()
+
+    # 这里只进行推理，不计算梯度，减少显存和计算开销
+    with torch.no_grad():
+        for batch in loader:
+            imgs = batch[0].to(device, non_blocking=True)
+
+            # 使用模型对目标域图像进行预测
+            # logits：分类输出
+            # _：其他不需要使用的输出
+            logits, _ = model(imgs, None, None, mode='test', task='target')
+
+            #转化成类别概率
+            probs = F.softmax(logits, dim=1).cpu()
+            # 获取每个样本的最大预测概率和对应预测类别
+            # max_prob：模型预测的最高置信度
+            # pred_label：最高置信度对应的类别
+            max_prob, pred_label = torch.max(probs, dim=1)
+
+            class_sum.scatter_add_(0, pred_label, max_prob.double())
+            class_count.scatter_add_(
+                0, pred_label, torch.ones_like(max_prob, dtype=torch.float64)
+            )
+
+    valid = class_count > 0
+    class_mean = class_sum / class_count.clamp_min(1.0)
+    if torch.any(valid):
+        global_mean = class_mean[valid].mean()
+    else:
+        global_mean = class_mean.new_tensor(float(threshold_base))
+
+    threshold_center = max(
+        float(threshold_base),
+        float(global_mean.item()) + float(threshold_margin),
+    )
+    threshold_center = min(threshold_center, float(threshold_max))
+
+    thresholds = threshold_center + threshold_beta * (class_mean - global_mean)
+    thresholds = torch.clamp(
+        thresholds, min=threshold_min, max=threshold_max
+    ).float()
+    thresholds[~valid] = float(threshold_max)
+    return (
+        thresholds,
+        class_mean.float(),
+        float(global_mean.item()),
+        float(threshold_center),
+    )
 
 
 def evaluate(model, loader, criterion, num_samples, epoch, split_name):
@@ -306,7 +389,7 @@ def run_training():
     )
 
     print('---------------------------------------------------------------------------------------')
-    print('EMA + Dual View + Direct Source Prototype Radius: '
+    print('EMA + Dual View High Confidence + Source Radius Rescue: '
           '%s with source %s and target %s' %
           (args.backbone, args.data1, args.data2))
     print('alpha(w1):%s beta(w2):%s gamma(w3):%s ema:%s' %
@@ -318,6 +401,12 @@ def run_training():
           'promotion_epochs:%d immediate_prototype_update:%s run_name:%s' %
           (args.source_radius_k, args.source_refresh_interval, args.role_separation,
            args.promotion_epochs, args.immediate_prototype_update, args.run_name))
+
+    print('confidence threshold base:%s beta:%s margin:%s range:[%s,%s] '
+          'radius_rescue:%s rescue_warmup:%d' %
+          (args.threshold_base, args.threshold_beta, args.threshold_margin,
+           args.threshold_min, args.threshold_max, args.radius_rescue,
+           args.radius_rescue_warmup_epochs))
 
     if args.backbone == 'resnet18':
         train_batch, test_batch = 128, 128
@@ -347,6 +436,10 @@ def run_training():
         weak2_transform=weak_transform, strong_transform=strong_transform,
         basic_aug=False, return_index=True
     )
+    target_threshold = FER(
+        args.target_path, phase='train', transform=weak_transform,
+        strong_transform=None, basic_aug=False
+    )
     target_val = FER(
         args.target_path, phase='val', transform=test_transform,
         strong_transform=None
@@ -369,6 +462,10 @@ def run_training():
     train_loader_target = torch.utils.data.DataLoader(
         target_train, batch_size=train_batch, num_workers=args.workers,
         shuffle=True, pin_memory=True, worker_init_fn=_init_fn,
+    )
+    threshold_loader_target = torch.utils.data.DataLoader(
+        target_threshold, batch_size=test_batch, num_workers=args.workers,
+        shuffle=False, pin_memory=True, worker_init_fn=_init_fn,
     )
     val_loader_target = torch.utils.data.DataLoader(
         target_val, batch_size=test_batch, num_workers=args.workers,
@@ -489,6 +586,16 @@ def run_training():
     global_step = 0
 
     for i in range(args.epochs):
+        thresholds, class_mean, global_mean, threshold_center = calculate_target_thresholds(
+            teacher, threshold_loader_target, class_num, args.threshold_base,
+            args.threshold_beta, args.threshold_margin, args.threshold_min, args.threshold_max,
+        )
+        enable_radius_rescue = args.radius_rescue and i >= args.radius_rescue_warmup_epochs
+        print('[Target Epoch %d] Confidence_Thresholds: %s Class_Mean_Confidence: %s '
+              'Global_Class_Mean: %.4f Threshold_Center: %.4f Radius_Rescue_Enabled: %s' %
+              (i, np.array2string(thresholds.numpy(), precision=4),
+               np.array2string(class_mean.numpy(), precision=4),
+               global_mean, threshold_center, enable_radius_rescue))
         if i % args.source_refresh_interval == 0:
             refresh_source_radius_bank(
                 teacher, teacher_feature_hook, prototype_loader_source, reliability_bank,
@@ -510,10 +617,15 @@ def run_training():
         batch_count = 0
         agreement_num = 0
         radius_pass_num = 0
+        confidence_accept_num = 0
+        rescue_candidate_num = 0
+        radius_rescue_num = 0
         final_accept_num = 0
         prototype_agree_num = 0
         prototype_checked_num = 0
         prototype_similarity_sum = 0.0
+        pseudo_distribution_confidence = np.zeros(class_num, dtype=np.int64)
+        pseudo_distribution_rescued = np.zeros(class_num, dtype=np.int64)
         pseudo_distribution_final = np.zeros(class_num, dtype=np.int64)
         pseudo_distribution_anchors = np.zeros(class_num, dtype=np.int64)
         anchor_num = 0
@@ -538,9 +650,13 @@ def run_training():
                 teacher_features1 = teacher_feature_hook.output.detach()
                 logits2, _ = teacher(weak2, None, None, 'test', 'target')
                 teacher_features2 = teacher_feature_hook.output.detach()
-                pseudo_targets = logits1.argmax(dim=1)
+                pseudo_targets, confidence_idx, agree_count = select_dual_view_pseudo_labels(
+                    logits1, logits2, thresholds
+                )
+                confidence_mask = confidence_idx.bool()
                 agreement_mask = pseudo_targets.eq(logits2.argmax(dim=1))
-                agree_count = int(agreement_mask.sum().item())
+                # Only agreeing samples that failed the high-confidence route are candidates.
+                rescue_candidates = agreement_mask & ~confidence_mask
                 teacher_mean_features = F.normalize(
                     F.normalize(teacher_features1, dim=1)
                     + F.normalize(teacher_features2, dim=1),
@@ -550,15 +666,18 @@ def run_training():
                 region_ok = reliability_bank.in_distribution(
                     teacher_mean_features, pseudo_targets
                 )
-                # Every accepted pseudo-label must pass its predicted-class radius.
-                final_mask = agreement_mask & region_ok
+                rescue_mask = torch.zeros_like(agreement_mask)
+                if enable_radius_rescue:
+                    rescue_mask = rescue_candidates & region_ok
+                # OR rescue: high-confidence samples do not need a radius pass to learn.
+                final_mask = confidence_mask | rescue_mask
                 # Learning is distinct from updating shared class knowledge.
                 con_idx = final_mask.float()
                 if role_tracker is not None:
                     conf1 = F.softmax(logits1, dim=1).max(dim=1).values
                     conf2 = F.softmax(logits2, dim=1).max(dim=1).values
                     anchor_mask = role_tracker.observe(
-                        sample_ids, pseudo_targets, final_mask,
+                        sample_ids, pseudo_targets, final_mask & region_ok,
                         torch.minimum(conf1, conf2), epoch=i,
                     )
                 else:
@@ -579,6 +698,9 @@ def run_training():
             # 统计当前epoch中不同阶段一共接纳了多少目标样本
             agreement_num += agree_count
             radius_pass_num += int(region_ok.sum().item())
+            confidence_accept_num += int(confidence_mask.sum().item())
+            rescue_candidate_num += int(rescue_candidates.sum().item())
+            radius_rescue_num += int(rescue_mask.sum().item())
             final_accept_num += int(final_mask.sum().item())
             anchor_num += int(anchor_mask.sum().item())
             prototype_update_num += int(prototype_update_mask.sum().item())
@@ -593,6 +715,12 @@ def run_training():
             prototype_similarity_sum += proto_similarity * proto_checked
 
             # 统计伪标签在不同掩码筛选下的类别分布
+            pseudo_distribution_confidence += np.bincount(
+                pseudo_targets[confidence_mask].cpu().numpy(), minlength=class_num
+            ).astype(np.int64)
+            pseudo_distribution_rescued += np.bincount(
+                pseudo_targets[rescue_mask].cpu().numpy(), minlength=class_num
+            ).astype(np.int64)
             final_labels = pseudo_targets[final_mask].cpu().numpy()
             if final_labels.size > 0:
                 pseudo_distribution_final += np.bincount(
@@ -665,8 +793,15 @@ def run_training():
             prototype_similarity_sum / float(prototype_checked_num)
             if prototype_checked_num > 0 else 0.0
         )
-        print('[Target Epoch %d] Agreement_Num: %d Radius_Pass_Num: %d Final_Accept_Num: %d' %
-              (i, agreement_num, radius_pass_num, final_accept_num))
+        print('[Target Epoch %d] Agreement_Num: %d Confidence_Accept_Num: %d '
+              'Rescue_Candidate_Num: %d Radius_Pass_Num: %d Radius_Rescue_Num: %d '
+              'Final_Accept_Num: %d' %
+              (i, agreement_num, confidence_accept_num, rescue_candidate_num,
+               radius_pass_num, radius_rescue_num, final_accept_num))
+        print('[Target Epoch %d] Pseudo_Distribution_Confidence: %s' %
+              (i, np.array2string(pseudo_distribution_confidence, separator=', ')))
+        print('[Target Epoch %d] Pseudo_Distribution_Rescued: %s' %
+              (i, np.array2string(pseudo_distribution_rescued, separator=', ')))
         print('[Target Epoch %d] Pseudo_Distribution_Final: %s' %
               (i, np.array2string(pseudo_distribution_final, separator=', ')))
         print('[Target Epoch %d] Anchor_Num: %d Anchor_Distribution: %s' %
