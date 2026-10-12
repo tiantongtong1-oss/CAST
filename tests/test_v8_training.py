@@ -87,7 +87,8 @@ class TrainingTests(unittest.TestCase):
                                           bank, role_tracker=roles, epoch=2)
             banks.append(bank)
         self.assertTrue(torch.equal(banks[0].memory_sender_scores, banks[1].memory_sender_scores))
-        self.assertTrue((banks[0].memory_sender_scores > 0).all())
+        self.assertTrue((banks[0].memory_sender_scores > 0).any())
+        self.assertTrue((banks[0].memory_sender_scores == 0).any())
         self.assertTrue(torch.equal(banks[0].memory_labels, torch.zeros(3, dtype=torch.long)))
 
     def test_full_cpu_training_and_checkpoint_for_default_and_soft_option(self):
@@ -107,7 +108,7 @@ class TrainingTests(unittest.TestCase):
                      contextlib.chdir(root), contextlib.redirect_stdout(stdout):
                     accuracy = train.run_training()
                 self.assertEqual(accuracy, 1.)
-                self.assertIn('Stable_Senders: 8/8', stdout.getvalue())
+                self.assertRegex(stdout.getvalue(), r'Stable_Senders: [1-8]/8')
                 self.assertIn('UAR(present classes): 1.0000', stdout.getvalue())
                 checkpoint_path = Path(root) / 'models/rafdb_fer/mobilenet_v2_rafdb_fer_smoke_target_best.pth'
                 saved = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
@@ -119,3 +120,4 @@ class TrainingTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

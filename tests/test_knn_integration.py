@@ -13,7 +13,7 @@ from torchvision import transforms
 from dataset import FER
 from knn_reliability import KNNReliabilityBank
 from prototype_utils import FeatureHook, PrototypeBank
-from train import parse_args, refresh_reliability_bank, save_checkpoint, log_gaussian_means
+from train import parse_args, refresh_reliability_bank, save_checkpoint, log_source_prototypes
 
 
 class TinyTeacher(nn.Module):
@@ -52,7 +52,7 @@ class IntegrationTests(unittest.TestCase):
         bank.class_means[0].fill_(0.01)
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            log_gaussian_means(bank)
+            log_source_prototypes(bank)
         text = out.getvalue()
         self.assertIn('bound_ok=True', text)
         self.assertIn('class=1 count=0 ready=False', text)
@@ -60,7 +60,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertNotIn('mu=[', text)
         bank.class_means[0, 0] = 2.
         with contextlib.redirect_stdout(out):
-            log_gaussian_means(bank)
+            log_source_prototypes(bank)
         self.assertIn('bound_ok=False', out.getvalue())
         self.assertIn('WARNING', out.getvalue())
 
@@ -140,5 +140,6 @@ class IntegrationTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
 
 

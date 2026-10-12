@@ -20,10 +20,8 @@ def points(angles):
 def bank_with_memory(angles, labels=None, sender_scores=None, score_mode='support', chunk=128):
     bank = SparseReliableKNNBank(2, 2, k=20, score_mode=score_mode, query_chunk_size=chunk)
     bank.class_means.copy_(torch.tensor([[1., 0.], [1., 0.]]))
-    bank.global_var.fill_(0.04)
-    bank.class_variances.fill_(0.04)
+    bank.class_radii.fill_(0.3)
     bank.distribution_initialized.fill_(True)
-    bank.sigma_initialized.fill_(True)
     n = len(angles)
     if labels is None:
         labels = torch.zeros(n, dtype=torch.long)
@@ -37,19 +35,18 @@ def query(bank, angle=0., label=0, sample_id=99):
                      torch.tensor([True]), torch.tensor([0.8, 0.8]))
 
 
-class ClassVarianceScaleTests(unittest.TestCase):
+class ClassRadiusScaleTests(unittest.TestCase):
     def test_sender_class_controls_kernel_and_radius(self):
         bank = bank_with_memory([.1, .1, .1, .1, .1, .1],
                                 labels=torch.tensor([0, 0, 0, 1, 1, 1]))
-        bank.class_variances[0].fill_(.001)
-        bank.class_variances[1].fill_(.1)
+        bank.class_radii[0] = .03
+        bank.class_radii[1] = .3
         # All senders lie in their own region; only class 0's radius excludes them.
         bank.class_means[:] = points([.1])[0]
         result = query(bank, label=1)
         self.assertEqual(result['support_count'].item(), 3)
         self.assertEqual(result['neighbor_probs'][0, 0].item(), 0)
         self.assertEqual(result['neighbor_probs'][0, 1].item(), 1)
-        bank.global_var.fill_(999)
         again = query(bank, label=1)
         self.assertTrue(torch.equal(result['neighbor_probs'], again['neighbor_probs']))
 
@@ -106,6 +103,8 @@ class RoleTests(unittest.TestCase):
 class SparseSupportTests(unittest.TestCase):
     def test_default_sparse_coherent_support_can_pass(self):
         bank = bank_with_memory([0.44, 0.46, 0.48])
+        # Both query and senders lie in the source region, yet are far apart.
+        bank.class_means[:] = points([.23])[0]
         result = query(bank)
         self.assertTrue(result['sparse_mask'].item())
         self.assertLess(result['density'].item(), 0.5)
@@ -208,4 +207,5 @@ class SoftRepairTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
 

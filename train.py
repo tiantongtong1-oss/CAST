@@ -12,7 +12,7 @@ import Networks
 from dataset import RafDataSet, FER
 from ema_utils import create_ema_teacher, select_dual_view_pseudo_labels, update_ema_teacher
 from prototype_utils import FeatureHook, PrototypeBank, prototype_weight_for_epoch
-from global_gaussian_knn_reliability import GlobalGaussianKNNReliabilityBank, combine_rescue_masks
+from prototype_radius_reliability import combine_rescue_masks
 from sparse_reliable_knn import SparseReliableKNNBank
 from reliability_roles import ReliabilityRoles, neighbor_soft_targets, soft_supervision_loss
 import image_utils as util
@@ -90,24 +90,16 @@ def parse_args(argv=None):
 
     parser.set_defaults(knn_gate=True)
     parser.add_argument('--knn_gate', dest='knn_gate', action='store_true',
-                        help='enable class-Gaussian/kNN OR rescue (default)')
+                        help='enable prototype-radius/kNN OR rescue (default)')
     parser.add_argument('--no_knn_gate', dest='knn_gate', action='store_false',
                         help='strict dual-view confidence baseline without rescue')
     parser.add_argument('--knn_k', type=int, default=20)
-    parser.add_argument('--knn_distribution_mass', type=float, default=0.95,
-                        help='nominal class Gaussian ellipsoid probability content')
-    parser.add_argument('--knn_variance_floor', type=float, default=1e-4,
-                        help='minimum per-coordinate class variance')
-    parser.add_argument('--knn_sigma_momentum', type=float, default=0.70,
-                        help='starting EMA momentum for the per-class source variance')
-    parser.add_argument('--knn_sigma_momentum_end', type=float, default=0.95,
-                        help='final EMA momentum for the per-class source variance')
-    parser.add_argument('--knn_sigma_momentum_ramp_refreshes', type=int, default=30,
-                        help='number of source refreshes used to increase per-class variance momentum')
+    parser.add_argument('--source_radius_k', type=int, default=20,
+                        help='mean of the farthest k source-to-prototype Euclidean distances')
     parser.add_argument('--knn_sparse_penalty', type=float, default=0.5,
                         help='multiplicative score penalty for sparse kNN neighborhoods')
     parser.add_argument('--knn_bandwidth_multiplier', type=float, default=1.0,
-                        help='local Gaussian bandwidth = multiplier * sigma')
+                        help='neighbor kernel bandwidth = multiplier * class radius')
     parser.add_argument('--knn_score_threshold', type=float, default=0.5)
     parser.add_argument('--knn_density_threshold', type=float, default=0.5,
                         help='dense/sparse cutoff used by the reliability score')
@@ -131,12 +123,12 @@ def parse_args(argv=None):
     parser.add_argument('--knn_min_purity', type=float, default=0.8)
     parser.add_argument('--knn_min_margin', type=float, default=0.2)
     parser.add_argument('--knn_radius_multiplier', type=float, default=2.0,
-                        help='squared-distance cap = 2 * multiplier * D * source variance')
+                        help='neighbor Euclidean-distance cap = multiplier * class radius')
     parser.add_argument('--neighbor_soft_labels', action='store_true',
                         help='optional soft supervision for reliable conflicting neighborhoods')
     parser.add_argument('--neighbor_soft_mix', type=float, default=0.5)
     parser.add_argument('--neighbor_soft_weight', type=float, default=0.1)
-    parser.add_argument('--run_name', type=str, default='role_sparse_knn_v8',
+    parser.add_argument('--run_name', type=str, default='role_sparse_knn_v8_03_radius',
                         help='checkpoint suffix; use distinct names for ablations')
     parser.add_argument('--device', choices=['cuda', 'cpu'], default='cuda',
                         help='CPU is supported for smoke tests; CUDA recommended for FER training')
@@ -146,21 +138,12 @@ def parse_args(argv=None):
         parser.error('knn_k, knn_query_chunk_size and knn_refresh_interval must be positive')
     if args.knn_warmup_epochs < 0 or args.pre_epochs < 0 or args.epochs < 0:
         parser.error('epoch counts must be nonnegative')
-    if not 0 <= args.knn_sigma_momentum < 1:
-        parser.error('knn_sigma_momentum must be in [0, 1)')
-    if not 0 <= args.knn_sigma_momentum_end < 1:
-        parser.error('knn_sigma_momentum_end must be in [0, 1)')
-    if args.knn_sigma_momentum_end < args.knn_sigma_momentum:
-        parser.error('knn_sigma_momentum_end must be >= knn_sigma_momentum')
-    if args.knn_sigma_momentum_ramp_refreshes < 1:
-        parser.error('knn_sigma_momentum_ramp_refreshes must be positive')
+    if args.source_radius_k < 1:
+        parser.error('source_radius_k must be positive')
     if not 0 < args.knn_sparse_penalty <= 1:
         parser.error('knn_sparse_penalty must be in (0, 1]')
-    if not 0 < args.knn_distribution_mass < 1:
-        parser.error('knn_distribution_mass must be in (0, 1)')
-    for name in ('knn_variance_floor', 'knn_bandwidth_multiplier'):
-        if not np.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
-            parser.error('%s must be finite and positive' % name)
+    if not np.isfinite(args.knn_bandwidth_multiplier) or args.knn_bandwidth_multiplier <= 0:
+        parser.error('knn_bandwidth_multiplier must be finite and positive')
     for name in ('knn_score_threshold', 'knn_density_threshold'):
         if not 0 < getattr(args, name) <= 1:
             parser.error('%s must be in (0, 1]' % name)
@@ -390,14 +373,14 @@ def initialize_source_prototypes(teacher, feature_hook, loader, prototype_bank):
     prototype_bank.finalize_source()
 
 
-def log_gaussian_means(reliability_bank):
+def log_source_prototypes(reliability_bank):
     """Print compact per-class scale diagnostics without dumping feature vectors."""
     means = reliability_bank.class_means.detach().cpu().numpy()
     ready = reliability_bank.distribution_initialized.detach().cpu().tolist()
     counts = reliability_bank.class_source_counts.detach().cpu().tolist()
     for c, mu in enumerate(means):
         if not ready[c]:
-            print('[Gaussian mu] class=%d count=%d ready=False (no valid distribution)' %
+            print('[Source prototype] class=%d count=%d ready=False (no valid distribution)' %
                   (c, counts[c]), flush=True)
             continue
         norm = float(np.linalg.norm(mu))
@@ -405,11 +388,11 @@ def log_gaussian_means(reliability_bank):
         finite = bool(np.isfinite(mu).all())
         # Means of unit vectors and their convex EMA have norm <= 1.
         bound_ok = finite and norm <= 1.00001 and abs_max <= 1.00001
-        print('[Gaussian mu] class=%d count=%d ready=True l2=%.8g abs_max=%.8g '
+        print('[Source prototype] class=%d count=%d ready=True l2=%.8g abs_max=%.8g '
               'finite=%s bound_ok=%s' %
               (c, counts[c], norm, abs_max, finite, bound_ok), flush=True)
         if not bound_ok:
-            print('[Gaussian mu WARNING] class=%d exceeds normalized-mean bounds; '
+            print('[Source prototype WARNING] class=%d exceeds normalized-mean bounds; '
                   'check features/statistics/checkpoint.' % c, flush=True)
 
 
@@ -493,14 +476,9 @@ def run_training():
     print('prototype weight:%s temp:%s momentum:%s source_anchor:%s warmup:%s ramp:%s' %
           (args.proto_weight, args.proto_temperature, args.proto_momentum,
            args.proto_source_anchor, args.proto_warmup_epochs, args.proto_ramp_epochs))
-    print('knn rescue:%s k:%s distribution_mass:%s class_variance_momentum:[%s->%s] ramp:%s '
-          'bandwidth:%s score_threshold:%s density_threshold:%s sparse_penalty:%s '
-          'warmup:%s refresh_interval:%s' %
-          (args.knn_gate, args.knn_k, args.knn_distribution_mass,
-           args.knn_sigma_momentum, args.knn_sigma_momentum_end,
-           args.knn_sigma_momentum_ramp_refreshes, args.knn_bandwidth_multiplier,
-           args.knn_score_threshold, args.knn_density_threshold, args.knn_sparse_penalty,
-           args.knn_warmup_epochs, args.knn_refresh_interval))
+    print('knn rescue:%s k:%s source_radius_k:%s bandwidth:%s refresh_interval:%s' %
+          (args.knn_gate, args.knn_k, args.source_radius_k,
+           args.knn_bandwidth_multiplier, args.knn_refresh_interval))
     print('---------------------------------------------------------------------------------------')
 
     print('role_separation:%s promotion_epochs:%d score_mode:%s '
@@ -694,16 +672,12 @@ def run_training():
     print('source prototype counts: %s' %
           np.array2string(prototype_bank.source_counts.cpu().numpy(), separator=', '))
 
-    # 新的拯救模块：逐类源域高斯分布 + 逐样本归属检查 + 目标域全类别近邻库。
+    # 新的拯救模块：逐类源域原型距离阈值 + 逐样本归属检查 + 目标域全类别近邻库。
     reliability_bank = SparseReliableKNNBank(
         class_num,
         model.fc.in_features,
         k=args.knn_k,
-        distribution_mass=args.knn_distribution_mass,
-        variance_floor=args.knn_variance_floor,
-        sigma_momentum=args.knn_sigma_momentum,
-        global_momentum_end=args.knn_sigma_momentum_end,
-        global_momentum_ramp_refreshes=args.knn_sigma_momentum_ramp_refreshes,
+        source_radius_k=args.source_radius_k,
         sparse_penalty=args.knn_sparse_penalty,
         bandwidth_multiplier=args.knn_bandwidth_multiplier,
         score_threshold=args.knn_score_threshold,
@@ -740,15 +714,12 @@ def run_training():
                 thresholds=thresholds, epoch=i,
             )
             print('[Target Epoch %d] KNN Source_Count: %d Target_Memory_Count: %d '
-                  'Class_Variances: %s Observed_Class_Variances: %s EMA_Momentum: %.4f '
-                  'Classes_Ready: %s' %
+                  'Class_Radii: %s Classes_Ready: %s' %
                   (i, reliability_bank.source_count.item(),
                    reliability_bank.memory_ids.numel(),
-                   np.array2string(reliability_bank.class_var.cpu().numpy(), precision=8),
-                   np.array2string(reliability_bank.current_observed_class_var.cpu().numpy(), precision=8),
-                   reliability_bank.current_global_momentum.item(),
+                   np.array2string(reliability_bank.class_radii.cpu().numpy(), precision=8),
                    reliability_bank.distribution_initialized.cpu().tolist()))
-            log_gaussian_means(reliability_bank)
+            log_source_prototypes(reliability_bank)
             print('[Target Epoch %d] Stable_Senders: %d/%d' %
                   (i, int((reliability_bank.memory_sender_scores > 0).sum().item()),
                    reliability_bank.memory_ids.numel()))
@@ -843,13 +814,13 @@ def run_training():
                 # Learning is distinct from updating shared class knowledge.
                 con_idx = final_mask.float()
                 if role_tracker is not None:
-                    gaussian_ok = reliability_bank.in_distribution(
+                    region_ok = reliability_bank.in_distribution(
                         teacher_mean_features, pseudo_targets
                     )
                     conf1 = F.softmax(logits1, dim=1).max(dim=1).values
                     conf2 = F.softmax(logits2, dim=1).max(dim=1).values
                     anchor_mask = role_tracker.observe(
-                        sample_ids, pseudo_targets, final_mask & gaussian_ok,
+                        sample_ids, pseudo_targets, final_mask & region_ok,
                         torch.minimum(conf1, conf2), epoch=i,
                     )
                 else:
@@ -1071,6 +1042,7 @@ def run_training():
 
 if __name__ == '__main__':
     run_training()
+
 
 
 

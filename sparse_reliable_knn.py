@@ -1,6 +1,6 @@
 """v8: stable senders and support-based rescue independent of absolute density.
 
-The v7 scorer remains available for ablation. Gaussian membership is still a
+The v7 scorer remains available for ablation. Prototype-radius membership is a
 source-only heuristic, not a calibrated probability guarantee under domain shift.
 """
 
@@ -8,10 +8,10 @@ import math
 import torch
 import torch.nn.functional as F
 
-from global_gaussian_knn_reliability import GlobalGaussianKNNReliabilityBank
+from prototype_radius_reliability import PrototypeRadiusKNNReliabilityBank
 
 
-class SparseReliableKNNBank(GlobalGaussianKNNReliabilityBank):
+class SparseReliableKNNBank(PrototypeRadiusKNNReliabilityBank):
     def __init__(self, *args, score_mode='support', min_support=3,
                  min_effective_support=2.0, min_purity=0.8,
                  min_margin=0.2, radius_multiplier=2.0, **kwargs):
@@ -36,7 +36,7 @@ class SparseReliableKNNBank(GlobalGaussianKNNReliabilityBank):
 
     @torch.no_grad()
     def set_sender_scores(self, scores):
-        scores = scores.detach().to(self.global_var)
+        scores = scores.detach().to(self.class_radii)
         if scores.shape != self.memory_confidences.shape:
             raise ValueError('sender scores must align with filtered memory IDs')
         if not torch.isfinite(scores).all() or (scores < 0).any() or (scores > 1).any():
@@ -70,9 +70,9 @@ class SparseReliableKNNBank(GlobalGaussianKNNReliabilityBank):
         result.update({name: false.clone() for name in (
             'checked_mask', 'dense_mask', 'sparse_mask', 'pass_mask',
             'in_distribution', 'neighbor_reliable')})
-        result['mahalanobis_sq'] = features.new_full((n,), float('inf'))
+        result['prototype_distance'] = features.new_full((n,), float('inf'))
         result['neighbor_probs'] = features.new_zeros(n, self.num_classes)
-        if not self.sigma_initialized.item() or self.memory_ids.numel() < 2:
+        if not self.distribution_initialized.any().item() or self.memory_ids.numel() < 2:
             return result
         if self.memory_sender_scores.shape != self.memory_confidences.shape:
             raise RuntimeError('refresh sender scores before querying memory')
@@ -88,9 +88,9 @@ class SparseReliableKNNBank(GlobalGaussianKNNReliabilityBank):
             z = F.normalize(features[idx], dim=1)
             # A sender contributes on its own class scale, including competing
             # classes in the vote used for purity and optional soft labels.
-            vector_var = (self.feature_dim * self.class_var[self.memory_labels]).clamp_min(self.eps)
-            h_sq = self.bandwidth_multiplier ** 2 * vector_var
-            radius_sq = 2.0 * self.radius_multiplier * vector_var
+            radius_scale_sq = self.class_radii[self.memory_labels].square().clamp_min(self.eps)
+            h_sq = self.bandwidth_multiplier ** 2 * radius_scale_sq
+            radius_sq = self.radius_multiplier ** 2 * radius_scale_sq
             distance = (2 - 2 * z.mm(self.memory_features.t())).clamp_min(0)
             distance.masked_fill_(ids[idx, None].eq(self.memory_ids[None, :]), float('inf'))
             nn_dist, nn_idx = distance.topk(k, dim=1, largest=False)
@@ -151,9 +151,10 @@ class SparseReliableKNNBank(GlobalGaussianKNNReliabilityBank):
             result['neighbor_reliable'][idx] = neighbor_good
             result['checked_mask'][idx] = enough
             result['in_distribution'][idx] = self_region
-            result['mahalanobis_sq'][idx] = self.distribution_distance(z, query_class)
+            result['prototype_distance'][idx] = self.distribution_distance(z, query_class)
             result['dense_mask'][idx] = enough & (density >= self.density_threshold)
             result['sparse_mask'][idx] = enough & (density < self.density_threshold)
             result['pass_mask'][idx] = accepted
         return result
+
 
