@@ -1,4 +1,4 @@
-"""Source-only prototypes and mean of the farthest-k Euclidean distances.
+"""Source-only prototypes and per-class Euclidean-distance quantile radii.
 
 Historical Gaussian experiments live in global_gaussian_knn_reliability.py;
 this bank does not calculate variances or Mahalanobis distances.
@@ -10,16 +10,18 @@ import torch.nn.functional as F
 
 
 class SourcePrototypeRadiusBank(nn.Module):
-    def __init__(self, num_classes, feature_dim, source_radius_k=11, eps=1e-8):
+    def __init__(self, num_classes, feature_dim, source_radius_quantile=0.90, eps=1e-8):
         super().__init__()
-        for name, value in (("num_classes", num_classes), ("feature_dim", feature_dim),
-                            ("source_radius_k", source_radius_k)):
+        for name, value in (("num_classes", num_classes), ("feature_dim", feature_dim)):
             if isinstance(value, bool) or int(value) != value or value < 1:
                 raise ValueError(name + " must be a positive integer")
         if not math.isfinite(eps) or eps <= 0:
             raise ValueError("eps must be finite and positive")
         self.num_classes, self.feature_dim = int(num_classes), int(feature_dim)
-        self.source_radius_k, self.eps = int(source_radius_k), float(eps)
+        if isinstance(source_radius_quantile, bool) or not math.isfinite(source_radius_quantile) or not 0 < source_radius_quantile <= 1:
+            raise ValueError("source_radius_quantile must be finite and in (0, 1]")
+        self.source_radius_quantile = float(source_radius_quantile)
+        self.eps = float(eps)
         self.register_buffer("class_means", torch.zeros(num_classes, feature_dim))
         self.register_buffer("class_radii", torch.zeros(num_classes))
         self.register_buffer("distribution_initialized", torch.zeros(num_classes, dtype=torch.bool))
@@ -61,16 +63,19 @@ class SourcePrototypeRadiusBank(nn.Module):
         self.class_means.copy_((self._source_sum / self._source_count.clamp_min(1)[:, None]).to(self.class_means))
         self.class_radii.zero_()
         self.distribution_initialized.copy_(self._source_count > 0)
-        top_distances = [self.class_radii.new_empty(0) for _ in range(self.num_classes)]
+        class_distances = [[] for _ in range(self.num_classes)]
         for features, labels in self._source_batches:
             features, labels = features.to(self.class_means), labels.to(self.class_means.device)
             distances = (features - self.class_means[labels]).norm(dim=1)
             for c in labels.unique().tolist():
-                values = torch.cat((top_distances[c], distances[labels == c]))
-                top_distances[c] = values.topk(min(self.source_radius_k, values.numel()), largest=True).values
-        for c, values in enumerate(top_distances):
-            if values.numel():
-                self.class_radii[c] = values.mean()
+                class_distances[c].append(distances[labels == c].cpu())
+        # Use all distances across batches, not a mean of batch quantiles.
+        for c, chunks in enumerate(class_distances):
+            if chunks:
+                values = torch.cat(chunks).float()
+                self.class_radii[c] = torch.quantile(
+                    values, self.source_radius_quantile, interpolation="linear"
+                ).to(self.class_radii)
         self._source_batches.clear()
         self.refresh_count.add_(1)
 
