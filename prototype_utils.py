@@ -25,13 +25,15 @@ class PrototypeBank(nn.Module):
     # 失函数所使用的原型是固定源锚点与自适应目标EMA原型的归一化混合。
 
     def __init__(self, num_classes, feature_dim, momentum=0.99,
-                 source_anchor=0.5):
+                 source_anchor=0.5, max_children=3):
         super().__init__()
         if not (0.0 <= momentum < 1.0):
             raise ValueError('prototype momentum must be in [0, 1)')
         if not (0.0 <= source_anchor <= 1.0):
             raise ValueError('source_anchor must be in [0, 1]')
 
+        self.register_buffer('child_prototypes', torch.zeros(num_classes, max_children, feature_dim))
+        self.register_buffer('child_ready', torch.zeros(num_classes, max_children, dtype=torch.bool))
         self.num_classes = int(num_classes)
         self.feature_dim = int(feature_dim)
         self.momentum = float(momentum)
@@ -141,6 +143,33 @@ class PrototypeBank(nn.Module):
 
         return F.normalize(prototypes, dim=1)
 
+    @torch.no_grad()
+    def set_children(self, children):
+        self.child_ready.zero_()
+        self.child_prototypes.zero_()
+        counts = [0] * self.num_classes
+        for c, feature in children:
+            slot = counts[c]
+            if slot >= self.child_ready.shape[1]:
+                raise ValueError('too many child prototypes')
+            value = torch.as_tensor(feature, device=self.child_prototypes.device,
+                                    dtype=self.child_prototypes.dtype)
+            self.child_prototypes[c, slot].copy_(F.normalize(value, dim=0))
+            self.child_ready[c, slot] = True
+            counts[c] += 1
+
+    def class_similarities(self, normalized_features):
+        base_scores = normalized_features.mm(self.blended_prototypes().detach().t())
+        scores = []
+        for c in range(self.num_classes):
+            ready = self.child_ready[c]
+            if ready.any():
+                local = normalized_features.mm(self.child_prototypes[c, ready].detach().t())
+                scores.append(torch.maximum(base_scores[:, c], local.max(dim=1).values))
+            else:
+                scores.append(base_scores[:, c])
+        return torch.stack(scores, dim=1)
+
     # 类平衡的原型对比损失 在可靠的目标域样本上，拉近特征与“正确类原型”的距离，同时推开与其他类原型的距离
     def consistency_loss(self, features, labels, reliable_mask,
                          temperature=0.2):
@@ -156,7 +185,7 @@ class PrototypeBank(nn.Module):
         # 混合原型（源锚点 + 目标 EMA），detach 不参与梯度
         prototypes = self.blended_prototypes().detach()
         # 特征与各类原型的相似度   → 分类 logits
-        logits = selected_features.mm(prototypes.t()) / float(temperature)
+        logits = self.class_similarities(selected_features) / float(temperature)
         # 每个样本的交叉熵损失
         per_sample = F.cross_entropy(logits, selected_labels, reduction='none')
         # 类平衡：每个类先求平均，再对类求平均，避免多数类主导
@@ -175,7 +204,7 @@ class PrototypeBank(nn.Module):
         selected_features = F.normalize(features.detach()[reliable_mask], dim=1)
         selected_labels = labels.detach()[reliable_mask].long()
         prototypes = self.blended_prototypes()
-        similarities = selected_features.mm(prototypes.t())
+        similarities = self.class_similarities(selected_features)
         prototype_predictions = similarities.argmax(dim=1)
         agreement = prototype_predictions.eq(selected_labels)
         assigned_similarity = similarities.gather(

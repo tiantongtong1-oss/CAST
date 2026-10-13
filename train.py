@@ -14,6 +14,7 @@ from ema_utils import create_ema_teacher, select_dual_view_pseudo_labels, update
 from prototype_utils import FeatureHook, PrototypeBank, prototype_weight_for_epoch
 from source_prototype_radius import SourcePrototypeRadiusBank
 from reliability_roles import ReliabilityRoles
+from prototype_lifecycle import PrototypeLifecycle
 import image_utils as util
 from randaugment import RandAugmentMC
 # 总训练入口与调度器。串起数据、Source 预训练、EMA Teacher、
@@ -109,7 +110,33 @@ def parse_args(argv=None):
     parser.add_argument('--device', choices=['cuda', 'cpu'], default='cuda',
                         help='CPU is supported for smoke tests; CUDA recommended for FER training')
 
+    parser.add_argument('--prototype_lifecycle', action='store_true')
+    parser.add_argument('--community_k', type=int, default=10)
+    parser.add_argument('--community_similarity', type=float, default=0.8)
+    parser.add_argument('--community_min_size', type=int, default=20)
+    parser.add_argument('--community_persistence', type=int, default=3)
+    parser.add_argument('--community_purity', type=float, default=0.9)
+    parser.add_argument('--community_semantic_margin', type=float, default=0.02)
+    parser.add_argument('--community_overlap', type=float, default=0.5)
+    parser.add_argument('--child_audit_min', type=int, default=10)
+    parser.add_argument('--child_audit_gain', type=float, default=0.005)
+    parser.add_argument('--child_audit_tolerance', type=float, default=0.01)
+    parser.add_argument('--child_merge_similarity', type=float, default=0.98)
+    parser.add_argument('--child_max_per_class', type=int, default=3)
+    parser.add_argument('--community_graph_limit', type=int, default=3000)
     args = parser.parse_args(argv)
+    if args.prototype_lifecycle and (not args.role_separation or args.immediate_prototype_update):
+        parser.error('prototype lifecycle requires role separation and anchor-only updates')
+    try:
+        PrototypeLifecycle(k=args.community_k, similarity=args.community_similarity,
+            min_size=args.community_min_size, persistence=args.community_persistence,
+            purity=args.community_purity, semantic_margin=args.community_semantic_margin,
+            overlap=args.community_overlap, audit_min=args.child_audit_min,
+            gain=args.child_audit_gain, tolerance=args.child_audit_tolerance,
+            merge_similarity=args.child_merge_similarity,
+            max_children=args.child_max_per_class, graph_limit=args.community_graph_limit)
+    except ValueError as exc:
+        parser.error(str(exc))
     if not np.isfinite(args.source_radius_quantile) or not 0 < args.source_radius_quantile <= 1:
         parser.error('source_radius_quantile must be finite and in (0, 1]')
     if args.source_refresh_interval < 1:
@@ -299,7 +326,7 @@ def evaluate(model, loader, criterion, num_samples, epoch, split_name):
 
 
 def save_checkpoint(path, model, optimizer, scheduler, epoch, best_val_acc, args,
-                    teacher=None, prototype_bank=None, reliability_bank=None, role_tracker=None):
+                    teacher=None, prototype_bank=None, reliability_bank=None, role_tracker=None, lifecycle=None):
     # 保存 Student、optimizer、scheduler、epoch 等；
     # 目标阶段还可保存 EMA Teacher 和 PrototypeBank
     state = {
@@ -318,6 +345,8 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch, best_val_acc, args
         state['reliability_bank'] = reliability_bank.state_dict()
     if role_tracker is not None:
         state['role_tracker'] = role_tracker.state_dict()
+    if lifecycle is not None:
+        state['prototype_lifecycle'] = lifecycle.state_dict()
     torch.save(state, path)
 
 
@@ -568,6 +597,7 @@ def run_training():
         model.fc.in_features,
         momentum=args.proto_momentum,
         source_anchor=args.proto_source_anchor,  #锚点权重
+        max_children=args.child_max_per_class,
     ).to(device)
 
     # 源域数据初始化原型
@@ -584,6 +614,18 @@ def run_training():
     role_tracker = (ReliabilityRoles(len(target_train), args.promotion_epochs).to(device)
                     if args.role_separation else None)
 
+    lifecycle = (PrototypeLifecycle(classes=class_num,
+        k=args.community_k, similarity=args.community_similarity,
+        min_size=args.community_min_size, persistence=args.community_persistence,
+        purity=args.community_purity, semantic_margin=args.community_semantic_margin,
+        overlap=args.community_overlap, audit_min=args.child_audit_min,
+        gain=args.child_audit_gain, tolerance=args.child_audit_tolerance,
+        merge_similarity=args.child_merge_similarity,
+        max_children=args.child_max_per_class, graph_limit=args.community_graph_limit)
+        if args.prototype_lifecycle else None)
+    previous_anchors = None
+    print('prototype_lifecycle:%s role_separation:%s anchor_only:%s' %
+          (args.prototype_lifecycle, args.role_separation, not args.immediate_prototype_update))
     best_target_val_acc = -1.0
     global_step = 0
 
@@ -607,6 +649,17 @@ def run_training():
                    np.array2string(reliability_bank.class_radii.cpu().numpy(), precision=8),
                    reliability_bank.distribution_initialized.cpu().tolist()))
             log_source_prototypes(reliability_bank)
+        if lifecycle is not None:
+            if previous_anchors is None:
+                previous_anchors = (np.empty(0, dtype=np.int64),
+                                    np.empty((0, model.fc.in_features), dtype=np.float32),
+                                    np.empty(0, dtype=np.int64))
+            stats = lifecycle.update(*previous_anchors,
+                source=reliability_bank.class_means.cpu().numpy(),
+                base=prototype_bank.blended_prototypes().cpu().numpy(), epoch=i)
+            prototype_bank.set_children(lifecycle.active)
+            print('[Target Epoch %d] Prototype_Lifecycle: %s' % (i, stats))
+        epoch_anchor_ids, epoch_anchor_features, epoch_anchor_labels = [], [], []
         current_proto_weight = prototype_weight_for_epoch(
             i, args.proto_weight, args.proto_warmup_epochs, args.proto_ramp_epochs
         )
@@ -697,6 +750,10 @@ def run_training():
                         teacher_mean_features, pseudo_targets, con_idx
                     )
                 )
+            if lifecycle is not None and anchor_mask.any():
+                epoch_anchor_ids.append(sample_ids[anchor_mask.cpu()].cpu().numpy())
+                epoch_anchor_features.append(teacher_mean_features[anchor_mask].cpu().numpy())
+                epoch_anchor_labels.append(pseudo_targets[anchor_mask].cpu().numpy())
             # 统计当前epoch中不同阶段一共接纳了多少目标样本
             agreement_num += agree_count
             radius_pass_num += int(region_ok.sum().item())
@@ -784,6 +841,11 @@ def run_training():
             train_loss3 += weight_loss.item()
             train_proto_loss += proto_loss.item()
             batch_count += 1
+        if lifecycle is not None:
+            previous_anchors = ((np.concatenate(epoch_anchor_ids), np.concatenate(epoch_anchor_features),
+                                 np.concatenate(epoch_anchor_labels)) if epoch_anchor_ids else
+                                (np.empty(0,dtype=np.int64), np.empty((0,model.fc.in_features),dtype=np.float32),
+                                 np.empty(0,dtype=np.int64)))
         # 更新学习率
         scheduler.step()
         # 求均值
@@ -835,7 +897,7 @@ def run_training():
                 best_target_val_acc, args, teacher=teacher,
                 prototype_bank=prototype_bank,
                 reliability_bank=reliability_bank,
-                role_tracker=role_tracker,
+                role_tracker=role_tracker, lifecycle=lifecycle,
             )
             print('best target-stage validation accuracy %.4f' % best_target_val_acc)
 
