@@ -14,6 +14,7 @@ from ema_utils import create_ema_teacher, select_dual_view_pseudo_labels, update
 from prototype_utils import FeatureHook, PrototypeBank, prototype_weight_for_epoch
 from source_prototype_radius import SourcePrototypeRadiusBank
 from reliability_roles import ReliabilityRoles
+from history_neighbor import HistoryNeighborGate
 import image_utils as util
 from randaugment import RandAugmentMC
 # 总训练入口与调度器。串起数据、Source 预训练、EMA Teacher、
@@ -109,7 +110,22 @@ def parse_args(argv=None):
     parser.add_argument('--device', choices=['cuda', 'cpu'], default='cuda',
                         help='CPU is supported for smoke tests; CUDA recommended for FER training')
 
+    parser.add_argument('--history_neighbor', action='store_true',
+                        help='require history-group-excluded neighbor support for radius rescue')
+    parser.add_argument('--neighbor_history_window', type=int, default=4)
+    parser.add_argument('--neighbor_k', type=int, default=20)
+    parser.add_argument('--neighbor_support', type=float, default=0.8)
+    parser.add_argument('--neighbor_min_remaining', type=int, default=3)
+    parser.add_argument('--neighbor_min_groups', type=int, default=2)
+    parser.add_argument('--neighbor_min_similarity', type=float, default=0.5)
     args = parser.parse_args(argv)
+    if min(args.neighbor_history_window, args.neighbor_k,
+           args.neighbor_min_remaining, args.neighbor_min_groups) < 1:
+        parser.error('neighbor sizes must be positive')
+    if not 0 <= args.neighbor_support <= 1 or not -1 <= args.neighbor_min_similarity <= 1:
+        parser.error('invalid neighbor support/similarity')
+    if args.history_neighbor and not args.role_separation:
+        parser.error('--history_neighbor requires role separation')
     if not np.isfinite(args.source_radius_quantile) or not 0 < args.source_radius_quantile <= 1:
         parser.error('source_radius_quantile must be finite and in (0, 1]')
     if args.source_refresh_interval < 1:
@@ -299,7 +315,7 @@ def evaluate(model, loader, criterion, num_samples, epoch, split_name):
 
 
 def save_checkpoint(path, model, optimizer, scheduler, epoch, best_val_acc, args,
-                    teacher=None, prototype_bank=None, reliability_bank=None, role_tracker=None):
+                    teacher=None, prototype_bank=None, reliability_bank=None, role_tracker=None, neighbor_gate=None):
     # 保存 Student、optimizer、scheduler、epoch 等；
     # 目标阶段还可保存 EMA Teacher 和 PrototypeBank
     state = {
@@ -318,6 +334,8 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch, best_val_acc, args
         state['reliability_bank'] = reliability_bank.state_dict()
     if role_tracker is not None:
         state['role_tracker'] = role_tracker.state_dict()
+    if neighbor_gate is not None:
+        state['history_neighbor'] = neighbor_gate.state_dict()
     torch.save(state, path)
 
 
@@ -584,10 +602,23 @@ def run_training():
     role_tracker = (ReliabilityRoles(len(target_train), args.promotion_epochs).to(device)
                     if args.role_separation else None)
 
+    neighbor_gate = (HistoryNeighborGate(
+        len(target_train), model.fc.in_features,
+        window=args.neighbor_history_window, k=args.neighbor_k,
+        support=args.neighbor_support, min_remaining=args.neighbor_min_remaining,
+        min_groups=args.neighbor_min_groups, min_similarity=args.neighbor_min_similarity,
+    ) if args.history_neighbor else None)
+    print('history_neighbor:%s window:%d k:%d support:%.3f min_remaining:%d min_groups:%d min_similarity:%.3f' %
+          (args.history_neighbor, args.neighbor_history_window, args.neighbor_k,
+           args.neighbor_support, args.neighbor_min_remaining,
+           args.neighbor_min_groups, args.neighbor_min_similarity))
     best_target_val_acc = -1.0
     global_step = 0
 
     for i in range(args.epochs):
+        if neighbor_gate is not None:
+            neighbor_gate.begin_epoch(i)
+        neighbor_candidates = neighbor_pass = neighbor_evidence = 0
         thresholds, class_mean, global_mean, threshold_center = calculate_target_thresholds(
             teacher, threshold_loader_target, class_num, args.threshold_base,
             args.threshold_beta, args.threshold_margin, args.threshold_min, args.threshold_max,
@@ -671,6 +702,20 @@ def run_training():
                 rescue_mask = torch.zeros_like(agreement_mask)
                 if enable_radius_rescue:
                     rescue_mask = rescue_candidates & region_ok
+                    if neighbor_gate is not None:
+                        query_mask = rescue_mask.clone()
+                        query_ids = sample_ids[query_mask.cpu()].numpy()
+                        ok, scores, remaining, groups = neighbor_gate.query(
+                            query_ids, teacher_mean_features[query_mask].cpu().numpy(),
+                            pseudo_targets[query_mask].cpu().numpy(),
+                        )
+                        neighbor_ok = torch.zeros_like(rescue_mask)
+                        neighbor_ok[query_mask] = torch.as_tensor(ok, device=device)
+                        neighbor_candidates += len(ok)
+                        neighbor_pass += int(ok.sum())
+                        neighbor_evidence += int(((remaining >= args.neighbor_min_remaining)
+                                                  & (groups >= args.neighbor_min_groups)).sum())
+                        rescue_mask &= neighbor_ok
                 # OR rescue: high-confidence samples do not need a radius pass to learn.
                 final_mask = confidence_mask | rescue_mask
                 # Learning is distinct from updating shared class knowledge.
@@ -696,6 +741,14 @@ def run_training():
                     prototype_bank.agreement_stats(
                         teacher_mean_features, pseudo_targets, con_idx
                     )
+                )
+            if neighbor_gate is not None:
+                neighbor_gate.observe(
+                    sample_ids.cpu().numpy(), teacher_mean_features.cpu().numpy(),
+                    pseudo_targets.cpu().numpy(), final_mask.cpu().numpy(),
+                    anchor_mask.cpu().numpy(),
+                    torch.minimum(F.softmax(logits1, dim=1).max(1).values,
+                                  F.softmax(logits2, dim=1).max(1).values).cpu().numpy(),
                 )
             # 统计当前epoch中不同阶段一共接纳了多少目标样本
             agreement_num += agree_count
@@ -784,6 +837,9 @@ def run_training():
             train_loss3 += weight_loss.item()
             train_proto_loss += proto_loss.item()
             batch_count += 1
+        if neighbor_gate is not None:
+            print('[Target Epoch %d] Neighbor_Candidates: %d Evidence_Ready: %d Neighbor_Pass: %d' %
+                  (i, neighbor_candidates, neighbor_evidence, neighbor_pass))
         # 更新学习率
         scheduler.step()
         # 求均值
@@ -835,7 +891,7 @@ def run_training():
                 best_target_val_acc, args, teacher=teacher,
                 prototype_bank=prototype_bank,
                 reliability_bank=reliability_bank,
-                role_tracker=role_tracker,
+                role_tracker=role_tracker, neighbor_gate=neighbor_gate,
             )
             print('best target-stage validation accuracy %.4f' % best_target_val_acc)
 
