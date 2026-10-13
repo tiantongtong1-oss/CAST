@@ -16,6 +16,7 @@ from prototype_utils import FeatureHook, PrototypeBank, prototype_weight_for_epo
 from source_prototype_radius import SourcePrototypeRadiusBank
 from reliability_roles import ReliabilityRoles
 from history_neighbor import HistoryNeighborGate
+from class_neighbor_diagnostics import class_neighbor_scores
 import image_utils as util
 from randaugment import RandAugmentMC
 # 总训练入口与调度器。串起数据、Source 预训练、EMA Teacher、
@@ -111,6 +112,9 @@ def parse_args(argv=None):
     parser.add_argument('--device', choices=['cuda', 'cpu'], default='cuda',
                         help='CPU is supported for smoke tests; CUDA recommended for FER training')
 
+    parser.add_argument('--class_neighbor_diagnostics', action='store_true',
+                        help='shadow per-class source/target neighbor comparison; no history exclusion')
+    parser.add_argument('--class_neighbor_k', type=int, default=10)
     parser.add_argument('--neighbor_diagnostics', action='store_true',
                         help='shadow neighbor audit; preserves baseline radius rescue')
     parser.add_argument('--neighbor_diagnostic_labels', action='store_true',
@@ -124,6 +128,10 @@ def parse_args(argv=None):
     parser.add_argument('--neighbor_min_groups', type=int, default=2)
     parser.add_argument('--neighbor_min_similarity', type=float, default=0.5)
     args = parser.parse_args(argv)
+    if args.class_neighbor_k < 1:
+        parser.error('class_neighbor_k must be positive')
+    if args.class_neighbor_diagnostics:
+        args.neighbor_diagnostics = True
     if min(args.neighbor_history_window, args.neighbor_k,
            args.neighbor_min_remaining, args.neighbor_min_groups) < 1:
         parser.error('neighbor sizes must be positive')
@@ -387,15 +395,22 @@ def log_source_prototypes(reliability_bank):
 
 
 @torch.no_grad()
-def refresh_source_radius_bank(teacher, feature_hook, source_loader, reliability_bank):
+def refresh_source_radius_bank(teacher, feature_hook, source_loader, reliability_bank, collect_neighbors=False):
     """Fit source prototypes and radii from source labels only."""
     device = next(teacher.parameters()).device
+    neighbor_features, neighbor_labels = [], []
     reliability_bank.begin_source_refresh()
     teacher.eval()
     for imgs, targets in source_loader:
         teacher(imgs.to(device, non_blocking=True), None, None, mode='test', task='source')
         reliability_bank.accumulate_source(feature_hook.output, targets.to(device))
+        if collect_neighbors:
+            neighbor_features.append(feature_hook.output.detach().cpu().numpy())
+            neighbor_labels.append(targets.cpu().numpy())
     reliability_bank.finalize_source()
+    if collect_neighbors:
+        return np.concatenate(neighbor_features), np.concatenate(neighbor_labels)
+    return None
 
 
 def run_training():
@@ -630,12 +645,19 @@ def run_training():
                              'support_before', 'support_after', 'local_margin',
                              'nearest_similarity', 'mean_similarity', 'largest_group_fraction',
                              'groups_before', 'neighbors_before']
+        if args.class_neighbor_diagnostics:
+            for domain in ('source', 'target'):
+                diagnostic_fields += [domain + '_' + key for key in
+                                      ('ready', 'assigned', 'competitor', 'competitor_score', 'margin')]
+                diagnostic_fields += [domain + '_score_' + str(c) for c in range(class_num)]
+                diagnostic_fields += [domain + '_count_' + str(c) for c in range(class_num)]
         if args.neighbor_diagnostic_labels:
             diagnostic_fields += ['diagnostic_true_label', 'pseudo_correct']
         diagnostic_writer = csv.DictWriter(diagnostic_file, fieldnames=diagnostic_fields)
         diagnostic_writer.writeheader()
         print('Neighbor shadow audit CSV:', diagnostic_path)
         print('Privileged diagnostic labels:', args.neighbor_diagnostic_labels)
+    source_neighbor_data = None
     best_target_val_acc = -1.0
     global_step = 0
 
@@ -654,8 +676,9 @@ def run_training():
                np.array2string(class_mean.numpy(), precision=4),
                global_mean, threshold_center, enable_radius_rescue))
         if i % args.source_refresh_interval == 0:
-            refresh_source_radius_bank(
+            source_neighbor_data = refresh_source_radius_bank(
                 teacher, teacher_feature_hook, prototype_loader_source, reliability_bank,
+                collect_neighbors=args.class_neighbor_diagnostics,
             )
             print('[Target Epoch %d] Source_Count: %d Class_Radii: %s Classes_Ready: %s' %
                   (i, reliability_bank.source_count.item(),
@@ -733,6 +756,19 @@ def run_training():
                             query_ids, teacher_mean_features[query_mask].cpu().numpy(),
                             pseudo_targets[query_mask].cpu().numpy(), return_details=True,
                         )
+                        class_results = {}
+                        if args.class_neighbor_diagnostics:
+                            query_features = teacher_mean_features[query_mask].cpu().numpy()
+                            query_labels = pseudo_targets[query_mask].cpu().numpy()
+                            class_results['source'] = class_neighbor_scores(
+                                query_features, query_labels, *source_neighbor_data,
+                                k=args.class_neighbor_k, num_classes=class_num)
+                            snap = neighbor_gate.snapshot
+                            bank_ids = np.flatnonzero(snap['seen'][:, -1] & snap['anchors'][:, -1])
+                            class_results['target'] = class_neighbor_scores(
+                                query_features, query_labels, snap['features'][bank_ids],
+                                snap['labels'][bank_ids, -1], k=args.class_neighbor_k,
+                                num_classes=class_num, query_ids=query_ids, bank_ids=bank_ids)
                         neighbor_ok = torch.zeros_like(rescue_mask)
                         neighbor_ok[query_mask] = torch.as_tensor(ok, device=device)
                         neighbor_candidates += len(ok)
@@ -753,6 +789,12 @@ def run_training():
                                               would_pass=int(ok[q]), remaining_neighbors=int(remaining[q]),
                                               remaining_groups=int(groups[q]))
                                 record.update({key: float(value[q]) for key, value in details.items()})
+                                for domain, result in class_results.items():
+                                    record.update({domain + '_' + key: result[key][q].item()
+                                                   for key in ('ready', 'assigned', 'competitor', 'competitor_score', 'margin')})
+                                    for c in range(class_num):
+                                        record[domain + '_score_' + str(c)] = float(result['scores'][q, c])
+                                        record[domain + '_count_' + str(c)] = int(result['counts'][q, c])
                                 if args.neighbor_diagnostic_labels:
                                     truth = int(diagnostic_targets[b].item())
                                     record.update(diagnostic_true_label=truth,
