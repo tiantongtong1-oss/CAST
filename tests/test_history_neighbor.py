@@ -41,6 +41,15 @@ class GateTests(unittest.TestCase):
         bank.begin_epoch(2)
         self.assertFalse(bank.query([0], [[1., 0.]], [0])[0][0])
 
+    def test_diagnostic_details(self):
+        bank = self.make(); bank.begin_epoch(2)
+        result = bank.query([0], [[1., 0.]], [0], return_details=True)
+        self.assertEqual(len(result), 5)
+        details = result[-1]
+        self.assertAlmostEqual(details['support_before'][0], 5/6, places=6)
+        self.assertAlmostEqual(details['support_after'][0], 2/3, places=6)
+        self.assertAlmostEqual(details['local_margin'][0], 0)
+
     def test_invalid_and_duplicate(self):
         with self.assertRaises(ValueError):
             HistoryNeighborGate(2, 2, support=2)

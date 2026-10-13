@@ -1,6 +1,7 @@
 import warnings
 warnings.filterwarnings('ignore')
 import argparse
+import csv
 import os
 import random
 import numpy as np
@@ -110,6 +111,10 @@ def parse_args(argv=None):
     parser.add_argument('--device', choices=['cuda', 'cpu'], default='cuda',
                         help='CPU is supported for smoke tests; CUDA recommended for FER training')
 
+    parser.add_argument('--neighbor_diagnostics', action='store_true',
+                        help='shadow neighbor audit; preserves baseline radius rescue')
+    parser.add_argument('--neighbor_diagnostic_labels', action='store_true',
+                        help='privileged train-label audit only; labels never used for selection/loss')
     parser.add_argument('--history_neighbor', action='store_true',
                         help='require history-group-excluded neighbor support for radius rescue')
     parser.add_argument('--neighbor_history_window', type=int, default=4)
@@ -124,7 +129,11 @@ def parse_args(argv=None):
         parser.error('neighbor sizes must be positive')
     if not 0 <= args.neighbor_support <= 1 or not -1 <= args.neighbor_min_similarity <= 1:
         parser.error('invalid neighbor support/similarity')
-    if args.history_neighbor and not args.role_separation:
+    if args.history_neighbor and args.neighbor_diagnostics:
+        parser.error('choose filtering or shadow diagnostics, not both')
+    if args.neighbor_diagnostic_labels and not args.neighbor_diagnostics:
+        parser.error('diagnostic labels require shadow mode')
+    if (args.history_neighbor or args.neighbor_diagnostics) and not args.role_separation:
         parser.error('--history_neighbor requires role separation')
     if not np.isfinite(args.source_radius_quantile) or not 0 < args.source_radius_quantile <= 1:
         parser.error('source_radius_quantile must be finite and in (0, 1]')
@@ -607,11 +616,26 @@ def run_training():
         window=args.neighbor_history_window, k=args.neighbor_k,
         support=args.neighbor_support, min_remaining=args.neighbor_min_remaining,
         min_groups=args.neighbor_min_groups, min_similarity=args.neighbor_min_similarity,
-    ) if args.history_neighbor else None)
+    ) if (args.history_neighbor or args.neighbor_diagnostics) else None)
     print('history_neighbor:%s window:%d k:%d support:%.3f min_remaining:%d min_groups:%d min_similarity:%.3f' %
           (args.history_neighbor, args.neighbor_history_window, args.neighbor_k,
            args.neighbor_support, args.neighbor_min_remaining,
            args.neighbor_min_groups, args.neighbor_min_similarity))
+    diagnostic_file = diagnostic_writer = None
+    if args.neighbor_diagnostics:
+        diagnostic_path = os.path.join(model_path, args.run_name + '_neighbor_diagnostics.csv')
+        diagnostic_file = open(diagnostic_path, 'w', newline='', encoding='utf-8')
+        diagnostic_fields = ['epoch', 'sample_id', 'pseudo_label', 'confidence', 'source_distance',
+                             'would_pass', 'remaining_neighbors', 'remaining_groups',
+                             'support_before', 'support_after', 'local_margin',
+                             'nearest_similarity', 'mean_similarity', 'largest_group_fraction',
+                             'groups_before', 'neighbors_before']
+        if args.neighbor_diagnostic_labels:
+            diagnostic_fields += ['diagnostic_true_label', 'pseudo_correct']
+        diagnostic_writer = csv.DictWriter(diagnostic_file, fieldnames=diagnostic_fields)
+        diagnostic_writer.writeheader()
+        print('Neighbor shadow audit CSV:', diagnostic_path)
+        print('Privileged diagnostic labels:', args.neighbor_diagnostic_labels)
     best_target_val_acc = -1.0
     global_step = 0
 
@@ -664,7 +688,7 @@ def run_training():
         anchor_num = 0
         prototype_update_num = immediate_update_num = 0
 
-        for weak1, weak2, strong, _, sample_ids in train_loader_target:
+        for weak1, weak2, strong, diagnostic_targets, sample_ids in train_loader_target:
             try:
                 source_imgs, source_targets = next(source_train_iter)
             except StopIteration:
@@ -705,9 +729,9 @@ def run_training():
                     if neighbor_gate is not None:
                         query_mask = rescue_mask.clone()
                         query_ids = sample_ids[query_mask.cpu()].numpy()
-                        ok, scores, remaining, groups = neighbor_gate.query(
+                        ok, scores, remaining, groups, details = neighbor_gate.query(
                             query_ids, teacher_mean_features[query_mask].cpu().numpy(),
-                            pseudo_targets[query_mask].cpu().numpy(),
+                            pseudo_targets[query_mask].cpu().numpy(), return_details=True,
                         )
                         neighbor_ok = torch.zeros_like(rescue_mask)
                         neighbor_ok[query_mask] = torch.as_tensor(ok, device=device)
@@ -715,7 +739,27 @@ def run_training():
                         neighbor_pass += int(ok.sum())
                         neighbor_evidence += int(((remaining >= args.neighbor_min_remaining)
                                                   & (groups >= args.neighbor_min_groups)).sum())
-                        rescue_mask &= neighbor_ok
+                        if diagnostic_writer is not None:
+                            confidences = torch.minimum(F.softmax(logits1, dim=1).max(1).values,
+                                                        F.softmax(logits2, dim=1).max(1).values)
+                            distances = reliability_bank.distribution_distance(
+                                teacher_mean_features, pseudo_targets)
+                            selected = query_mask.nonzero().flatten().tolist()
+                            for q, b in enumerate(selected):
+                                record = dict(epoch=i, sample_id=int(query_ids[q]),
+                                              pseudo_label=int(pseudo_targets[b].item()),
+                                              confidence=float(confidences[b].item()),
+                                              source_distance=float(distances[b].item()),
+                                              would_pass=int(ok[q]), remaining_neighbors=int(remaining[q]),
+                                              remaining_groups=int(groups[q]))
+                                record.update({key: float(value[q]) for key, value in details.items()})
+                                if args.neighbor_diagnostic_labels:
+                                    truth = int(diagnostic_targets[b].item())
+                                    record.update(diagnostic_true_label=truth,
+                                                  pseudo_correct=int(truth == record['pseudo_label']))
+                                diagnostic_writer.writerow(record)
+                        if args.history_neighbor:
+                            rescue_mask &= neighbor_ok
                 # OR rescue: high-confidence samples do not need a radius pass to learn.
                 final_mask = confidence_mask | rescue_mask
                 # Learning is distinct from updating shared class knowledge.
@@ -837,6 +881,8 @@ def run_training():
             train_loss3 += weight_loss.item()
             train_proto_loss += proto_loss.item()
             batch_count += 1
+        if diagnostic_file is not None:
+            diagnostic_file.flush()
         if neighbor_gate is not None:
             print('[Target Epoch %d] Neighbor_Candidates: %d Evidence_Ready: %d Neighbor_Pass: %d' %
                   (i, neighbor_candidates, neighbor_evidence, neighbor_pass))
@@ -904,6 +950,8 @@ def run_training():
         model.load_state_dict(checkpoint['model'])
         selected_val_acc = best_source_val_acc
 
+    if diagnostic_file is not None:
+        diagnostic_file.close()
     teacher_feature_hook.close()
     student_feature_hook.close()
 

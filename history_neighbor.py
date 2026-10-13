@@ -43,7 +43,7 @@ class HistoryNeighborGate:
         bins = np.where(delta < -0.05, -1, np.where(delta > 0.05, 1, 0))
         return tuple(np.concatenate((labels, accepted.astype(int), anchors.astype(int), bins)).tolist())
 
-    def query(self, ids, features, labels):
+    def query(self, ids, features, labels, return_details=False):
         ids, features, labels = np.asarray(ids), np.asarray(features), np.asarray(labels)
         snap = self.snapshot
         n = len(ids)
@@ -51,6 +51,9 @@ class HistoryNeighborGate:
         scores = np.zeros(n, np.float32)
         remaining = np.zeros(n, np.int64)
         group_counts = np.zeros(n, np.int64)
+        details = {key: np.full(n, np.nan, np.float32) for key in
+                   ('support_before', 'support_after', 'local_margin', 'nearest_similarity',
+                    'mean_similarity', 'largest_group_fraction', 'groups_before', 'neighbors_before')}
         bank_ids = np.flatnonzero(snap['seen'].all(1) & snap['anchors'][:, -1])
         for row, sid in enumerate(ids):
             if not snap['seen'][sid].all() or not np.isfinite(features[row]).all():
@@ -71,6 +74,19 @@ class HistoryNeighborGate:
                 groups.setdefault(sig, []).append((int(bid), float(sim)))
             if not groups:
                 continue
+            neighbor_labels = snap['labels'][candidates, -1]
+            details['support_before'][row] = np.mean(neighbor_labels == labels[row])
+            label_scores = {int(c): float(sims[neighbor_labels == c].mean())
+                            for c in np.unique(neighbor_labels)}
+            assigned = label_scores.get(int(labels[row]))
+            competitors = [v for c, v in label_scores.items() if c != labels[row]]
+            if assigned is not None and competitors:
+                details['local_margin'][row] = assigned - max(competitors)
+            details['nearest_similarity'][row] = sims.max()
+            details['mean_similarity'][row] = sims.mean()
+            details['largest_group_fraction'][row] = max(map(len, groups.values())) / len(candidates)
+            details['groups_before'][row] = len(groups)
+            details['neighbors_before'][row] = len(candidates)
             query_sig = self.signature(*(snap[key][sid] for key in
                                         ('labels', 'accepted', 'anchors', 'confidence')))
             # Remove the closest history group, even when no exact match exists.
@@ -78,6 +94,10 @@ class HistoryNeighborGate:
             del groups[excluded]
             remaining[row] = sum(len(g) for g in groups.values())
             group_counts[row] = len(groups)
+            votes = [np.mean([snap['labels'][bid, -1] == labels[row] for bid, _ in g])
+                     for g in groups.values()]
+            if votes:
+                details['support_after'][row] = np.mean(votes)
             if remaining[row] < self.min_remaining or len(groups) < self.min_groups:
                 continue
             # One contribution per history group; duplicates do not increase its weight.
@@ -85,7 +105,8 @@ class HistoryNeighborGate:
                      for g in groups.values()]
             scores[row] = np.mean(votes)
             ok[row] = scores[row] >= self.support
-        return ok, scores, remaining, group_counts
+        result = (ok, scores, remaining, group_counts)
+        return (*result, details) if return_details else result
 
     def observe(self, ids, features, labels, accepted, anchors, confidence):
         ids = np.asarray(ids, dtype=np.int64)
