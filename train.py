@@ -14,6 +14,7 @@ from ema_utils import create_ema_teacher, select_dual_view_pseudo_labels, update
 from prototype_utils import FeatureHook, PrototypeBank, prototype_weight_for_epoch
 from source_prototype_radius import SourcePrototypeRadiusBank
 from reliability_roles import ReliabilityRoles
+from neighbor_structure import StructureBank, structure_loss
 import image_utils as util
 from randaugment import RandAugmentMC
 # 总训练入口与调度器。串起数据、Source 预训练、EMA Teacher、
@@ -109,7 +110,26 @@ def parse_args(argv=None):
     parser.add_argument('--device', choices=['cuda', 'cpu'], default='cuda',
                         help='CPU is supported for smoke tests; CUDA recommended for FER training')
 
+    parser.add_argument('--neighbor_structure', action='store_true')
+    parser.add_argument('--structure_weight', type=float, default=0.05)
+    parser.add_argument('--structure_k', type=int, default=10)
+    parser.add_argument('--structure_min_neighbors', type=int, default=3)
+    parser.add_argument('--structure_similarity', type=float, default=0.5)
+    parser.add_argument('--structure_temperature', type=float, default=0.2)
+    parser.add_argument('--structure_max_js', type=float, default=0.05)
+    parser.add_argument('--structure_capacity', type=int, default=3000)
+    parser.add_argument('--structure_warmup', type=int, default=3)
+    parser.add_argument('--structure_ramp', type=int, default=5)
     args = parser.parse_args(argv)
+    if args.neighbor_structure and (not args.role_separation or args.immediate_prototype_update):
+        parser.error('neighbor structure requires role separation and anchor-only updates')
+    if not np.isfinite(args.structure_weight) or args.structure_weight<0 or min(args.structure_warmup,args.structure_ramp)<0:
+        parser.error('invalid structure weight/warmup/ramp')
+    try:
+        StructureBank(k=args.structure_k,min_neighbors=args.structure_min_neighbors,
+            similarity=args.structure_similarity,temperature=args.structure_temperature,
+            max_js=args.structure_max_js,capacity=args.structure_capacity)
+    except ValueError as exc: parser.error(str(exc))
     if not np.isfinite(args.source_radius_quantile) or not 0 < args.source_radius_quantile <= 1:
         parser.error('source_radius_quantile must be finite and in (0, 1]')
     if args.source_refresh_interval < 1:
@@ -299,7 +319,7 @@ def evaluate(model, loader, criterion, num_samples, epoch, split_name):
 
 
 def save_checkpoint(path, model, optimizer, scheduler, epoch, best_val_acc, args,
-                    teacher=None, prototype_bank=None, reliability_bank=None, role_tracker=None):
+                    teacher=None, prototype_bank=None, reliability_bank=None, role_tracker=None, structure_bank=None):
     # 保存 Student、optimizer、scheduler、epoch 等；
     # 目标阶段还可保存 EMA Teacher 和 PrototypeBank
     state = {
@@ -318,6 +338,8 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch, best_val_acc, args
         state['reliability_bank'] = reliability_bank.state_dict()
     if role_tracker is not None:
         state['role_tracker'] = role_tracker.state_dict()
+    if structure_bank is not None:
+        state['structure_bank'] = {'ids':structure_bank.ids, 'features':structure_bank.features}
     torch.save(state, path)
 
 
@@ -584,10 +606,24 @@ def run_training():
     role_tracker = (ReliabilityRoles(len(target_train), args.promotion_epochs).to(device)
                     if args.role_separation else None)
 
+    structure_bank = (StructureBank(k=args.structure_k,min_neighbors=args.structure_min_neighbors,
+        similarity=args.structure_similarity,temperature=args.structure_temperature,
+        max_js=args.structure_max_js,capacity=args.structure_capacity)
+        if args.neighbor_structure else None)
+    previous_structure_anchors = None
+    print('neighbor_structure:%s weight:%s temperature:%s max_js:%s' %
+          (args.neighbor_structure,args.structure_weight,args.structure_temperature,args.structure_max_js))
     best_target_val_acc = -1.0
     global_step = 0
 
     for i in range(args.epochs):
+        if structure_bank is not None and previous_structure_anchors is not None:
+            structure_bank.refresh(*previous_structure_anchors)
+        structure_ids, structure_features = [], []
+        structure_eligible = structure_used = 0
+        train_structure_loss = 0.0
+        structure_scale = prototype_weight_for_epoch(i,args.structure_weight,
+                                                     args.structure_warmup,args.structure_ramp)
         thresholds, class_mean, global_mean, threshold_center = calculate_target_thresholds(
             teacher, threshold_loader_target, class_num, args.threshold_base,
             args.threshold_beta, args.threshold_margin, args.threshold_min, args.threshold_max,
@@ -697,6 +733,16 @@ def run_training():
                         teacher_mean_features, pseudo_targets, con_idx
                     )
                 )
+            structure_result = ([],[],[],[])
+            if structure_bank is not None:
+                if structure_scale > 0:
+                    structure_result = structure_bank.query(sample_ids.cpu().numpy(),
+                        teacher_features1.cpu().numpy(),teacher_features2.cpu().numpy(),final_mask.cpu().numpy())
+                structure_eligible += int(final_mask.sum().item())
+                structure_used += len(structure_result[0])
+                if anchor_mask.any():
+                    structure_ids.append(sample_ids[anchor_mask.cpu()].cpu().numpy())
+                    structure_features.append(teacher_mean_features[anchor_mask].cpu().numpy())
             # 统计当前epoch中不同阶段一共接纳了多少目标样本
             agreement_num += agree_count
             radius_pass_num += int(region_ok.sum().item())
@@ -760,12 +806,15 @@ def run_training():
                 con_idx,
                 temperature=args.proto_temperature,
             )
+            relation_loss = (structure_loss(target_student_features,structure_result,args.structure_temperature)
+                             if structure_bank is not None and structure_scale>0 else target_student_features.sum()*0.0)
             # 总损失
             loss = (
                 cls_loss * args.w1
                 + aff_loss * args.w2
                 + weight_loss * args.w3
                 + proto_loss * current_proto_weight
+                + relation_loss * structure_scale
             )
             #反向传播
             loss.backward()
@@ -783,7 +832,14 @@ def run_training():
             train_loss2 += aff_loss.item()
             train_loss3 += weight_loss.item()
             train_proto_loss += proto_loss.item()
+            train_structure_loss += relation_loss.item()
             batch_count += 1
+        if structure_bank is not None:
+            previous_structure_anchors = ((np.concatenate(structure_ids),np.concatenate(structure_features))
+                if structure_ids else (np.empty(0,dtype=np.int64),np.empty((0,model.fc.in_features),dtype=np.float32)))
+            print('[Target Epoch %d] Neighbor_Structure: bank=%d eligible=%d used=%d loss=%.6f weight=%.4f' %
+                  (i,len(structure_bank.ids),structure_eligible,structure_used,
+                   train_structure_loss/max(batch_count,1),structure_scale))
         # 更新学习率
         scheduler.step()
         # 求均值
@@ -835,7 +891,7 @@ def run_training():
                 best_target_val_acc, args, teacher=teacher,
                 prototype_bank=prototype_bank,
                 reliability_bank=reliability_bank,
-                role_tracker=role_tracker,
+                role_tracker=role_tracker, structure_bank=structure_bank,
             )
             print('best target-stage validation accuracy %.4f' % best_target_val_acc)
 
