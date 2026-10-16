@@ -120,8 +120,9 @@ class DSTest(unittest.TestCase):
         exec(compile(ast.Module(body=selected, type_ignores=[]), '<args>', 'exec'), namespace)
         args = namespace['parse_args'](['--ds_neighbor'])
         self.assertTrue(args.ds_neighbor)
+        self.assertTrue(namespace['parse_args'](['--ds_neighbor', '--no_role_separation']).ds_neighbor)
         with self.assertRaises(SystemExit):
-            namespace['parse_args'](['--ds_neighbor', '--no_role_separation'])
+            namespace['parse_args'](['--ds_source_weight', '0.5'])
 
     def test_wiring_scope_and_no_truth(self):
         s = Path('train.py').read_text()
@@ -130,7 +131,7 @@ class DSTest(unittest.TestCase):
         self.assertEqual(s.count('n = max(ds_totals[0], 1)'), 1)
         self.assertGreater(s.index('n = max(ds_totals[0], 1)'), s.index('for i in range(args.epochs):'))
         tree = ast.parse(s)
-        refresh = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'refresh_ds_banks')
+        refresh = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'refresh_ds_source_bank')
         reads = [n for n in ast.walk(refresh) if isinstance(n, ast.Name)
                  and n.id == '_ignored_target_truth' and isinstance(n.ctx, ast.Load)]
         self.assertFalse(reads)
@@ -138,3 +139,4 @@ class DSTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

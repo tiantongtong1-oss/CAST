@@ -137,3 +137,28 @@ def combine_domains(source, target, pseudo_labels, config):
     passed &= (uncertainty <= config.uncertainty) & (cross <= config.conflict)
     return dict(pass_mask=passed, available=available, support=support, margin=margin,
                 uncertainty=uncertainty, cross_conflict=cross, mass=mass)
+
+
+
+def audit_source(source, pseudo_labels, config):
+    """Audit rescue candidates using source evidence only, without a domain pool.
+
+    EvidenceBank handles minimum neighbor count and within-source conflict.
+    Keep explicit conflict checking here as well for callers with saved evidence.
+    """
+    mass = source['mass']
+    labels = np.asarray(pseudo_labels, dtype=np.int64)
+    if mass.ndim != 2 or mass.shape[1] < 2 or labels.shape != (len(mass),):
+        raise ValueError('source mass and pseudo-label shapes must match')
+    if ((labels < 0) | (labels >= mass.shape[1])).any():
+        raise ValueError('invalid pseudo-label')
+    support = mass[np.arange(len(labels)), labels]
+    competitors = mass.copy()
+    competitors[np.arange(len(labels)), labels] = -np.inf
+    margin = support - competitors.max(1)
+    uncertainty = source['uncertainty']
+    available = source['available']
+    passed = available & (support >= config.support) & (margin >= config.margin)
+    passed &= (uncertainty <= config.uncertainty) & (source['conflict'] <= config.conflict)
+    return dict(pass_mask=passed, available=available, support=support, margin=margin,
+                uncertainty=uncertainty, mass=mass)
