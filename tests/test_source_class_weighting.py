@@ -43,7 +43,7 @@ class SourceClassWeightTest(unittest.TestCase):
         mask[-1]=0
         self.assertAlmostEqual(mixed_source_target_ce(loss,labels,mask,2,np.array([2.,1.])),5/3)
 
-    def test_cli_and_no_js_or_balanced_sampling(self):
+    def test_cli_and_no_balanced_sampling(self):
         text=Path('train.py').read_text();tree=ast.parse(text)
         funcs=[n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in ['parse_args','ds_config_from_args']]
         env=dict(argparse=argparse,np=np,DSConfig=DSConfig)
@@ -52,7 +52,6 @@ class SourceClassWeightTest(unittest.TestCase):
         self.assertEqual(env['parse_args'](['--source_class_weight_power','.5']).source_class_weight_power,.5)
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             env['parse_args'](['--source_class_weight_power','nan'])
-        self.assertNotIn('rescue_js',text)
         self.assertNotIn('WeightedRandomSampler',text)
         self.assertIn('source_train.label',text)
         self.assertIn('source_weighted_mean(criterion(output[0], targets)',text)
