@@ -16,6 +16,7 @@ from prototype_utils import FeatureHook, PrototypeBank, prototype_weight_for_epo
 from source_prototype_radius import SourcePrototypeRadiusBank
 from reliability_roles import ReliabilityRoles
 from dual_domain_ds import DSConfig, EvidenceBank, audit_source
+from rescue_js import rescue_js_gate
 import image_utils as util
 from randaugment import RandAugmentMC
 # 总训练入口与调度器。串起数据、Source 预训练、EMA Teacher、
@@ -111,6 +112,9 @@ def parse_args(argv=None):
     parser.add_argument('--device', choices=['cuda', 'cpu'], default='cuda',
                         help='CPU is supported for smoke tests; CUDA recommended for FER training')
 
+    parser.add_argument('--rescue_js_threshold', type=float, default=None,
+                        help='optional rescue-only JS divergence ceiling, natural logs; e.g. 0.01')
+
     parser.add_argument('--ds_neighbor', action='store_true',
                         help='audit radius-rescue candidates with source-only DS evidence')
     parser.add_argument('--ds_k', type=int, default=20)
@@ -145,6 +149,8 @@ def parse_args(argv=None):
         parser.error('--promotion_epochs must be positive')
     if not args.run_name or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-' for c in args.run_name):
         parser.error('--run_name must contain only letters, digits, underscores or hyphens')
+    if args.rescue_js_threshold is not None and (not np.isfinite(args.rescue_js_threshold) or not 0 <= args.rescue_js_threshold <= np.log(2.0)):
+        parser.error('--rescue_js_threshold must be finite and in [0, ln(2)]')
     try:
         ds_config_from_args(args)
     except ValueError as error:
@@ -633,10 +639,12 @@ def run_training():
     ds_config = ds_config_from_args(args)
     print('DS_Neighbor: %s DS_Config: %s Scope: radius_rescue_only Evidence: source_only' %
           (args.ds_neighbor, ds_config))
+    print('Rescue_JS_Threshold: %s (natural-log JS; high-confidence route unchanged)' % args.rescue_js_threshold)
     ds_csv_path = os.path.join(model_path, args.run_name + '_ds_diagnostics.csv')
     ds_columns = ['epoch', 'sample_id', 'pseudo_label', 'source_count',
                   'source_available', 'source_support', 'source_unknown',
-                  'source_conflict', 'support', 'margin', 'unknown', 'accepted']
+                  'source_conflict', 'support', 'margin', 'unknown',
+                  'js_divergence', 'js_pass', 'ds_pass', 'accepted']
     if args.ds_neighbor:
         with open(ds_csv_path, 'w', newline='') as handle:
             csv.writer(handle).writerow(ds_columns)
@@ -650,6 +658,7 @@ def run_training():
                 teacher, teacher_feature_hook, prototype_loader_source, class_num)
             print('[Target Epoch %d] DS_Source_Refs: %d' % (i, len(ds_source.x)))
         ds_totals = np.zeros(7, dtype=np.float64)
+        js_totals = np.zeros(3, dtype=np.int64)
 
         thresholds, class_mean, global_mean, threshold_center = calculate_target_thresholds(
             teacher, threshold_loader_target, class_num, args.threshold_base,
@@ -731,9 +740,21 @@ def run_training():
                 region_ok = reliability_bank.in_distribution(
                     teacher_mean_features, pseudo_targets
                 )
+                # JS is observational for high-confidence samples: only rescue is gated.
+                js_values = np.full(len(pseudo_targets), np.nan)
+                js_mask = torch.ones_like(agreement_mask)
+                if args.rescue_js_threshold is not None:
+                    js_values, js_pass = rescue_js_gate(
+                        F.softmax(logits1, dim=1).cpu().numpy(),
+                        F.softmax(logits2, dim=1).cpu().numpy(),
+                        args.rescue_js_threshold)
+                    js_mask = torch.as_tensor(js_pass, device=device, dtype=torch.bool)
                 rescue_mask = torch.zeros_like(agreement_mask)
                 if enable_radius_rescue:
                     rescue_mask = rescue_candidates & region_ok
+                    # Keep DS auditing all radius candidates for a comparable CSV.
+                    js_totals[0] += int(rescue_mask.sum().item())
+                    js_totals[1] += int((rescue_mask & js_mask).sum().item())
                     if args.ds_neighbor and rescue_mask.any():
                         query_idx = torch.where(rescue_mask)[0]
                         queries = teacher_mean_features[query_idx].cpu().numpy()
@@ -741,7 +762,9 @@ def run_training():
                         source_ds = ds_source.evaluate(queries, query_ids, ds_config)
                         ds_result = audit_source(
                             source_ds, pseudo_targets[query_idx].cpu().numpy(), ds_config)
-                        rescue_mask[query_idx] = torch.as_tensor(ds_result['pass_mask'], device=device)
+                        ds_pass_tensor = torch.as_tensor(ds_result['pass_mask'], device=device)
+                        rescue_mask[query_idx] = ds_pass_tensor & js_mask[query_idx]
+                        js_totals[2] += int((ds_pass_tensor & ~js_mask[query_idx]).sum().item())
                         ds_totals += np.array([
                             len(query_idx), source_ds['available'].sum(),
                             ds_result['pass_mask'].sum(), ds_result['support'].sum(),
@@ -756,10 +779,15 @@ def run_training():
                                 source_ds['mass'][row, label], source_ds['uncertainty'][row],
                                 source_ds['conflict'][row], ds_result['support'][row],
                                 ds_result['margin'][row], ds_result['uncertainty'][row],
-                                bool(ds_result['pass_mask'][row])])
+                                float(js_values[int(query_idx[row])]) if args.rescue_js_threshold is not None else None,
+                                bool(js_mask[query_idx[row]].item()),
+                                bool(ds_result['pass_mask'][row]),
+                                bool(rescue_mask[query_idx[row]].item())])
                         with open(ds_csv_path, 'a', newline='') as handle:
                             csv.writer(handle).writerows(rows)
 
+
+                    rescue_mask &= js_mask
 
                 # OR rescue: high-confidence samples do not need a radius pass to learn.
                 final_mask = confidence_mask | rescue_mask
@@ -880,6 +908,9 @@ def run_training():
                   'DS_Passed: %d Mean_Support: %.4f Mean_Margin: %.4f '
                   'Mean_Unknown: %.4f Mean_Source_Conflict: %.4f' %
                   (i, *ds_totals[:3].astype(int), *(ds_totals[3:] / n)))
+        if args.rescue_js_threshold is not None:
+            print('[Target Epoch %d] JS_Radius_Candidates: %d JS_Passed: %d '
+                  'JS_Rejected_After_DS: %d' % (i, *js_totals))
         # 更新学习率
         scheduler.step()
         # 求均值
@@ -960,6 +991,7 @@ def run_training():
 
 if __name__ == '__main__':
     run_training()
+
 
 
 
