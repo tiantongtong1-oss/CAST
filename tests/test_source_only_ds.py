@@ -47,22 +47,8 @@ class SourceOnlyDSTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             audit_source(self.evidence([0, 0, 0]), [2], self.cfg)
 
-    def test_training_has_no_target_reference_dependency(self):
-        text = Path('train.py').read_text()
-        tree = ast.parse(text)
-        calls = {n.func.id for n in ast.walk(tree)
-                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
-        self.assertIn('audit_source', calls)
-        self.assertNotIn('combine_domains', calls)
-        self.assertNotIn('refresh_ds_banks', calls)
-        self.assertNotIn('target_ds_reference', text)
-        refresh = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
-                       and n.name == 'refresh_ds_source_bank')
-        self.assertEqual([a.arg for a in refresh.args.args],
-                         ['teacher', 'feature_hook', 'source_loader', 'classes'])
-        self.assertIn('final_mask = confidence_mask | rescue_mask', text)
-        self.assertIn('if args.immediate_prototype_update:', text)
 
 
 if __name__ == '__main__':
     unittest.main()
+

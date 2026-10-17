@@ -120,18 +120,17 @@ class DSTest(unittest.TestCase):
         exec(compile(ast.Module(body=selected, type_ignores=[]), '<args>', 'exec'), namespace)
         args = namespace['parse_args'](['--ds_neighbor'])
         self.assertTrue(args.ds_neighbor)
-        self.assertTrue(namespace['parse_args'](['--ds_neighbor', '--no_role_separation']).ds_neighbor)
         with self.assertRaises(SystemExit):
-            namespace['parse_args'](['--ds_source_weight', '0.5'])
+            namespace['parse_args'](['--ds_neighbor', '--no_role_separation'])
 
     def test_wiring_scope_and_no_truth(self):
         s = Path('train.py').read_text()
-        self.assertLess(s.index('rescue_mask = rescue_candidates & region_ok'), s.index('source_ds = ds_source.evaluate'))
-        self.assertLess(s.index('source_ds = ds_source.evaluate'), s.index('final_mask = confidence_mask | rescue_mask'))
+        self.assertLess(s.index('rescue_mask = rescue_candidates & region_ok'), s.index('target_ds = ds_target.evaluate'))
+        self.assertLess(s.index('target_ds = ds_target.evaluate'), s.index('final_mask = confidence_mask | rescue_mask'))
         self.assertEqual(s.count('n = max(ds_totals[0], 1)'), 1)
         self.assertGreater(s.index('n = max(ds_totals[0], 1)'), s.index('for i in range(args.epochs):'))
         tree = ast.parse(s)
-        refresh = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'refresh_ds_source_bank')
+        refresh = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'refresh_ds_target_bank')
         reads = [n for n in ast.walk(refresh) if isinstance(n, ast.Name)
                  and n.id == '_ignored_target_truth' and isinstance(n.ctx, ast.Load)]
         self.assertFalse(reads)
@@ -139,4 +138,5 @@ class DSTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
 

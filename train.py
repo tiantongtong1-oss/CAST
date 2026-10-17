@@ -15,7 +15,8 @@ from ema_utils import create_ema_teacher, select_dual_view_pseudo_labels, update
 from prototype_utils import FeatureHook, PrototypeBank, prototype_weight_for_epoch
 from source_prototype_radius import SourcePrototypeRadiusBank
 from reliability_roles import ReliabilityRoles
-from dual_domain_ds import DSConfig, EvidenceBank, audit_source
+from target_anchor_ds import anchor_reference_scores
+from dual_domain_ds import DSConfig, EvidenceBank, audit_target
 import image_utils as util
 from randaugment import RandAugmentMC
 # 总训练入口与调度器。串起数据、Source 预训练、EMA Teacher、
@@ -112,14 +113,14 @@ def parse_args(argv=None):
                         help='CPU is supported for smoke tests; CUDA recommended for FER training')
 
     parser.add_argument('--ds_neighbor', action='store_true',
-                        help='audit radius-rescue candidates with source-only DS evidence')
+                        help='audit radius-rescue candidates using only stable high-confidence target anchors')
     parser.add_argument('--ds_k', type=int, default=20)
     parser.add_argument('--ds_min_neighbors', type=int, default=3)
     parser.add_argument('--ds_max_distance', type=float, default=0.5,
                         help='maximum normalized-feature Euclidean neighbor distance')
     parser.add_argument('--ds_bandwidth', type=float, default=0.25)
     parser.add_argument('--ds_source_weight', type=float, default=1.0,
-                        help='compatibility option; source-only DS requires 1.0')
+                        help='legacy compatibility option; unused by target-anchor-only DS')
     parser.add_argument('--ds_support_threshold', type=float, default=0.6)
     parser.add_argument('--ds_margin_threshold', type=float, default=0.1)
     parser.add_argument('--ds_uncertainty_threshold', type=float, default=0.3)
@@ -149,8 +150,8 @@ def parse_args(argv=None):
         ds_config_from_args(args)
     except ValueError as error:
         parser.error(str(error))
-    if args.ds_source_weight != 1.0:
-        parser.error('source-only DS requires --ds_source_weight 1.0')
+    if args.ds_neighbor and not args.role_separation:
+        parser.error('target-anchor DS requires role separation')
     return args
 
 
@@ -403,18 +404,50 @@ def refresh_source_radius_bank(teacher, feature_hook, source_loader, reliability
 
 
 @torch.no_grad()
-def refresh_ds_source_bank(teacher, feature_hook, source_loader, classes):
-    """Freeze source-label evidence in current Teacher coordinates for this epoch."""
+def refresh_ds_target_bank(teacher, feature_hook, target_dataset, role_tracker,
+                           reliability_bank, thresholds, epoch, batch_size, workers, classes):
+    """Revalidate prior high-confidence anchors; return a frozen target-only bank.
+
+    The deterministic current view checks label, class threshold and source radius.
+    Consecutive dual-weak-view eligibility is recorded by observe during training.
+    Invalidated senders lose their streak and must qualify again from scratch.
+    """
     device = next(teacher.parameters()).device
     teacher.eval()
-    sx, sy = [], []
-    for imgs, labels in source_loader:
-        teacher(imgs.to(device), None, None, mode='test', task='source')
-        sx.append(feature_hook.output.detach().cpu().numpy())
-        sy.append(labels.numpy())
-    x, y = np.concatenate(sx), np.concatenate(sy)
-    # Source IDs and target query IDs are separate namespaces: do not exclude self.
-    return EvidenceBank(x, y, np.arange(len(y)), np.ones(len(y)), classes)
+    eligible = role_tracker.streak >= role_tracker.promotion_epochs
+    eligible &= role_tracker.last_epoch.eq(epoch - 1)
+    ids = torch.where(eligible)[0].cpu()
+    tx, ty, ti, tq = [], [], [], []
+    loader = torch.utils.data.DataLoader(
+        torch.utils.data.Subset(target_dataset, ids.tolist()),
+        batch_size=batch_size, shuffle=False, num_workers=workers, pin_memory=True)
+    revoked = 0
+    for imgs, _ignored_target_truth, sample_ids in loader:
+        logits, _ = teacher(imgs.to(device), None, None, mode='test', task='target')
+        features = feature_hook.output.detach()
+        confidence, labels = logits.softmax(1).max(1)
+        region_ok = reliability_bank.in_distribution(features, labels)
+        history_ids = sample_ids.to(role_tracker.labels.device)
+        scores = anchor_reference_scores(
+            labels.cpu().numpy(), confidence.cpu().numpy(), region_ok.cpu().numpy(),
+            role_tracker.labels[history_ids].cpu().numpy(),
+            role_tracker.quality[history_ids].cpu().numpy(), thresholds.cpu().numpy())
+        keep = torch.as_tensor(scores > 0, device=device)
+        invalid_ids = history_ids[~keep.to(history_ids.device)]
+        revoked += int(invalid_ids.numel())
+        role_tracker.streak[invalid_ids] = 0
+        role_tracker.quality[invalid_ids] = 0
+        tx.append(features[keep].cpu().numpy())
+        ty.append(labels[keep].cpu().numpy())
+        ti.append(sample_ids[keep.cpu()].numpy())
+        tq.append(scores[scores > 0])
+    dim = reliability_bank.feature_dim
+    bank = EvidenceBank(
+        np.concatenate(tx) if tx else np.empty((0, dim)),
+        np.concatenate(ty) if ty else np.empty(0, dtype=np.int64),
+        np.concatenate(ti) if ti else np.empty(0, dtype=np.int64),
+        np.concatenate(tq) if tq else np.empty(0), classes)
+    return bank, revoked
 
 
 def run_training():
@@ -488,6 +521,12 @@ def run_training():
         args.target_path, phase='train', transform=weak_transform,
         strong_transform=None, basic_aug=False
     )
+    if args.ds_neighbor:
+        target_ds_reference = FER(
+            args.target_path, phase='train', transform=test_transform,
+            strong_transform=None, basic_aug=False, return_index=True)
+        if target_ds_reference.file_paths != target_train.file_paths:
+            raise RuntimeError('DS reference and training sample IDs do not align')
     target_val = FER(
         args.target_path, phase='val', transform=test_transform,
         strong_transform=None
@@ -631,12 +670,12 @@ def run_training():
                     if args.role_separation else None)
 
     ds_config = ds_config_from_args(args)
-    print('DS_Neighbor: %s DS_Config: %s Scope: radius_rescue_only Evidence: source_only' %
+    print('DS_Neighbor: %s DS_Config: %s Scope: radius_rescue_only Evidence: target_anchor_only Anchor_Eligibility: high_confidence_and_source_radius' %
           (args.ds_neighbor, ds_config))
     ds_csv_path = os.path.join(model_path, args.run_name + '_ds_diagnostics.csv')
-    ds_columns = ['epoch', 'sample_id', 'pseudo_label', 'source_count',
-                  'source_available', 'source_support', 'source_unknown',
-                  'source_conflict', 'support', 'margin', 'unknown', 'accepted']
+    ds_columns = ['epoch', 'sample_id', 'pseudo_label', 'target_count',
+                  'target_available', 'target_support', 'target_unknown',
+                  'target_conflict', 'support', 'margin', 'unknown', 'accepted']
     if args.ds_neighbor:
         with open(ds_csv_path, 'w', newline='') as handle:
             csv.writer(handle).writerow(ds_columns)
@@ -645,10 +684,6 @@ def run_training():
     global_step = 0
 
     for i in range(args.epochs):
-        if args.ds_neighbor:
-            ds_source = refresh_ds_source_bank(
-                teacher, teacher_feature_hook, prototype_loader_source, class_num)
-            print('[Target Epoch %d] DS_Source_Refs: %d' % (i, len(ds_source.x)))
         ds_totals = np.zeros(7, dtype=np.float64)
 
         thresholds, class_mean, global_mean, threshold_center = calculate_target_thresholds(
@@ -670,6 +705,12 @@ def run_training():
                    np.array2string(reliability_bank.class_radii.cpu().numpy(), precision=8),
                    reliability_bank.distribution_initialized.cpu().tolist()))
             log_source_prototypes(reliability_bank)
+        if args.ds_neighbor:
+            ds_target, revoked = refresh_ds_target_bank(
+                teacher, teacher_feature_hook, target_ds_reference, role_tracker,
+                reliability_bank, thresholds, i, test_batch, args.workers, class_num)
+            print('[Target Epoch %d] DS_Target_Anchor_Refs: %d DS_Refresh_Revoked: %d' %
+                  (i, len(ds_target.x), revoked))
         current_proto_weight = prototype_weight_for_epoch(
             i, args.proto_weight, args.proto_warmup_epochs, args.proto_ramp_epochs
         )
@@ -738,23 +779,23 @@ def run_training():
                         query_idx = torch.where(rescue_mask)[0]
                         queries = teacher_mean_features[query_idx].cpu().numpy()
                         query_ids = sample_ids[query_idx.cpu()].cpu().numpy()
-                        source_ds = ds_source.evaluate(queries, query_ids, ds_config)
-                        ds_result = audit_source(
-                            source_ds, pseudo_targets[query_idx].cpu().numpy(), ds_config)
+                        target_ds = ds_target.evaluate(queries, query_ids, ds_config, exclude_self=True)
+                        ds_result = audit_target(
+                            target_ds, pseudo_targets[query_idx].cpu().numpy(), ds_config)
                         rescue_mask[query_idx] = torch.as_tensor(ds_result['pass_mask'], device=device)
                         ds_totals += np.array([
-                            len(query_idx), source_ds['available'].sum(),
+                            len(query_idx), target_ds['available'].sum(),
                             ds_result['pass_mask'].sum(), ds_result['support'].sum(),
                             ds_result['margin'].sum(), ds_result['uncertainty'].sum(),
-                            source_ds['conflict'].sum()])
+                            target_ds['conflict'].sum()])
                         query_labels = pseudo_targets[query_idx].cpu().numpy()
                         rows = []
                         for row, label in enumerate(query_labels):
                             rows.append([
                                 i, int(query_ids[row]), int(label),
-                                int(source_ds['count'][row]), bool(source_ds['available'][row]),
-                                source_ds['mass'][row, label], source_ds['uncertainty'][row],
-                                source_ds['conflict'][row], ds_result['support'][row],
+                                int(target_ds['count'][row]), bool(target_ds['available'][row]),
+                                target_ds['mass'][row, label], target_ds['uncertainty'][row],
+                                target_ds['conflict'][row], ds_result['support'][row],
                                 ds_result['margin'][row], ds_result['uncertainty'][row],
                                 bool(ds_result['pass_mask'][row])])
                         with open(ds_csv_path, 'a', newline='') as handle:
@@ -769,7 +810,7 @@ def run_training():
                     conf1 = F.softmax(logits1, dim=1).max(dim=1).values
                     conf2 = F.softmax(logits2, dim=1).max(dim=1).values
                     anchor_mask = role_tracker.observe(
-                        sample_ids, pseudo_targets, final_mask & region_ok,
+                        sample_ids, pseudo_targets, confidence_mask & region_ok,
                         torch.minimum(conf1, conf2), epoch=i,
                     )
                 else:
@@ -876,9 +917,9 @@ def run_training():
             batch_count += 1
         if args.ds_neighbor:
             n = max(ds_totals[0], 1)
-            print('[Target Epoch %d] DS_Audited: %d Source_Available: %d '
+            print('[Target Epoch %d] DS_Audited: %d Target_Available: %d '
                   'DS_Passed: %d Mean_Support: %.4f Mean_Margin: %.4f '
-                  'Mean_Unknown: %.4f Mean_Source_Conflict: %.4f' %
+                  'Mean_Unknown: %.4f Mean_Target_Conflict: %.4f' %
                   (i, *ds_totals[:3].astype(int), *(ds_totals[3:] / n)))
         # 更新学习率
         scheduler.step()
@@ -960,6 +1001,7 @@ def run_training():
 
 if __name__ == '__main__':
     run_training()
+
 
 
 

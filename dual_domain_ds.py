@@ -140,8 +140,8 @@ def combine_domains(source, target, pseudo_labels, config):
 
 
 
-def audit_source(source, pseudo_labels, config):
-    """Audit rescue candidates using source evidence only, without a domain pool.
+def audit_single_domain(source, pseudo_labels, config):
+    """Audit rescue candidates using one evidence bank, without a domain pool.
 
     EvidenceBank handles minimum neighbor count and within-source conflict.
     Keep explicit conflict checking here as well for callers with saved evidence.
@@ -162,3 +162,14 @@ def audit_source(source, pseudo_labels, config):
     passed &= (uncertainty <= config.uncertainty) & (source['conflict'] <= config.conflict)
     return dict(pass_mask=passed, available=available, support=support, margin=margin,
                 uncertainty=uncertainty, mass=mass)
+
+
+
+def audit_source(source, pseudo_labels, config):
+    """Compatibility entry point for source-only diagnostics/experiments."""
+    return audit_single_domain(source, pseudo_labels, config)
+
+
+def audit_target(target, pseudo_labels, config):
+    """Audit only the frozen target-anchor evidence; source masses are not used."""
+    return audit_single_domain(target, pseudo_labels, config)
