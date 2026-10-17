@@ -8,3 +8,11 @@ def rescue_js_gate(probabilities1, probabilities2, threshold):
         raise ValueError('rescue JS threshold must be finite and in [0, ln(2)]')
     js, _ = view_probability_metrics(probabilities1, probabilities2)
     return js, js <= threshold
+
+
+
+def rescue_js_enabled(threshold, epoch, start_epoch=0):
+    """Schedule only; omitted threshold disables JS regardless of start epoch."""
+    if start_epoch < 0 or epoch < 0:
+        raise ValueError('epoch and start_epoch must be nonnegative')
+    return threshold is not None and epoch >= start_epoch

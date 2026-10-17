@@ -1,6 +1,6 @@
-# Source-only DS with dual-view JS rescue gate (v16)
+# Source-only DS with dual-view JS rescue gate with delayed activation (v17)
 
-Based on source-ds-js-diagnostics-v15; NOT target-anchor-only v14. Neighbor evidence remains source-only. Target anchor eligibility and prototype updates keep the source baseline behavior.
+Based on source-ds-js-rescue-v16; NOT target-anchor-only v14. Neighbor evidence remains source-only. Target anchor eligibility and prototype updates keep the source baseline behavior.
 
 --rescue_js_threshold 0.01 enables an extra gate only on radius rescue. Both view softmax distributions are compared using natural-log Jensen-Shannon divergence (not square-root JS distance), in [0, ln(2)]. Rescue requires JS <= threshold in addition to agreement, low confidence, source radius, rescue enable/warmup and DS pass when --ds_neighbor is enabled. High-confidence acceptance is still confidence_mask OR rescue_mask and is unaffected by this gate. No target truth enters selection.
 
@@ -22,9 +22,9 @@ python -u train.py \
   --ds_max_distance 0.5 --ds_bandwidth 0.25 --ds_strength_cap 0.95 \
   --ds_support_threshold 0.6 --ds_margin_threshold 0.1 \
   --ds_uncertainty_threshold 0.3 --ds_conflict_threshold 0.5 \
-  --rescue_js_threshold 0.01 \
-  --run_name source_ds_q90_k11_js001_immediate \
-  2>&1 | tee test_logs/source_ds_q90_k11_js001_immediate.log
+  --rescue_js_threshold 0.01 --rescue_js_start_epoch 20 \
+  --run_name source_ds_q90_k11_js001_start20_immediate \
+  2>&1 | tee test_logs/source_ds_q90_k11_js001_start20_immediate.log
 ```
 
 New run_name avoids overwriting prior outputs. This is a new training experiment, not checkpoint diagnostic inference or exact resume.
@@ -44,3 +44,13 @@ python -m py_compile train.py rescue_js.py
 ```
 
 Numerical gate, CLI, boundary and wiring checks run without PyTorch. Full RAF/FER training was not executed in the authoring environment.
+
+
+
+## Delayed activation
+
+--rescue_js_start_epoch 20 uses zero-based target epoch indices: epochs 0-19 have no JS filtering; epochs 20 onward apply the configured JS threshold. This is the 21st human-counted target epoch. The start default is 0, preserving v16 behavior. Omitting --rescue_js_threshold keeps JS off for all epochs. A start >= --epochs never activates it. The normal radius rescue enabled flag and warmup remain independent.
+
+Every target epoch prints JS_Enabled and JS_Start_Epoch. CSV adds js_enabled; before activation js_divergence is blank, js_pass=True, and accepted equals ds_pass. After activation accepted equals ds_pass AND js_pass. JS counters may still print before activation when a threshold is configured: pass-through counts then do NOT mean JS was computed; consult JS_Enabled. No CPU JS computation occurs before activation.
+
+This run starts from source weights and retrains the full 30 epochs; it is not resuming the previous epoch-20 model. Epoch 20 is an exploratory setting, not a validated optimum. Other source DS, high-confidence acceptance, anchor and prototype rules remain unchanged.

@@ -16,7 +16,7 @@ from prototype_utils import FeatureHook, PrototypeBank, prototype_weight_for_epo
 from source_prototype_radius import SourcePrototypeRadiusBank
 from reliability_roles import ReliabilityRoles
 from dual_domain_ds import DSConfig, EvidenceBank, audit_source
-from rescue_js import rescue_js_gate
+from rescue_js import rescue_js_gate, rescue_js_enabled
 import image_utils as util
 from randaugment import RandAugmentMC
 # 总训练入口与调度器。串起数据、Source 预训练、EMA Teacher、
@@ -115,6 +115,9 @@ def parse_args(argv=None):
     parser.add_argument('--rescue_js_threshold', type=float, default=None,
                         help='optional rescue-only JS divergence ceiling, natural logs; e.g. 0.01')
 
+    parser.add_argument('--rescue_js_start_epoch', type=int, default=0,
+                        help='first target epoch enabling JS rescue filtering (zero-based)')
+
     parser.add_argument('--ds_neighbor', action='store_true',
                         help='audit radius-rescue candidates with source-only DS evidence')
     parser.add_argument('--ds_k', type=int, default=20)
@@ -149,6 +152,8 @@ def parse_args(argv=None):
         parser.error('--promotion_epochs must be positive')
     if not args.run_name or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-' for c in args.run_name):
         parser.error('--run_name must contain only letters, digits, underscores or hyphens')
+    if args.rescue_js_start_epoch < 0:
+        parser.error('--rescue_js_start_epoch must be nonnegative')
     if args.rescue_js_threshold is not None and (not np.isfinite(args.rescue_js_threshold) or not 0 <= args.rescue_js_threshold <= np.log(2.0)):
         parser.error('--rescue_js_threshold must be finite and in [0, ln(2)]')
     try:
@@ -639,12 +644,13 @@ def run_training():
     ds_config = ds_config_from_args(args)
     print('DS_Neighbor: %s DS_Config: %s Scope: radius_rescue_only Evidence: source_only' %
           (args.ds_neighbor, ds_config))
-    print('Rescue_JS_Threshold: %s (natural-log JS; high-confidence route unchanged)' % args.rescue_js_threshold)
+    print('Rescue_JS_Threshold: %s Rescue_JS_Start_Epoch: %d (zero-based; natural-log JS; high-confidence route unchanged)' %
+          (args.rescue_js_threshold, args.rescue_js_start_epoch))
     ds_csv_path = os.path.join(model_path, args.run_name + '_ds_diagnostics.csv')
     ds_columns = ['epoch', 'sample_id', 'pseudo_label', 'source_count',
                   'source_available', 'source_support', 'source_unknown',
                   'source_conflict', 'support', 'margin', 'unknown',
-                  'js_divergence', 'js_pass', 'ds_pass', 'accepted']
+                  'js_enabled', 'js_divergence', 'js_pass', 'ds_pass', 'accepted']
     if args.ds_neighbor:
         with open(ds_csv_path, 'w', newline='') as handle:
             csv.writer(handle).writerow(ds_columns)
@@ -653,6 +659,10 @@ def run_training():
     global_step = 0
 
     for i in range(args.epochs):
+        enable_js = rescue_js_enabled(
+            args.rescue_js_threshold, i, args.rescue_js_start_epoch)
+        print('[Target Epoch %d] JS_Enabled: %s JS_Start_Epoch: %d' %
+              (i, enable_js, args.rescue_js_start_epoch))
         if args.ds_neighbor:
             ds_source = refresh_ds_source_bank(
                 teacher, teacher_feature_hook, prototype_loader_source, class_num)
@@ -743,7 +753,7 @@ def run_training():
                 # JS is observational for high-confidence samples: only rescue is gated.
                 js_values = np.full(len(pseudo_targets), np.nan)
                 js_mask = torch.ones_like(agreement_mask)
-                if args.rescue_js_threshold is not None:
+                if enable_js:
                     js_values, js_pass = rescue_js_gate(
                         F.softmax(logits1, dim=1).cpu().numpy(),
                         F.softmax(logits2, dim=1).cpu().numpy(),
@@ -779,7 +789,8 @@ def run_training():
                                 source_ds['mass'][row, label], source_ds['uncertainty'][row],
                                 source_ds['conflict'][row], ds_result['support'][row],
                                 ds_result['margin'][row], ds_result['uncertainty'][row],
-                                float(js_values[int(query_idx[row])]) if args.rescue_js_threshold is not None else None,
+                                enable_js,
+                                float(js_values[int(query_idx[row])]) if enable_js else None,
                                 bool(js_mask[query_idx[row]].item()),
                                 bool(ds_result['pass_mask'][row]),
                                 bool(rescue_mask[query_idx[row]].item())])
@@ -991,6 +1002,7 @@ def run_training():
 
 if __name__ == '__main__':
     run_training()
+
 
 
 
