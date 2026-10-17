@@ -6,7 +6,7 @@ from pathlib import Path
 import random
 import numpy as np
 from dual_domain_ds import DSConfig, EvidenceBank, audit_source
-from ds_diagnostics import diagnose_query
+from ds_diagnostics import diagnose_query, view_probability_metrics
 
 
 def parse_args(argv=None):
@@ -141,8 +141,11 @@ def run(args):
                 logits2, _ = model(view2.to(device), None, None, mode='test', task='target')
                 f2 = hook.output.detach()
                 z = F.normalize(F.normalize(f1,dim=1)+F.normalize(f2,dim=1),dim=1).cpu().numpy()
-                conf1, pred1 = logits1.softmax(1).max(1)
-                conf2, pred2 = logits2.softmax(1).max(1)
+                probs1, probs2 = logits1.softmax(1), logits2.softmax(1)
+                conf1, pred1 = probs1.max(1)
+                conf2, pred2 = probs2.max(1)
+                p1, p2 = probs1.cpu().numpy(), probs2.cpu().numpy()
+                js, conf_diff = view_probability_metrics(p1, p2)
                 evidence = bank.evaluate(z, sample_ids.numpy(), config)
                 result = audit_source(evidence, pred1.cpu().numpy(), config)
                 for j, sample_id in enumerate(sample_ids.tolist()):
@@ -155,8 +158,14 @@ def run(args):
                     for n in ns:
                         n['source_path'] = source.file_paths[n['source_id']]
                     neighbors.extend(ns)
+                    probability_columns = {
+                        **{f'prob1_class_{c}': float(p1[j,c]) for c in range(7)},
+                        **{f'prob2_class_{c}': float(p2[j,c]) for c in range(7)},
+                    }
                     rows.append(dict(sample_id=sample_id, target_path=target.file_paths[sample_id], pseudo_label=y,
                                      conf1=float(conf1[j]), conf2=float(conf2[j]), threshold=float(thresholds[y]),
+                                     js_divergence=float(js[j]), confidence_difference=float(conf_diff[j]),
+                                     **probability_columns,
                                      agreement=agreement, high_confidence=confident, region_ok=region,
                                      prototype_distance=distance, class_radius=float(radii[y]), rescue_candidate=candidate,
                                      source_available=bool(evidence['available'][j]), ds_support=float(result['support'][j]),
@@ -169,6 +178,9 @@ def run(args):
                        target_samples=len(rows), sampled_ids=ids.tolist(), thresholds=thresholds.tolist(),
                        global_class_mean=global_mean, threshold_center=center,
                        rescue_candidates=len(candidates), candidates_ds_passed=sum(r['ds_pass'] for r in candidates),
+                       js_definition='0.5 KL(p1||m) + 0.5 KL(p2||m); m=(p1+p2)/2; natural logs; range [0, ln(2)]',
+                       candidate_js_median=float(np.median([r['js_divergence'] for r in candidates])) if candidates else None,
+                       candidate_js_max=max((r['js_divergence'] for r in candidates),default=None),
                        candidate_support_min=min((r['ds_support'] for r in candidates),default=None),
                        candidate_support_ge_0999=sum(r['ds_support']>=.999 for r in candidates),
                        note='One checkpoint snapshot; no optimizer, backward, training or historical epoch replay. '
@@ -190,3 +202,4 @@ def run(args):
 
 if __name__ == '__main__':
     run(parse_args())
+

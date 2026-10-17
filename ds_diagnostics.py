@@ -42,3 +42,32 @@ def diagnose_query(bank, feature, pseudo_label, query_id, config, ks=(1, 3, 5, 1
                    weighted_support=float((strength*supports).sum()/strength.sum()) if strength.sum() else None,
                    capped_fraction=float((strength >= config.strength_cap).mean()) if len(idx) else None)
     return summary, neighbors
+
+
+
+def view_probability_metrics(probabilities1, probabilities2):
+    """Per-query JS divergence (natural logs, NOT square-root JS distance).
+
+    Returns values in [0, ln(2)] plus the maximum-confidence difference.
+    Inputs must be nonnegative finite probability matrices with equal shapes.
+    Normalize within a small softmax-roundoff tolerance, preserving exact zeros.
+    """
+    p = np.asarray(probabilities1, dtype=np.float64)
+    q = np.asarray(probabilities2, dtype=np.float64)
+    if p.shape != q.shape or p.ndim != 2 or p.shape[1] < 2:
+        raise ValueError('views must have matching [samples, classes] shapes')
+    if not np.isfinite(p).all() or not np.isfinite(q).all() or (p < 0).any() or (q < 0).any():
+        raise ValueError('invalid view probabilities')
+    for a in (p, q):
+        if not np.allclose(a.sum(1), 1., rtol=1e-5, atol=1e-7):
+            raise ValueError('probabilities must sum to one')
+    p = p / p.sum(1, keepdims=True)
+    q = q / q.sum(1, keepdims=True)
+    m = .5 * (p+q)
+    def kl(a):
+        terms = np.zeros_like(a)
+        positive = a > 0
+        terms[positive] = a[positive] * (np.log(a[positive])-np.log(m[positive]))
+        return terms.sum(1)
+    js = np.clip(.5 * (kl(p)+kl(q)), 0., np.log(2.))
+    return js, np.abs(p.max(1)-q.max(1))

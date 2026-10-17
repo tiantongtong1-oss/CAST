@@ -40,3 +40,12 @@ python diagnose_ds.py --help
 ```
 
 NumPy tests cover accumulation, conflict, empty neighborhoods, full-bank nearest competing-class search, strength values, CLI defaults and absence of optimizer/backward calls. Full checkpoint/data inference was not run in the authoring environment.
+
+
+## v15 probability consistency diagnostics
+
+queries.csv additionally contains prob1_class_0 through prob1_class_6 and prob2_class_0 through prob2_class_6, in CAST order (Surprise, Fear, Disgust, Happy, Sad, Angry, Neutral). js_divergence is 0.5 KL(p1||m)+0.5 KL(p2||m), m=(p1+p2)/2, using natural logarithms. It lies in [0, ln(2)] and is NOT square-root JS distance. Smaller values indicate more similar distributions, not necessarily correct predictions. confidence_difference is abs(max(p1)-max(p2)).
+
+No JS threshold is applied to training or diagnostic acceptance. This is observational only. Keep checkpoint/weights, seed, sample count, batch size and workers identical to the preceding run. Use a new --output_dir such as ./ds_debug/target_best_k11_5000_js. Rerunning inference is necessary because previous CSVs did not contain full probability vectors. No retraining is needed.
+
+Compare JS distributions on accepted rescue candidates first. Label-based correctness evaluation must remain offline and separate from selection/training. This branch derives from source-only v13, not target-anchor v14; train.py remains the source-only DS version.

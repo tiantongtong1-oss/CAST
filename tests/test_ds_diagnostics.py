@@ -1,7 +1,7 @@
 import unittest
 import numpy as np
 from dual_domain_ds import DSConfig, EvidenceBank
-from ds_diagnostics import diagnose_query
+from ds_diagnostics import diagnose_query, view_probability_metrics
 from diagnose_ds import parse_args, config_from_args
 
 
@@ -46,6 +46,29 @@ class DiagnosticTest(unittest.TestCase):
         self.assertEqual(s['count_k15'],15)
         self.assertAlmostEqual(n[0]['strength'],min(np.exp(-.5*(n[0]['distance']/cfg.bandwidth)**2),.95))
 
+    def test_js_identical_disjoint_symmetric_and_zeros(self):
+        p=np.array([[1.,0.],[.2,.8],[0.,1.]])
+        q=np.array([[0.,1.],[.2,.8],[0.,1.]])
+        js,diff=view_probability_metrics(p,q)
+        np.testing.assert_allclose(js,[np.log(2),0,0],atol=1e-14)
+        np.testing.assert_allclose(js,view_probability_metrics(q,p)[0])
+        np.testing.assert_allclose(diff,0)
+
+    def test_js_detects_distribution_changes_with_same_top_confidence(self):
+        p=np.array([[.6,.3,.1]])
+        q=np.array([[.6,.1,.3]])
+        js,diff=view_probability_metrics(p,q)
+        self.assertGreater(js[0],0)
+        self.assertAlmostEqual(diff[0],0,places=14)
+
+    def test_js_empty_and_invalid_inputs(self):
+        js,diff=view_probability_metrics(np.empty((0,7)),np.empty((0,7)))
+        self.assertEqual(len(js),0)
+        for p,q in (([[.4,.4]],[[.5,.5]]),([[-.1,1.1]],[[.5,.5]]),
+                    ([[np.nan,.5]],[[.5,.5]]),([[1,0]],[[1,0,0]])):
+            with self.assertRaises(ValueError):
+                view_probability_metrics(p,q)
+
     def test_cli_no_torch_needed(self):
         a=parse_args(['--checkpoint','source.pth'])
         self.assertEqual(config_from_args(a).k,11)
@@ -63,3 +86,4 @@ class DiagnosticTest(unittest.TestCase):
 
 if __name__=='__main__':
     unittest.main()
+
