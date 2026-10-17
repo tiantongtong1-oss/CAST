@@ -80,10 +80,17 @@ class JAFFE(data.Dataset):
     """One full transductive image pool; only evaluation exposes pose labels."""
     def __init__(self, path, phase='adapt', transform=None, weak2_transform=None,
                  strong_transform=None, basic_aug=False, return_index=False):
+        from pathlib import Path
+        import json
         if phase not in {'adapt', 'eval'}:
             raise ValueError('JAFFE phase must be adapt or eval (no validation split)')
         self.phase = phase
         records = scan_jaffe(path)
+        metadata_path = Path(path) / 'alignment_metadata.json'
+        if metadata_path.exists():
+            metadata = json.loads(metadata_path.read_text())
+            if metadata['failed_count'] or metadata['aligned_count'] != len(records):
+                raise ValueError('Incomplete aligned JAFFE pool; inspect alignment_report.csv')
         self.file_paths = [p for p, _ in records]
         self.label = [label for _, label in records] if phase == 'eval' else [-1] * len(records)
         self.transform, self.weak2_transform = transform, weak2_transform

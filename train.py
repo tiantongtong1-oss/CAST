@@ -17,6 +17,7 @@ from source_prototype_radius import SourcePrototypeRadiusBank
 from reliability_roles import ReliabilityRoles
 from dual_domain_ds import DSConfig, EvidenceBank, audit_source
 from rescue_js import rescue_js_gate, rescue_js_enabled
+from training_log import training_log
 import image_utils as util
 from randaugment import RandAugmentMC
 # 总训练入口与调度器。串起数据、Source 预训练、EMA Teacher、
@@ -50,6 +51,9 @@ def parse_args(argv=None):
                         help='mobilenet_v2, resnet18 or resnet50')
     parser.add_argument('--lr', type=float, default=0.001)
     parser.add_argument('--workers', default=10, type=int)
+    parser.add_argument('--model_dir', default=None, help='checkpoint output directory')
+    parser.add_argument('--log_dir', default=None, help='console/DS log directory')
+    parser.add_argument('--no_imagenet_pretrained', action='store_true', help='random backbone initialization')
     parser.add_argument('--pre_epochs', type=int, default=30,
                         help='source-domain pre-training epochs')
     parser.add_argument('--epochs', type=int, default=30,
@@ -134,8 +138,8 @@ def parse_args(argv=None):
     parser.add_argument('--ds_strength_cap', type=float, default=0.95)
 
     args = parser.parse_args(argv)
-    if args.data2 == 'jaffe' and (args.pre_epochs != 0 or not args.checkpoint):
-        parser.error('JAFFE requires --pre_epochs 0 and a source-only --checkpoint; no target-label model selection')
+    if args.data2 == 'jaffe' and args.pre_epochs == 0 and not args.checkpoint:
+        parser.error('JAFFE needs source training (--pre_epochs > 0) or a source-only checkpoint')
     if args.data2 == 'jaffe' and args.epochs < 1:
         parser.error('JAFFE requires at least one fixed adaptation epoch')
     if not np.isfinite(args.source_radius_quantile) or not 0 < args.source_radius_quantile <= 1:
@@ -434,13 +438,13 @@ def refresh_ds_source_bank(teacher, feature_hook, source_loader, classes):
     return EvidenceBank(x, y, np.arange(len(y)), np.ones(len(y)), classes)
 
 
-def run_training():
-    args = parse_args()
+def run_training(args=None):
+    args = parse_args() if args is None else args
     device = torch.device(args.device)
     is_jaffe = args.data2 == 'jaffe'
     if device.type == 'cuda' and not torch.cuda.is_available():
         raise RuntimeError('CUDA unavailable; use --device cpu for a smoke test')
-    model_path = os.path.join('./models', args.data1 + '_' + args.data2)
+    model_path = args.model_dir or ('./jaffe_models' if is_jaffe else os.path.join('./models', args.data1 + '_' + args.data2))
     os.makedirs(model_path, exist_ok=True)
 
     source_best_path = os.path.join(
@@ -454,6 +458,7 @@ def run_training():
         + '_' + args.run_name + '_target_best.pth'
     )
 
+    source_last_path = source_best_path.replace('_source_best.pth', '_source_last.pth')
     target_last_path = target_best_path.replace('_target_best.pth', '_target_last.pth')
     if is_jaffe:
         print('Protocol: JAFFE full-pool transductive adaptation; no val or target-best selection; final student evaluation only')
@@ -562,7 +567,8 @@ def run_training():
         print('JAFFE target images: %d; batch_size: %d; updates/epoch: %d; total planned updates: %d; drop_last: False' %
               (len(target_train), train_batch, len(train_loader_target), args.epochs * len(train_loader_target)))
     # 输出分类 logits 和 source affinity loss
-    model = Networks.Model(backbone=args.backbone, num_classes=class_num).to(device)
+    model = Networks.Model(backbone=args.backbone, num_classes=class_num,
+                           pretrained=not args.no_imagenet_pretrained).to(device)
     # 训练组件初始化
     optimizer = torch.optim.Adam(model.parameters(), args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
@@ -616,17 +622,25 @@ def run_training():
                train_loss2 / max(batch_count, 1),
                train_loss3 / max(batch_count, 1),
                optimizer.param_groups[0]['lr']))
-        # 保存最佳的model
-        val_acc = evaluate(
-            model, val_loader_target, criterion, len(target_val), i, 'Validation'
-        )
-        if val_acc > best_source_val_acc:
-            best_source_val_acc = val_acc
-            save_checkpoint(source_best_path, model, optimizer, scheduler, i,
-                            best_source_val_acc, args)
-            print('best source-stage validation accuracy %.4f' % best_source_val_acc)
+        if not is_jaffe:
+            # 保存最佳的model
+            val_acc = evaluate(
+                model, val_loader_target, criterion, len(target_val), i, 'Validation'
+            )
+            if val_acc > best_source_val_acc:
+                best_source_val_acc = val_acc
+                save_checkpoint(source_best_path, model, optimizer, scheduler, i,
+                                best_source_val_acc, args)
+                print('best source-stage validation accuracy %.4f' % best_source_val_acc)
     # --checkpoint is weights initialization, not a full target-stage resume.
-    if args.pre_epochs > 0:
+    if is_jaffe and args.pre_epochs > 0:
+        # Keep newly trained weights in memory: no checkpoint read between stages.
+        save_checkpoint(source_last_path, model, optimizer, scheduler,
+                        args.pre_epochs - 1, None, args)
+        print('Saved fixed source final checkpoint:', source_last_path)
+        optimizer = torch.optim.Adam(model.parameters(), args.lr, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
+    elif args.pre_epochs > 0:
         checkpoint = torch.load(source_best_path, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint['model'])
         optimizer.load_state_dict(checkpoint['optimizer'])
@@ -674,7 +688,9 @@ def run_training():
           (args.ds_neighbor, ds_config))
     print('Rescue_JS_Threshold: %s Rescue_JS_Start_Epoch: %d (zero-based; natural-log JS; high-confidence route unchanged)' %
           (args.rescue_js_threshold, args.rescue_js_start_epoch))
-    ds_csv_path = os.path.join(model_path, args.run_name + '_ds_diagnostics.csv')
+    diagnostic_path = args.log_dir or model_path
+    os.makedirs(diagnostic_path, exist_ok=True)
+    ds_csv_path = os.path.join(diagnostic_path, args.run_name + '_ds_diagnostics.csv')
     ds_columns = ['epoch', 'sample_id', 'pseudo_label', 'source_count',
                   'source_available', 'source_support', 'source_unknown',
                   'source_conflict', 'support', 'margin', 'unknown',
@@ -1042,7 +1058,11 @@ def run_training():
 
 
 if __name__ == '__main__':
-    run_training()
+    cli_args = parse_args()
+    if cli_args.data2 == 'jaffe' and cli_args.log_dir is None:
+        cli_args.log_dir = './jaffe_logs'
+    with training_log(cli_args.log_dir, cli_args.run_name):
+        run_training(cli_args)
 
 
 
