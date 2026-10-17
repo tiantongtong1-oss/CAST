@@ -16,6 +16,7 @@ from prototype_utils import FeatureHook, PrototypeBank, prototype_weight_for_epo
 from source_prototype_radius import SourcePrototypeRadiusBank
 from reliability_roles import ReliabilityRoles
 from dual_domain_ds import DSConfig, EvidenceBank, audit_source
+from source_class_weighting import make_source_class_weights, source_weighted_mean, mixed_source_target_ce
 import image_utils as util
 from randaugment import RandAugmentMC
 # 总训练入口与调度器。串起数据、Source 预训练、EMA Teacher、
@@ -111,6 +112,9 @@ def parse_args(argv=None):
     parser.add_argument('--device', choices=['cuda', 'cpu'], default='cuda',
                         help='CPU is supported for smoke tests; CUDA recommended for FER training')
 
+    parser.add_argument('--source_class_weight_power', type=float, default=0.0,
+                        help='source-only CE inverse-count power: 0 disables, 0.5 uses inverse sqrt')
+
     parser.add_argument('--ds_neighbor', action='store_true',
                         help='audit radius-rescue candidates with source-only DS evidence')
     parser.add_argument('--ds_k', type=int, default=20)
@@ -145,6 +149,8 @@ def parse_args(argv=None):
         parser.error('--promotion_epochs must be positive')
     if not args.run_name or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-' for c in args.run_name):
         parser.error('--run_name must contain only letters, digits, underscores or hyphens')
+    if not np.isfinite(args.source_class_weight_power) or not 0 <= args.source_class_weight_power <= 1:
+        parser.error('--source_class_weight_power must be finite and in [0,1]')
     try:
         ds_config_from_args(args)
     except ValueError as error:
@@ -530,6 +536,16 @@ def run_training():
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
     # 交叉熵损失
     criterion = torch.nn.CrossEntropyLoss(reduction='none')
+    # Only labeled source training counts determine class weights.
+    source_counts = np.bincount(np.asarray(source_train.label, dtype=np.int64), minlength=class_num)
+    source_class_weights = None
+    if args.source_class_weight_power > 0:
+        source_class_weights = torch.as_tensor(
+            make_source_class_weights(source_counts, args.source_class_weight_power),
+            device=device, dtype=next(model.parameters()).dtype)
+    print('Source_Class_Weight_Power: %.3f Source_Class_Counts: %s Source_CE_Weights: %s' %
+          (args.source_class_weight_power, source_counts.tolist(),
+           source_class_weights.detach().cpu().tolist() if source_class_weights is not None else 'disabled'))
 
     if args.checkpoint:
         print('Loading pretrained weights...', args.checkpoint)
@@ -552,7 +568,7 @@ def run_training():
             # 清空梯度
             optimizer.zero_grad()
             output = model(imgs, targets, None, 'train', 'source')
-            cls_loss = torch.mean(criterion(output[0], targets))
+            cls_loss = source_weighted_mean(criterion(output[0], targets), targets, source_class_weights)
             aff_loss = output[1]
             weight_loss = classifier_modulation_loss(model)
             loss = cls_loss * args.w1 + aff_loss * args.w2 + weight_loss * args.w3
@@ -835,9 +851,11 @@ def run_training():
                 source_count=source_imgs.shape[0],
             )
             # 分类损失
-            per_sample_loss = criterion(output[0], train_targets) * train_con_idx
-            # 对真正有效的源域和目标域样本求平均分类损失
-            cls_loss = per_sample_loss.sum() / train_con_idx.sum().clamp_min(1.0)
+            per_sample_loss = criterion(output[0], train_targets)
+            # Normalize source weights within its batch; preserve target coefficients.
+            cls_loss = mixed_source_target_ce(
+                per_sample_loss, train_targets, train_con_idx,
+                source_imgs.shape[0], source_class_weights)
             aff_loss = output[1]
             # 分类器权重之间的正则项
             weight_loss = classifier_modulation_loss(model)
@@ -960,6 +978,7 @@ def run_training():
 
 if __name__ == '__main__':
     run_training()
+
 
 
 
