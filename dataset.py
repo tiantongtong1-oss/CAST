@@ -6,6 +6,7 @@ import image_utils as util
 import random
 import glob
 import numpy as np
+from jaffe_manifest import scan_jaffe
 
 
 "0: surprise, 1: fear, 2: disgust, 3: happy 4: sad  5: angry 6: neutral 7:attempt"
@@ -73,6 +74,43 @@ class RafDataSet(data.Dataset):
             img_aug = self.strong_transform(image)
             return img, img_aug, label
         return img, label
+
+
+class JAFFE(data.Dataset):
+    """One full transductive image pool; only evaluation exposes pose labels."""
+    def __init__(self, path, phase='adapt', transform=None, weak2_transform=None,
+                 strong_transform=None, basic_aug=False, return_index=False):
+        if phase not in {'adapt', 'eval'}:
+            raise ValueError('JAFFE phase must be adapt or eval (no validation split)')
+        self.phase = phase
+        records = scan_jaffe(path)
+        self.file_paths = [p for p, _ in records]
+        self.label = [label for _, label in records] if phase == 'eval' else [-1] * len(records)
+        self.transform, self.weak2_transform = transform, weak2_transform
+        self.strong_transform, self.return_index = strong_transform, return_index
+        print('JAFFE %s: %d images; protocol=full_pool_transductive; labels=%s' %
+              (phase, len(records), 'evaluation_only' if phase == 'eval' else 'hidden'))
+        if len(records) != 213:
+            print('JAFFE WARNING: expected original 213-image pool, found %d; check dataset contents.' % len(records))
+
+    def __len__(self):
+        return len(self.file_paths)
+
+    def __getitem__(self, idx):
+        image = cv2.imread(self.file_paths[idx], cv2.IMREAD_COLOR)
+        if image is None:
+            raise FileNotFoundError('Failed to read image: %s' % self.file_paths[idx])
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        img = self.transform(image) if self.transform else image
+        result = [img]
+        if self.weak2_transform is not None:
+            result.append(self.weak2_transform(image))
+        if self.strong_transform is not None:
+            result.append(self.strong_transform(image))
+        result.append(self.label[idx])
+        if self.return_index:
+            result.append(idx)
+        return tuple(result)
 
 
 class FER(data.Dataset):
@@ -182,3 +220,4 @@ class FER(data.Dataset):
 
         result = (img, label)
         return result + (idx,) if self.return_index else result
+

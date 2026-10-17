@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torchvision import transforms
 
 import Networks
-from dataset import RafDataSet, FER
+from dataset import RafDataSet, FER, JAFFE
 from ema_utils import create_ema_teacher, select_dual_view_pseudo_labels, update_ema_teacher
 from prototype_utils import FeatureHook, PrototypeBank, prototype_weight_for_epoch
 from source_prototype_radius import SourcePrototypeRadiusBank
@@ -40,7 +40,7 @@ def _init_fn(worker_id):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--data1', type=str, default='rafdb', help='source data')
-    parser.add_argument('--data2', type=str, default='fer', help='target data')
+    parser.add_argument('--data2', choices=['fer', 'jaffe'], default='fer', help='target data')
     parser.add_argument('--source_path', type=str,
                         default='/workspace/ttt/code/test-upload-clean/datesets/raf-basic')
     parser.add_argument('--target_path', type=str,
@@ -134,6 +134,10 @@ def parse_args(argv=None):
     parser.add_argument('--ds_strength_cap', type=float, default=0.95)
 
     args = parser.parse_args(argv)
+    if args.data2 == 'jaffe' and (args.pre_epochs != 0 or not args.checkpoint):
+        parser.error('JAFFE requires --pre_epochs 0 and a source-only --checkpoint; no target-label model selection')
+    if args.data2 == 'jaffe' and args.epochs < 1:
+        parser.error('JAFFE requires at least one fixed adaptation epoch')
     if not np.isfinite(args.source_radius_quantile) or not 0 < args.source_radius_quantile <= 1:
         parser.error('source_radius_quantile must be finite and in (0, 1]')
     if args.source_refresh_interval < 1:
@@ -351,6 +355,8 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch, best_val_acc, args
         'epoch': epoch,
         'best_val_acc': best_val_acc,
         'args': vars(args),
+        'evaluation_protocol': ('jaffe_full_pool_transductive_last_student'
+                                if args.data2 == 'jaffe' else 'fer_validation_best_student'),
     }
     if teacher is not None:
         state['ema_teacher'] = teacher.state_dict()
@@ -431,6 +437,7 @@ def refresh_ds_source_bank(teacher, feature_hook, source_loader, classes):
 def run_training():
     args = parse_args()
     device = torch.device(args.device)
+    is_jaffe = args.data2 == 'jaffe'
     if device.type == 'cuda' and not torch.cuda.is_available():
         raise RuntimeError('CUDA unavailable; use --device cpu for a smoke test')
     model_path = os.path.join('./models', args.data1 + '_' + args.data2)
@@ -446,6 +453,10 @@ def run_training():
         args.backbone + '_' + args.data1 + '_' + args.data2
         + '_' + args.run_name + '_target_best.pth'
     )
+
+    target_last_path = target_best_path.replace('_target_best.pth', '_target_last.pth')
+    if is_jaffe:
+        print('Protocol: JAFFE full-pool transductive adaptation; no val or target-best selection; final student evaluation only')
 
     print('---------------------------------------------------------------------------------------')
     print('EMA + Dual View High Confidence + Source Radius Rescue: '
@@ -478,8 +489,8 @@ def run_training():
 
     weak_transform, strong_transform, test_transform = build_transforms()
 
-    if args.data1 != 'rafdb' or args.data2 != 'fer':
-        raise ValueError('This branch implements RAF-DB -> FER2013.')
+    if args.data1 != 'rafdb':
+        raise ValueError('Supported source: RAF-DB')
 
     source_train = RafDataSet(
         args.source_path, phase='train', transform=weak_transform,
@@ -490,23 +501,34 @@ def run_training():
         strong_transform=None, basic_aug=False
     )
 
-    target_train = FER(
-        args.target_path, phase='train', transform=weak_transform,
-        weak2_transform=weak_transform, strong_transform=strong_transform,
-        basic_aug=False, return_index=True
-    )
-    target_threshold = FER(
-        args.target_path, phase='train', transform=weak_transform,
-        strong_transform=None, basic_aug=False
-    )
-    target_val = FER(
-        args.target_path, phase='val', transform=test_transform,
-        strong_transform=None
-    )
-    target_test = FER(
-        args.target_path, phase='test', transform=test_transform,
-        strong_transform=None
-    )
+    if is_jaffe:
+        target_train = JAFFE(
+            args.target_path, phase='adapt', transform=weak_transform,
+            weak2_transform=weak_transform, strong_transform=strong_transform,
+            return_index=True)
+        target_threshold = JAFFE(args.target_path, phase='adapt', transform=weak_transform)
+        target_val = None
+        target_test = JAFFE(args.target_path, phase='eval', transform=test_transform)
+        if not (target_train.file_paths == target_threshold.file_paths == target_test.file_paths):
+            raise RuntimeError('JAFFE view sample IDs do not align')
+    else:
+        target_train = FER(
+            args.target_path, phase='train', transform=weak_transform,
+            weak2_transform=weak_transform, strong_transform=strong_transform,
+            basic_aug=False, return_index=True
+        )
+        target_threshold = FER(
+            args.target_path, phase='train', transform=weak_transform,
+            strong_transform=None, basic_aug=False
+        )
+        target_val = FER(
+            args.target_path, phase='val', transform=test_transform,
+            strong_transform=None
+        )
+        target_test = FER(
+            args.target_path, phase='test', transform=test_transform,
+            strong_transform=None
+        )
 
     class_num = 7
 
@@ -529,11 +551,16 @@ def run_training():
     val_loader_target = torch.utils.data.DataLoader(
         target_val, batch_size=test_batch, num_workers=args.workers,
         shuffle=False, pin_memory=True,
-    )
+    ) if target_val is not None else None
     test_loader_target = torch.utils.data.DataLoader(
         target_test, batch_size=test_batch, num_workers=args.workers,
         shuffle=False, pin_memory=True,
     )
+    if len(train_loader_target) == 0:
+        raise RuntimeError('Target loader has no training batches')
+    if is_jaffe:
+        print('JAFFE target images: %d; batch_size: %d; updates/epoch: %d; total planned updates: %d; drop_last: False' %
+              (len(target_train), train_batch, len(train_loader_target), args.epochs * len(train_loader_target)))
     # 输出分类 logits 和 source affinity loss
     model = Networks.Model(backbone=args.backbone, num_classes=class_num).to(device)
     # 训练组件初始化
@@ -607,9 +634,10 @@ def run_training():
     else:
         # Weights were loaded above; start target training with a fresh optimizer.
         source_best_path = args.checkpoint
-        best_source_val_acc = evaluate(
-            model, val_loader_target, criterion, len(target_val), -1, 'Validation'
-        )
+        if not is_jaffe:
+            best_source_val_acc = evaluate(
+                model, val_loader_target, criterion, len(target_val), -1, 'Validation'
+            )
 
     # 构建 EMA 教师模型
     teacher = create_ema_teacher(model).to(device)
@@ -962,29 +990,38 @@ def run_training():
                train_proto_loss / max(batch_count, 1),
                current_proto_weight,
                optimizer.param_groups[0]['lr']))
-        # 在每个epoch 后用目标域 validation set做验证
-        val_acc = evaluate(
-            model, val_loader_target, criterion, len(target_val), i, 'Validation'
-        )
-        if val_acc > best_target_val_acc:
-            best_target_val_acc = val_acc
-            save_checkpoint(
-                target_best_path, model, optimizer, scheduler, i,
-                best_target_val_acc, args, teacher=teacher,
-                prototype_bank=prototype_bank,
-                reliability_bank=reliability_bank,
-                role_tracker=role_tracker,
+        if not is_jaffe:
+            # 在每个epoch 后用目标域 validation set做验证
+            val_acc = evaluate(
+                model, val_loader_target, criterion, len(target_val), i, 'Validation'
             )
-            print('best target-stage validation accuracy %.4f' % best_target_val_acc)
+            if val_acc > best_target_val_acc:
+                best_target_val_acc = val_acc
+                save_checkpoint(
+                    target_best_path, model, optimizer, scheduler, i,
+                    best_target_val_acc, args, teacher=teacher,
+                    prototype_bank=prototype_bank,
+                    reliability_bank=reliability_bank,
+                    role_tracker=role_tracker,
+                )
+                print('best target-stage validation accuracy %.4f' % best_target_val_acc)
 
-    if args.epochs > 0:
-        checkpoint = torch.load(target_best_path, map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint['model'])
-        selected_val_acc = best_target_val_acc
+
+    if is_jaffe:
+        save_checkpoint(
+            target_last_path, model, optimizer, scheduler, args.epochs - 1,
+            None, args, teacher=teacher, prototype_bank=prototype_bank,
+            reliability_bank=reliability_bank, role_tracker=role_tracker)
+        print('Saved fixed-final-epoch checkpoint:', target_last_path)
     else:
-        checkpoint = torch.load(source_best_path, map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint['model'])
-        selected_val_acc = best_source_val_acc
+        if args.epochs > 0:
+            checkpoint = torch.load(target_best_path, map_location=device, weights_only=False)
+            model.load_state_dict(checkpoint['model'])
+            selected_val_acc = best_target_val_acc
+        else:
+            checkpoint = torch.load(source_best_path, map_location=device, weights_only=False)
+            model.load_state_dict(checkpoint['model'])
+            selected_val_acc = best_source_val_acc
 
     teacher_feature_hook.close()
     student_feature_hook.close()
@@ -992,16 +1029,21 @@ def run_training():
     test_acc = evaluate(
         model, test_loader_target, criterion, len(target_test), args.epochs, 'Test'
     )
-    print('best source-stage validation accuracy %.4f' % best_source_val_acc)
-    if args.epochs > 0:
-        print('best target-stage validation accuracy %.4f' % best_target_val_acc)
-    print('selected validation accuracy %.4f' % selected_val_acc)
-    print('final target test accuracy %.4f' % test_acc)
+    if is_jaffe:
+        print('JAFFE full-pool transductive evaluation; selected fixed epoch %d; weights=model (student)' % (args.epochs - 1))
+        print('final target evaluation accuracy %.4f' % test_acc)
+    else:
+        print('best source-stage validation accuracy %.4f' % best_source_val_acc)
+        if args.epochs > 0:
+            print('best target-stage validation accuracy %.4f' % best_target_val_acc)
+        print('selected validation accuracy %.4f' % selected_val_acc)
+        print('final target test accuracy %.4f' % test_acc)
     return test_acc
 
 
 if __name__ == '__main__':
     run_training()
+
 
 
 
