@@ -19,6 +19,7 @@ from dual_domain_ds import DSConfig, EvidenceBank, audit_source
 from rescue_js import rescue_js_gate, rescue_js_enabled
 from training_log import training_log
 from update_schedule import batches_for_window, schedule_metadata
+from raf_alignment import validate_shared_alignment
 import image_utils as util
 from randaugment import RandAugmentMC
 # 总训练入口与调度器。串起数据、Source 预训练、EMA Teacher、
@@ -62,6 +63,8 @@ def parse_args(argv=None):
     parser.add_argument('--target_steps_per_round', type=int, default=0,
                         help='fixed target updates per scheduling round; 0 preserves native epochs. '
                              'All target epoch-based schedules then refer to these fixed-update rounds.')
+    parser.add_argument('--require_shared_alignment', action='store_true',
+                        help='require complete source and target metadata with identical alignment template/settings')
     parser.add_argument('--w1', type=float, default=4.0,
                         help='alpha: classification loss weight')
     parser.add_argument('--w2', type=float, default=0.3,
@@ -449,6 +452,9 @@ def run_training(args=None):
     args = parse_args() if args is None else args
     device = torch.device(args.device)
     is_jaffe = args.data2 == 'jaffe'
+    if args.require_shared_alignment:
+        validate_shared_alignment(args.source_path, args.target_path)
+        print('Shared source/target alignment metadata verified (template, size, threshold, method)')
     if device.type == 'cuda' and not torch.cuda.is_available():
         raise RuntimeError('CUDA unavailable; use --device cpu for a smoke test')
     model_path = args.model_dir or ('./jaffe_models' if is_jaffe else os.path.join('./models', args.data1 + '_' + args.data2))

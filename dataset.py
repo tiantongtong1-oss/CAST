@@ -7,6 +7,7 @@ import random
 import glob
 import numpy as np
 from jaffe_manifest import scan_jaffe
+from raf_alignment import aligned_raf_path
 
 
 "0: surprise, 1: fear, 2: disgust, 3: happy 4: sad  5: angry 6: neutral 7:attempt"
@@ -18,6 +19,15 @@ class RafDataSet(data.Dataset):
         self.transform = transform
         self.strong_transform = strong_transform
         self.raf_path = raf_path
+        from pathlib import Path
+        import json
+        metadata_path = Path(raf_path) / 'alignment_metadata.json'
+        unified_alignment = False
+        if metadata_path.exists():
+            metadata = json.loads(metadata_path.read_text())
+            if metadata['failed_count'] or metadata['input_count'] != metadata['aligned_count']:
+                raise ValueError('Incomplete RAF alignment pool: %s' % raf_path)
+            unified_alignment = metadata.get('output_format') == 'raf_aligned_png'
 
         NAME_COLUMN = 0
         LABEL_COLUMN = 1
@@ -36,8 +46,13 @@ class RafDataSet(data.Dataset):
 
         self.file_paths = []
         for f in file_names:
-            f = f.split('.')[0] + '_aligned.jpg'
-            path = os.path.join(self.raf_path, 'Image/aligned', f)
+            if unified_alignment:
+                path = str(aligned_raf_path(self.raf_path, f))
+                if not os.path.isfile(path):
+                    raise FileNotFoundError(path)
+            else:
+                f = f.split('.')[0] + '_aligned.jpg'
+                path = os.path.join(self.raf_path, 'Image/aligned', f)
             self.file_paths.append(path)
 
         self.basic_aug = basic_aug
