@@ -2,6 +2,7 @@ import warnings
 warnings.filterwarnings('ignore')
 import argparse
 import csv
+import json
 import os
 import random
 import numpy as np
@@ -43,6 +44,7 @@ def _init_fn(worker_id):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--data1', type=str, default='rafdb', help='source data')
+    parser.add_argument('--jaffe_split_manifest', default=None, help='Fixed 170/43 JAFFE JSON manifest; no target validation selection')
     parser.add_argument('--data2', choices=['fer', 'jaffe'], default='fer', help='target data')
     parser.add_argument('--source_path', type=str,
                         default='/workspace/ttt/code/test-upload-clean/datesets/raf-basic')
@@ -368,10 +370,13 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch, best_val_acc, args
         'epoch': epoch,
         'best_val_acc': best_val_acc,
         'args': vars(args),
-        'evaluation_protocol': ('jaffe_full_pool_transductive_last_student'
+        'evaluation_protocol': (('jaffe_stratified_170_43_last_student' if args.jaffe_split_manifest else 'jaffe_full_pool_transductive_last_student')
                                 if args.data2 == 'jaffe' else 'fer_validation_best_student'),
         'target_update_schedule': getattr(args, 'target_update_schedule', None),
     }
+    if args.data2 == 'jaffe' and args.jaffe_split_manifest:
+        with open(args.jaffe_split_manifest) as split_file:
+            state['jaffe_split_manifest'] = json.load(split_file)
     if teacher is not None:
         state['ema_teacher'] = teacher.state_dict()
     if prototype_bank is not None:
@@ -474,7 +479,7 @@ def run_training(args=None):
     source_last_path = source_best_path.replace('_source_best.pth', '_source_last.pth')
     target_last_path = target_best_path.replace('_target_best.pth', '_target_last.pth')
     if is_jaffe:
-        print('Protocol: JAFFE full-pool transductive adaptation; no val or target-best selection; final student evaluation only')
+        print('Protocol: JAFFE %s; no val or target-best selection; final student evaluation only' % ('170 adapt / 43 held-out test' if args.jaffe_split_manifest else 'full-pool transductive adaptation'))
 
     print('---------------------------------------------------------------------------------------')
     print('EMA + Dual View High Confidence + Source Radius Rescue: '
@@ -523,12 +528,14 @@ def run_training(args=None):
         target_train = JAFFE(
             args.target_path, phase='adapt', transform=weak_transform,
             weak2_transform=weak_transform, strong_transform=strong_transform,
-            return_index=True)
-        target_threshold = JAFFE(args.target_path, phase='adapt', transform=weak_transform)
+            return_index=True, split_manifest=args.jaffe_split_manifest)
+        target_threshold = JAFFE(args.target_path, phase='adapt', transform=weak_transform, split_manifest=args.jaffe_split_manifest)
         target_val = None
-        target_test = JAFFE(args.target_path, phase='eval', transform=test_transform)
-        if not (target_train.file_paths == target_threshold.file_paths == target_test.file_paths):
+        target_test = JAFFE(args.target_path, phase='eval', transform=test_transform, split_manifest=args.jaffe_split_manifest)
+        if not (target_train.file_paths == target_threshold.file_paths):
             raise RuntimeError('JAFFE view sample IDs do not align')
+        if args.jaffe_split_manifest and set(target_train.file_paths) & set(target_test.file_paths):
+            raise RuntimeError('JAFFE adaptation and test sets overlap')
     else:
         target_train = FER(
             args.target_path, phase='train', transform=weak_transform,
@@ -1073,7 +1080,7 @@ def run_training(args=None):
         model, test_loader_target, criterion, len(target_test), args.epochs, 'Test'
     )
     if is_jaffe:
-        print('JAFFE full-pool transductive evaluation; selected fixed epoch %d; weights=model (student)' % (args.epochs - 1))
+        print('JAFFE %s evaluation; selected fixed epoch %d; weights=model (student)' % ('held-out 43-image test' if args.jaffe_split_manifest else 'full-pool transductive', args.epochs - 1))
         print('final target evaluation accuracy %.4f' % test_acc)
     else:
         print('best source-stage validation accuracy %.4f' % best_source_val_acc)

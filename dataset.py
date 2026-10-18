@@ -92,9 +92,9 @@ class RafDataSet(data.Dataset):
 
 
 class JAFFE(data.Dataset):
-    """One full transductive image pool; only evaluation exposes pose labels."""
+    """Full pool or fixed held-out split; only evaluation exposes pose labels."""
     def __init__(self, path, phase='adapt', transform=None, weak2_transform=None,
-                 strong_transform=None, basic_aug=False, return_index=False):
+                 strong_transform=None, basic_aug=False, return_index=False, split_manifest=None):
         from pathlib import Path
         import json
         if phase not in {'adapt', 'eval'}:
@@ -106,14 +106,18 @@ class JAFFE(data.Dataset):
             metadata = json.loads(metadata_path.read_text())
             if metadata['failed_count'] or metadata['aligned_count'] != len(records):
                 raise ValueError('Incomplete aligned JAFFE pool; inspect alignment_report.csv')
+        pool_count = len(records)
+        if split_manifest:
+            from jaffe_split import select_split
+            records = select_split(path, records, split_manifest, phase)
         self.file_paths = [p for p, _ in records]
         self.label = [label for _, label in records] if phase == 'eval' else [-1] * len(records)
         self.transform, self.weak2_transform = transform, weak2_transform
         self.strong_transform, self.return_index = strong_transform, return_index
-        print('JAFFE %s: %d images; protocol=full_pool_transductive; labels=%s' %
-              (phase, len(records), 'evaluation_only' if phase == 'eval' else 'hidden'))
-        if len(records) != 213:
-            print('JAFFE WARNING: expected original 213-image pool, found %d; check dataset contents.' % len(records))
+        print('JAFFE %s: %d images; protocol=%s; labels=%s' %
+              (phase, len(records), 'stratified_170_43' if split_manifest else 'full_pool_transductive', 'evaluation_only' if phase == 'eval' else 'hidden'))
+        if pool_count != 213:
+            print('JAFFE WARNING: expected original 213-image pool, found %d; check dataset contents.' % pool_count)
 
     def __len__(self):
         return len(self.file_paths)
