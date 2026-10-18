@@ -18,6 +18,7 @@ from reliability_roles import ReliabilityRoles
 from dual_domain_ds import DSConfig, EvidenceBank, audit_source
 from rescue_js import rescue_js_gate, rescue_js_enabled
 from training_log import training_log
+from update_schedule import batches_for_window, schedule_metadata
 import image_utils as util
 from randaugment import RandAugmentMC
 # 总训练入口与调度器。串起数据、Source 预训练、EMA Teacher、
@@ -58,6 +59,9 @@ def parse_args(argv=None):
                         help='source-domain pre-training epochs')
     parser.add_argument('--epochs', type=int, default=30,
                         help='target-domain self-training epochs')
+    parser.add_argument('--target_steps_per_round', type=int, default=0,
+                        help='fixed target updates per scheduling round; 0 preserves native epochs. '
+                             'All target epoch-based schedules then refer to these fixed-update rounds.')
     parser.add_argument('--w1', type=float, default=4.0,
                         help='alpha: classification loss weight')
     parser.add_argument('--w2', type=float, default=0.3,
@@ -138,6 +142,8 @@ def parse_args(argv=None):
     parser.add_argument('--ds_strength_cap', type=float, default=0.95)
 
     args = parser.parse_args(argv)
+    if args.target_steps_per_round < 0:
+        parser.error('--target_steps_per_round must be nonnegative')
     if args.data2 == 'jaffe' and args.pre_epochs == 0 and not args.checkpoint:
         parser.error('JAFFE needs source training (--pre_epochs > 0) or a source-only checkpoint')
     if args.data2 == 'jaffe' and args.epochs < 1:
@@ -361,6 +367,7 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch, best_val_acc, args
         'args': vars(args),
         'evaluation_protocol': ('jaffe_full_pool_transductive_last_student'
                                 if args.data2 == 'jaffe' else 'fer_validation_best_student'),
+        'target_update_schedule': getattr(args, 'target_update_schedule', None),
     }
     if teacher is not None:
         state['ema_teacher'] = teacher.state_dict()
@@ -563,9 +570,14 @@ def run_training(args=None):
     )
     if len(train_loader_target) == 0:
         raise RuntimeError('Target loader has no training batches')
+    args.target_update_schedule = schedule_metadata(args, len(train_loader_target))
+    steps_per_round = args.target_update_schedule['updates_per_round']
+    print('Target_Update_Schedule:', args.target_update_schedule)
     if is_jaffe:
-        print('JAFFE target images: %d; batch_size: %d; updates/epoch: %d; total planned updates: %d; drop_last: False' %
-              (len(target_train), train_batch, len(train_loader_target), args.epochs * len(train_loader_target)))
+        print('JAFFE target images: %d; batch_size: %d; native batches/pass: %d; '
+              'updates/round: %d; total planned updates: %d; drop_last: False' %
+              (len(target_train), train_batch, len(train_loader_target), steps_per_round,
+               args.epochs * steps_per_round))
     # 输出分类 logits 和 source affinity loss
     model = Networks.Model(backbone=args.backbone, num_classes=class_num,
                            pretrained=not args.no_imagenet_pretrained).to(device)
@@ -701,6 +713,7 @@ def run_training(args=None):
         print('DS_Diagnostics:', ds_csv_path)
     best_target_val_acc = -1.0
     global_step = 0
+    target_train_iter = None
 
     for i in range(args.epochs):
         enable_js = rescue_js_enabled(
@@ -759,7 +772,12 @@ def run_training(args=None):
         anchor_num = 0
         prototype_update_num = immediate_update_num = 0
 
-        for weak1, weak2, strong, _, sample_ids in train_loader_target:
+        if not args.target_steps_per_round:
+            # Legacy mode reshuffles at each native epoch boundary, as before.
+            target_train_iter = None
+        for target_batch, target_train_iter in batches_for_window(
+                train_loader_target, steps_per_round, target_train_iter):
+            weak1, weak2, strong, _, sample_ids = target_batch
             try:
                 source_imgs, source_targets = next(source_train_iter)
             except StopIteration:
@@ -968,6 +986,9 @@ def run_training(args=None):
                   'JS_Rejected_After_DS: %d' % (i, *js_totals))
         # 更新学习率
         scheduler.step()
+        print('[Target Round %d] Completed_Updates: %d Planned_Updates: %d '
+              'Updates_This_Round: %d JS_Enabled: %s' %
+              (i, global_step, args.epochs * steps_per_round, batch_count, enable_js))
         # 求均值
         proto_agreement_rate = (
             float(prototype_agree_num) / float(prototype_checked_num)
