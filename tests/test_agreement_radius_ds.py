@@ -13,6 +13,7 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 import numpy as np
+from adaptive_confidence import DualViewClassMeans
 from dual_domain_ds import DSConfig, EvidenceBank, audit_source
 
 
@@ -25,6 +26,27 @@ class Tensor(np.ndarray):
 
     def argmax(self, dim=None):
         return tensor(np.asarray(self).argmax(axis=dim))
+
+    @property
+    def device(self):
+        return 'cpu'
+
+    def to(self, **kwargs):
+        return self
+
+    def index_select(self, dim, indices):
+        return tensor(np.take(self, indices, axis=dim))
+
+    def bool(self):
+        return tensor(self.astype(bool))
+
+    def float(self):
+        return tensor(self.astype(float))
+
+    def max(self, dim=None, **kwargs):
+        if dim is None:
+            return np.asarray(self).max(**kwargs)
+        return tensor(np.asarray(self).max(axis=dim)), tensor(np.asarray(self).argmax(axis=dim))
 
     def eq(self, other):
         return tensor(self == other)
@@ -47,38 +69,53 @@ class AgreementRadiusDSTest(unittest.TestCase):
         exec(compile(ast.Module(body=nodes, type_ignores=[]), '<args>', 'exec'), env)
         return env['parse_args'](argv)
 
-    def run_gate(self, logits1, logits2, region, features, bank):
+    def run_gate(self, logits1, logits2, region, features, bank, enable_rescue=True, thresholds=(.8, .8)):
         # Extract the live selection and audit statements from the training body.
-        start = self.source.index('                pseudo_targets = logits1.argmax')
+        start = self.source.index('                pseudo_targets, confidence_idx, agree_count =')
         end = self.source.index('                teacher_mean_features =', start)
         gate_start = self.source.index('                radius_candidates =')
         gate_end = self.source.index('                # Learning is distinct', gate_start)
         import textwrap
         code = textwrap.dedent(self.source[start:end]) + textwrap.dedent(self.source[gate_start:gate_end])
+        def softmax(x, dim):
+            z = np.exp(x - np.max(x, axis=dim, keepdims=True))
+            return tensor(z / z.sum(axis=dim, keepdims=True))
+        fake_torch = SimpleNamespace(
+            zeros_like=lambda x: tensor(np.zeros_like(x)),
+            where=lambda x: (tensor(np.where(x)[0]),),
+            as_tensor=lambda x, **kw: tensor(x), bool=bool,
+            max=lambda x, dim: (tensor(np.max(x, axis=dim)), tensor(np.argmax(x, axis=dim))))
+        selector_tree = ast.parse(Path('ema_utils.py').read_text())
+        selector = next(n for n in selector_tree.body if isinstance(n, ast.FunctionDef)
+                        and n.name == 'select_dual_view_pseudo_labels')
+        selector.decorator_list = []
+        selector_env = dict(torch=fake_torch, F=SimpleNamespace(softmax=softmax))
+        exec(compile(ast.Module(body=[selector], type_ignores=[]), '<actual-selector>', 'exec'), selector_env)
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'audit.csv'
             env = dict(np=np, csv=csv, audit_source=audit_source, i=0, device='cpu',
+                       thresholds=tensor(thresholds), enable_radius_rescue=enable_rescue,
+                       select_dual_view_pseudo_labels=selector_env['select_dual_view_pseudo_labels'],
                        logits1=tensor(logits1), logits2=tensor(logits2),
                        region_ok=tensor(region), teacher_mean_features=tensor(features),
                        sample_ids=tensor(np.arange(len(region))), ds_source=bank,
                        ds_config=DSConfig(k=3, min_neighbors=3, alpha=1.0),
                        ds_totals=np.zeros(7), ds_csv_path=str(path),
-                       torch=SimpleNamespace(zeros_like=lambda x: tensor(np.zeros_like(x)),
-                                             where=lambda x: (tensor(np.where(x)[0]),),
-                                             as_tensor=lambda x, **kw: tensor(x), bool=bool))
+                       torch=fake_torch)
             exec(compile(code, '<actual-training-gate>', 'exec'), env)
             rows = list(csv.reader(io.StringIO(path.read_text()))) if path.exists() else []
         return env, rows
 
-    def test_all_gates_and_no_confidence_bypass(self):
+    def test_direct_confidence_and_ds_rescue(self):
         bank = EvidenceBank(np.tile([1., 0.], (3, 1)), [0, 0, 0],
                             [0, 1, 2], [1., 1., 1.], 2)
-        # Low confidence passes; high confidence fails radius/DS; disagreement fails.
-        a = [[.01, 0], [10, 0], [10, 0], [10, 0], [0, 10]]
-        b = [[.02, 0], [10, 0], [10, 0], [0, 10], [0, 10]]
+        # Low confidence rescued; high confidence bypasses radius; missing/opposite
+        # DS evidence rejects low confidence; disagreement is always rejected.
+        a = [[.01, 0], [10, 0], [.01, 0], [10, 0], [0, .01]]
+        b = [[.02, 0], [10, 0], [.02, 0], [0, 10], [0, .02]]
         env, rows = self.run_gate(a, b, [True, False, True, True, True],
-                                  [[1., 0.], [1., 0.], [-1., 0.], [1., 0.], [1., 0.]], bank)
-        self.assertEqual(env['final_mask'].tolist(), [True, False, False, False, False])
+                                  [[1., 0.], [-1., 0.], [-1., 0.], [1., 0.], [1., 0.]], bank)
+        self.assertEqual(env['final_mask'].tolist(), [True, True, False, False, False])
         self.assertEqual(env['ds_totals'][0], 3)
         self.assertEqual(env['ds_totals'][2], 1)
         self.assertEqual([row[1] for row in rows], ['0', '2', '4'])
@@ -86,6 +123,24 @@ class AgreementRadiusDSTest(unittest.TestCase):
         cols = next(n.value for n in ast.walk(self.tree) if isinstance(n, ast.Assign)
                     and any(isinstance(t, ast.Name) and t.id == 'ds_columns' for t in n.targets))
         self.assertTrue(all(len(row) == len(cols.elts) for row in rows))
+
+    def test_warmup_keeps_only_direct_confidence(self):
+        class ForbiddenBank:
+            def evaluate(self, *args):
+                raise AssertionError('Warmup must skip DS')
+        env, rows = self.run_gate([[.01, 0], [10, 0]], [[.01, 0], [10, 0]],
+                                  [True, False], [[1., 0.], [1., 0.]], ForbiddenBank(), False)
+        self.assertEqual(env['final_mask'].tolist(), [False, True])
+        self.assertEqual(rows, [])
+
+    def test_boundary_and_missing_class_close_direct_route(self):
+        class ForbiddenBank:
+            def evaluate(self, *args):
+                raise AssertionError('Warmup must skip DS')
+        env, _ = self.run_gate([[0, 0], [0, 10]], [[0, 0], [0, 10]],
+                              [True, True], [[1., 0.], [1., 0.]], ForbiddenBank(), False,
+                              thresholds=(.5, np.inf))
+        self.assertEqual(env['final_mask'].tolist(), [True, False])
 
     def test_no_candidates_never_queries_ds(self):
         class ForbiddenBank:
@@ -99,22 +154,47 @@ class AgreementRadiusDSTest(unittest.TestCase):
         self.assertTrue(self.parse([]).ds_neighbor)
         for argv in (['--threshold_base', '.9'], ['--phi', '1.4'],
                      ['--rescue_js_threshold', '.01'], ['--rescue_js_start_epoch', '20'],
-                     ['--radius_rescue_warmup_epochs', '3'], ['--no_radius_rescue']):
+                     ['--radius_rescue_warmup_epochs', '-1'], ['--no_radius_rescue']):
             with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 self.parse(argv)
 
-    def test_epoch_zero_refresh_and_no_confidence_or_js_selection(self):
+    def test_epoch_refresh_and_no_js_selection(self):
         self.assertNotIn('rescue_js', self.source)
-        self.assertNotIn('calculate_target_thresholds', self.source)
-        self.assertNotIn('confidence_mask', self.source)
+        self.assertIn('final_mask = confidence_mask | rescue_mask', self.source)
+        self.assertEqual(self.parse([]).radius_rescue_warmup_epochs, 3)
         loop = self.source.index('for i in range(args.epochs):')
         refresh = self.source.index('ds_source = refresh_ds_source_bank(', loop)
         batches = self.source.index('for weak1, weak2, strong, _, sample_ids', loop)
         self.assertLess(refresh, batches)
+        self.assertLess(self.source.index('thresholds, threshold_counts = calculate_target_thresholds(', loop), batches)
+        scanner = next(n for n in self.tree.body if isinstance(n, ast.FunctionDef)
+                       and n.name == 'calculate_target_thresholds')
+        self.assertFalse(any(isinstance(n, ast.Name) and n.id == '_ignored_target_labels'
+                             and isinstance(n.ctx, ast.Load) for n in ast.walk(scanner)))
         self.assertIn('if i % args.source_refresh_interval == 0:', self.source)
         self.assertIn('prototype_update_mask |= final_mask', self.source)
         self.assertIn('criterion(output[0], train_targets) * train_con_idx', self.source)
 
+
+class ThresholdStatisticsTest(unittest.TestCase):
+    def test_unequal_batches_agreement_and_missing_class(self):
+        stats = DualViewClassMeans(3)
+        stats.update([[.8,.1,.1]], [[.7,.2,.1]])
+        stats.update([[.9,.05,.05], [.6,.2,.2], [.1,.8,.1], [.8,.1,.1]],
+                     [[.8,.1,.1], [.5,.3,.2], [.2,.7,.1], [.1,.8,.1]])
+        thresholds, counts = stats.finalize()
+        np.testing.assert_allclose(thresholds[:2], [2./3., .7])
+        self.assertTrue(np.isinf(thresholds[2]))
+        self.assertEqual(counts.tolist(), [3, 1, 0])
+
+    def test_empty_epoch_and_no_statistics_leak_across_epochs(self):
+        stats = DualViewClassMeans(2)
+        stats.update(np.empty((0,2)), np.empty((0,2)))
+        stats.update([[.9,.1]], [[.1,.9]])
+        self.assertTrue(np.isinf(stats.finalize()[0]).all())
+        stats.update([[.9,.1]], [[.8,.2]])
+        self.assertAlmostEqual(stats.finalize()[0][0], .8)
+        self.assertTrue(np.isinf(DualViewClassMeans(2).finalize()[0]).all())
 
 if __name__ == '__main__':
     unittest.main()

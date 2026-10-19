@@ -3,12 +3,13 @@
 This is a PyTorch implementation of the paper:
 
 "Unsupervised Cross-Domain Facial Expression Recognition via Class Adaptive self-Training"
-## Current experiment: agreement + source radius + DS (v18)
+## Current experiment: class-mean dual-view confidence + radius/DS rescue
 
-See [v18 behavior and training command](AGREEMENT_RADIUS_DS_V18.md).
-This branch removes high-confidence acceptance and JS from training.
-All accepted target pseudo-labels pass agreement, radius and source-only DS from epoch 0.
-Older experiment documents below describe historical branches.
+See [current behavior and training command](AGREEMENT_RADIUS_DS_V18.md).
+The existing v18 branch now uses epoch-wide per-class mean minimum confidence
+from agreeing target-training weak views. High-confidence predictions are accepted
+directly; the remaining agreeing samples can use source radius + DS rescue after
+three warmup epochs. No JS is used in training. Older documents describe historical experiments.
 
 ## Environment
 Ubuntu 16.04 LTS, python 3.8, pytorch 1.8.1
