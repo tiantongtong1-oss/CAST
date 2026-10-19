@@ -60,7 +60,7 @@ class SourceOnlyDSTest(unittest.TestCase):
                        and n.name == 'refresh_ds_source_bank')
         self.assertEqual([a.arg for a in refresh.args.args],
                          ['teacher', 'feature_hook', 'source_loader', 'classes'])
-        self.assertIn('final_mask = confidence_mask | rescue_mask', text)
+        self.assertIn('radius_candidates = agreement_mask & region_ok', text)
         self.assertIn('if args.immediate_prototype_update:', text)
 
 

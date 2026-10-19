@@ -126,8 +126,8 @@ class DSTest(unittest.TestCase):
 
     def test_wiring_scope_and_no_truth(self):
         s = Path('train.py').read_text()
-        self.assertLess(s.index('rescue_mask = rescue_candidates & region_ok'), s.index('source_ds = ds_source.evaluate'))
-        self.assertLess(s.index('source_ds = ds_source.evaluate'), s.index('final_mask = confidence_mask | rescue_mask'))
+        self.assertLess(s.index('radius_candidates = agreement_mask & region_ok'), s.index('source_ds = ds_source.evaluate'))
+        self.assertLess(s.index('source_ds = ds_source.evaluate'), s.index('final_mask[query_idx] = torch.as_tensor'))
         self.assertEqual(s.count('n = max(ds_totals[0], 1)'), 1)
         self.assertGreater(s.index('n = max(ds_totals[0], 1)'), s.index('for i in range(args.epochs):'))
         tree = ast.parse(s)

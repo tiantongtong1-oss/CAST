@@ -3,6 +3,13 @@
 This is a PyTorch implementation of the paper:
 
 "Unsupervised Cross-Domain Facial Expression Recognition via Class Adaptive self-Training"
+## Current experiment: agreement + source radius + DS (v18)
+
+See [v18 behavior and training command](AGREEMENT_RADIUS_DS_V18.md).
+This branch removes high-confidence acceptance and JS from training.
+All accepted target pseudo-labels pass agreement, radius and source-only DS from epoch 0.
+Older experiment documents below describe historical branches.
+
 ## Environment
 Ubuntu 16.04 LTS, python 3.8, pytorch 1.8.1
 ## Datasets
