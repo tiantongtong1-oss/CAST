@@ -112,6 +112,8 @@ def parse_args(argv=None):
     parser.add_argument('--device', choices=['cuda', 'cpu'], default='cuda',
                         help='CPU is supported for smoke tests; CUDA recommended for FER training')
 
+    parser.add_argument('--no_rescue_js', action='store_true',
+                        help='disable JS computation and filtering for every target epoch; overrides JS threshold')
     parser.add_argument('--rescue_js_threshold', type=float, default=None,
                         help='optional rescue-only JS divergence ceiling, natural logs; e.g. 0.01')
 
@@ -152,6 +154,8 @@ def parse_args(argv=None):
         parser.error('--promotion_epochs must be positive')
     if not args.run_name or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-' for c in args.run_name):
         parser.error('--run_name must contain only letters, digits, underscores or hyphens')
+    if args.no_rescue_js:
+        args.rescue_js_threshold = None
     if args.rescue_js_start_epoch < 0:
         parser.error('--rescue_js_start_epoch must be nonnegative')
     if args.rescue_js_threshold is not None and (not np.isfinite(args.rescue_js_threshold) or not 0 <= args.rescue_js_threshold <= np.log(2.0)):

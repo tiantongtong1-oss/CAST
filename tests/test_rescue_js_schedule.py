@@ -22,6 +22,14 @@ class JSScheduleTest(unittest.TestCase):
         for epoch in [0,19,20,29]:
             self.assertFalse(rescue_js_enabled(None,epoch,20))
 
+    def test_explicit_ablation_overrides_late_js(self):
+        args = self.parse(['--rescue_js_threshold', '.01',
+                           '--rescue_js_start_epoch', '20', '--no_rescue_js'])
+        self.assertIsNone(args.rescue_js_threshold)
+        for epoch in [0, 19, 20, 29]:
+            self.assertFalse(rescue_js_enabled(args.rescue_js_threshold, epoch,
+                                              args.rescue_js_start_epoch))
+
     def parse(self,argv):
         tree=ast.parse(Path('train.py').read_text())
         functions=[n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in ('parse_args','ds_config_from_args')]
@@ -64,3 +72,4 @@ class JSScheduleTest(unittest.TestCase):
 
 if __name__=='__main__':
     unittest.main()
+
