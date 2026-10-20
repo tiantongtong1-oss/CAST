@@ -15,7 +15,8 @@ from ema_utils import create_ema_teacher, select_dual_view_pseudo_labels, update
 from prototype_utils import FeatureHook, PrototypeBank, prototype_weight_for_epoch
 from source_prototype_radius import SourcePrototypeRadiusBank
 from reliability_roles import ReliabilityRoles
-from dual_domain_ds import DSConfig, EvidenceBank, audit_source
+from dual_domain_ds import DSConfig
+from neighbor_support import MeanSupportBank, audit_mean_support, otsu_threshold
 import image_utils as util
 from randaugment import RandAugmentMC
 # 总训练入口与调度器。串起数据、Source 预训练、EMA Teacher、
@@ -95,7 +96,7 @@ def parse_args(argv=None):
                              'MMD anchor promotion is unchanged')
     parser.add_argument('--promotion_epochs', type=int, default=3,
                         help='consecutive eligible epochs before anchor promotion')
-    parser.add_argument('--run_name', type=str, default='adaptive_minconf_radius_ds_nojs_v18',
+    parser.add_argument('--run_name', type=str, default='adaptive_minconf_radius_mean_support_otsu_nojs_v18',
                         help='checkpoint suffix; use distinct names for ablations')
     parser.add_argument('--device', choices=['cuda', 'cpu'], default='cuda',
                         help='CPU is supported for smoke tests; CUDA recommended for FER training')
@@ -403,7 +404,31 @@ def refresh_ds_source_bank(teacher, feature_hook, source_loader, classes):
         sy.append(labels.numpy())
     x, y = np.concatenate(sx), np.concatenate(sy)
     # Source IDs and target query IDs are separate namespaces: do not exclude self.
-    return EvidenceBank(x, y, np.arange(len(y)), np.ones(len(y)), classes)
+    return MeanSupportBank(x, y, np.arange(len(y)), np.ones(len(y)), classes)
+
+
+@torch.no_grad()
+def calibrate_neighbor_support(teacher, hook, loader, source, config, radius, thresholds):
+    """One epoch-wide Otsu threshold using training rescue candidates only."""
+    device = next(teacher.parameters()).device
+    teacher.eval()
+    scores = []
+    for weak1, weak2, _, _, sample_ids in loader:
+        logits1, _ = teacher(weak1.to(device), None, None, 'test', 'target')
+        f1 = F.normalize(hook.output.detach(), dim=1)
+        logits2, _ = teacher(weak2.to(device), None, None, 'test', 'target')
+        features = F.normalize(f1 + F.normalize(hook.output.detach(), dim=1), dim=1)
+        labels, accepted, _ = select_dual_view_pseudo_labels(logits1, logits2, thresholds)
+        candidates = labels.eq(logits2.argmax(dim=1)) & ~accepted.bool()
+        candidates &= radius.in_distribution(features, labels)
+        idx = torch.where(candidates)[0]
+        if not len(idx):
+            continue
+        evidence = source.evaluate(features[idx].cpu().numpy(),
+                                   sample_ids[idx.cpu()].cpu().numpy(), config)
+        result = audit_mean_support(evidence, labels[idx].cpu().numpy(), np.inf)
+        scores.extend(result['support'][result['available']].tolist())
+    return otsu_threshold(scores), len(scores)
 
 
 def run_training():
@@ -614,7 +639,10 @@ def run_training():
                     if args.role_separation else None)
 
     ds_config = ds_config_from_args(args)
-    print('DS_Neighbor: %s DS_Config: %s Scope: low_confidence_radius_rescue_only Evidence: source_only' %
+    print('Neighbor support uses only ds_k/ds_min_neighbors; legacy DS distance, '
+          'bandwidth, strength cap and four thresholds are inactive.')
+    print('DS_Neighbor: %s DS_Config: %s Scope: low_confidence_radius_rescue_only Evidence: source_only Mean_Support_Otsu'
+           %
           (args.ds_neighbor, ds_config))
     ds_csv_path = os.path.join(model_path, args.run_name + '_ds_diagnostics.csv')
     ds_columns = ['epoch', 'sample_id', 'pseudo_label', 'source_count',
@@ -654,6 +682,13 @@ def run_training():
                    np.array2string(reliability_bank.class_radii.cpu().numpy(), precision=8),
                    reliability_bank.distribution_initialized.cpu().tolist()))
             log_source_prototypes(reliability_bank)
+        support_threshold, support_calibration_count = (float('inf'), 0)
+        if enable_radius_rescue:
+            support_threshold, support_calibration_count = calibrate_neighbor_support(
+                teacher, teacher_feature_hook, train_loader_target, ds_source,
+                ds_config, reliability_bank, thresholds)
+        print('[Target Epoch %d] Neighbor_Support_Otsu: %s Calibration_Count: %d' %
+              (i, support_threshold, support_calibration_count))
         current_proto_weight = prototype_weight_for_epoch(
             i, args.proto_weight, args.proto_warmup_epochs, args.proto_ramp_epochs
         )
@@ -718,8 +753,8 @@ def run_training():
                     queries = teacher_mean_features[query_idx].cpu().numpy()
                     query_ids = sample_ids[query_idx.cpu()].cpu().numpy()
                     source_ds = ds_source.evaluate(queries, query_ids, ds_config)
-                    ds_result = audit_source(
-                        source_ds, pseudo_targets[query_idx].cpu().numpy(), ds_config)
+                    ds_result = audit_mean_support(
+                        source_ds, pseudo_targets[query_idx].cpu().numpy(), support_threshold)
                     rescue_mask[query_idx] = torch.as_tensor(
                         ds_result['pass_mask'], device=device, dtype=torch.bool)
                     ds_totals += np.array([

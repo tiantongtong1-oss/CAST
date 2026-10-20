@@ -14,7 +14,8 @@ from types import SimpleNamespace
 import unittest
 import numpy as np
 from adaptive_confidence import DualViewClassMeans
-from dual_domain_ds import DSConfig, EvidenceBank, audit_source
+from dual_domain_ds import DSConfig
+from neighbor_support import MeanSupportBank as EvidenceBank, audit_mean_support
 
 
 class Tensor(np.ndarray):
@@ -94,7 +95,7 @@ class AgreementRadiusDSTest(unittest.TestCase):
         exec(compile(ast.Module(body=[selector], type_ignores=[]), '<actual-selector>', 'exec'), selector_env)
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'audit.csv'
-            env = dict(np=np, csv=csv, audit_source=audit_source, i=0, device='cpu',
+            env = dict(np=np, csv=csv, audit_mean_support=audit_mean_support, support_threshold=.6, i=0, device='cpu',
                        thresholds=tensor(thresholds), enable_radius_rescue=enable_rescue,
                        select_dual_view_pseudo_labels=selector_env['select_dual_view_pseudo_labels'],
                        logits1=tensor(logits1), logits2=tensor(logits2),

@@ -26,15 +26,29 @@ reliable = agreement & (min_confidence >= sample_threshold)
 这与两个置信度分别 >= 同一个阈值数学等价；恢复旧阈值公式才是相对 e4224b9 的算法变化。
 保留 >= 的包含边界行为，不改成严格 >。adaptive_confidence.py 为旧实验工具，不进入当前训练。
 
-## 补救及训练
+## 平均邻居支持度补救（本次更新）
 
-最终接受 = 自适应置信度接受 OR (类别一致 AND 非置信度接受 AND 源域半径通过 AND DS通过)。
-恢复原高置信度方案的前三轮补救 warmup：epoch 0–2 仅自适应置信度直接接受；epoch 3 起启用补救。
-可用 --radius_rescue_warmup_epochs 调整，默认 3。此调度独立于原型损失 warmup。
-DS 始终作为补救审核启用，--ds_neighbor 是兼容参数。证据仅来自有真实标签的源域。
-源域半径默认每轮刷新，DS 证据每轮刷新。高置信度样本不必通过半径或 DS 即可参与分类监督。
-anchor 晋升仍要求半径内且连续满足条件；--immediate_prototype_update 允许全部最终接纳样本即时更新原型。
-Student 和 EMA Teacher 每 batch 更新。无目标样本通过时，源域监督仍继续。
+保留原双视图阈值公式、类别一致性、源域半径、三轮补救 warmup、EMA 及原型更新流程；继续无 JS。
+高置信度直接接纳路径完全保留。
+
+源域证据有真实标签。使用 Teacher 特征的余弦相似度选最近 K 个源域邻居，
+每个邻居的强度 s=max(0, cosine)，其真实标签获得质量 s，未知集合获得 1-s。
+外层等权平均，候选标签 A 的分数 S=mean(s * I(source_label=A))。
+不再使用 Dempster 连乘融合；相同弱证据重复出现不会仅因数量增加而趋近 1。
+本实现是平均证据支持审核，不是相关性修正 DS。
+
+每轮刷新源域证据和所需半径后，额外扫描目标训练 loader 的双弱视图。
+仅收集“类别一致、未被双视图置信度直接接纳、通过源域半径、邻居数量足够”的候选支持度。
+对这些分数做精确 Otsu 分割，阈值取高分组最小值，训练 batch 使用 S>=阈值。
+不读取目标真实标签。额外扫描会增加每轮计算量，随机增强及 Teacher batch 更新意味着校准分布与训练分数不完全一致。
+无候选或所有分数相同时阈值为 inf，本轮关闭补救，直接置信度路径继续。
+Otsu 仅划分相对高分组，不保证伪标签正确率。
+
+邻居审核只使用 --ds_k 和 --ds_min_neighbors；保留旧 CLI 参数兼容性，但旧距离截断、
+带宽、强度上限、support/margin/uncertainty/conflict 四阈值不再参与新审核。
+旧参数仍经过兼容合法性检查，启动日志会明确说明它们不参与审核。
+DSConfig 及 dual_domain_ds.py 中旧算法保留供旧实验和诊断工具调用。
+最终接受 = 原双视图置信度接受 OR 平均支持度补救接受。
 
 ## 更新与运行
 
@@ -58,26 +72,23 @@ python -u train.py \
   --radius_rescue_warmup_epochs 3 \
   --immediate_prototype_update \
   --ds_neighbor --ds_k 11 --ds_min_neighbors 3 \
-  --ds_max_distance 0.5 --ds_bandwidth 0.25 --ds_strength_cap 0.95 \
-  --ds_support_threshold 0.6 --ds_margin_threshold 0.1 \
-  --ds_uncertainty_threshold 0.3 --ds_conflict_threshold 0.5 \
-  --run_name adaptive_minconf_radius_ds_nojs_v18 \
-  2>&1 | tee test_logs/adaptive_minconf_radius_ds_nojs_v18.log
+  --run_name adaptive_minconf_radius_mean_support_otsu_nojs_v18 \
+  2>&1 | tee test_logs/adaptive_minconf_radius_mean_support_otsu_nojs_v18.log
 ```
 
 ## 日志及诊断
 
-每轮日志输出 Confidence_Thresholds、Class_Mean_Confidence、Global_Class_Mean、Threshold_Center，
-并显示 Threshold_Mode: original_adaptive_min_conf。
-Confidence_Accept_Num 是直接接纳数，Radius_Rescue_Num 是补救数，两者相加为 Final_Accept_Num。
-DS CSV 仅记录补救候选，不包含直接接纳样本；没有 JS 字段。
+新增 Neighbor_Support_Otsu 和 Calibration_Count。
+保留旧 CSV 列以兼容工具，但 source_support/support 现在是平均单类别质量，
+unknown 是平均未知质量，margin 仅诊断，conflict 固定为 0（未计算 DS 冲突），均不单独设阈值。
+历史 diagnose_ds.py 仍是旧 DS 诊断，不代表当前训练选择规则。
 
 ## 检查
 
 ```bash
 python -m unittest discover -s tests -p '*ds*.py' -v
-python -m py_compile train.py ema_utils.py
+python -m unittest discover -s tests -p 'test_neighbor_support.py' -v
+python -m py_compile train.py neighbor_support.py
 ```
 
-37 项针对性测试通过，包含显式最小置信度与双比较等价性、边界、补救及 warmup。
-阈值扫描函数恢复自 v17。环境没有 PyTorch 和 RAF/FER 数据，未运行完整训练。
+环境没有 PyTorch 和 RAF/FER 数据，未运行完整训练。

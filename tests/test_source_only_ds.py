@@ -52,7 +52,7 @@ class SourceOnlyDSTest(unittest.TestCase):
         tree = ast.parse(text)
         calls = {n.func.id for n in ast.walk(tree)
                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
-        self.assertIn('audit_source', calls)
+        self.assertIn('audit_mean_support', calls)
         self.assertNotIn('combine_domains', calls)
         self.assertNotIn('refresh_ds_banks', calls)
         self.assertNotIn('target_ds_reference', text)
