@@ -84,6 +84,7 @@ class AgreementRadiusDSTest(unittest.TestCase):
             zeros_like=lambda x: tensor(np.zeros_like(x)),
             where=lambda x: (tensor(np.where(x)[0]),),
             as_tensor=lambda x, **kw: tensor(x), bool=bool,
+            minimum=lambda x, y: tensor(np.minimum(x, y)),
             max=lambda x, dim: (tensor(np.max(x, axis=dim)), tensor(np.argmax(x, axis=dim))))
         selector_tree = ast.parse(Path('ema_utils.py').read_text())
         selector = next(n for n in selector_tree.body if isinstance(n, ast.FunctionDef)
@@ -152,24 +153,37 @@ class AgreementRadiusDSTest(unittest.TestCase):
 
     def test_default_is_ds_enabled_and_old_gates_rejected(self):
         self.assertTrue(self.parse([]).ds_neighbor)
-        for argv in (['--threshold_base', '.9'], ['--phi', '1.4'],
+        for argv in (['--phi', '1.4'],
                      ['--rescue_js_threshold', '.01'], ['--rescue_js_start_epoch', '20'],
                      ['--radius_rescue_warmup_epochs', '-1'], ['--no_radius_rescue']):
             with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 self.parse(argv)
 
+    def test_minimum_score_matches_two_inclusive_comparisons(self):
+        rng = np.random.default_rng(17)
+        conf1, conf2, threshold = rng.random((3, 500))
+        conf1[:3] = [.8, .9, .7]
+        conf2[:3] = [.9, .8, .8]
+        threshold[:3] = .8
+        np.testing.assert_array_equal(np.minimum(conf1, conf2) >= threshold,
+                                      (conf1 >= threshold) & (conf2 >= threshold))
+
     def test_epoch_refresh_and_no_js_selection(self):
         self.assertNotIn('rescue_js', self.source)
         self.assertIn('final_mask = confidence_mask | rescue_mask', self.source)
         self.assertEqual(self.parse([]).radius_rescue_warmup_epochs, 3)
+        args = self.parse([])
+        self.assertEqual((args.threshold_base, args.threshold_beta, args.threshold_margin,
+                          args.threshold_min, args.threshold_max), (.85, .5, .02, .8, .95))
+        self.assertEqual(self.parse(['--threshold_base', '.9']).threshold_base, .9)
         loop = self.source.index('for i in range(args.epochs):')
         refresh = self.source.index('ds_source = refresh_ds_source_bank(', loop)
         batches = self.source.index('for weak1, weak2, strong, _, sample_ids', loop)
         self.assertLess(refresh, batches)
-        self.assertLess(self.source.index('thresholds, threshold_counts = calculate_target_thresholds(', loop), batches)
+        self.assertLess(self.source.index('thresholds, class_mean, global_mean, threshold_center = calculate_target_thresholds(', loop), batches)
         scanner = next(n for n in self.tree.body if isinstance(n, ast.FunctionDef)
                        and n.name == 'calculate_target_thresholds')
-        self.assertFalse(any(isinstance(n, ast.Name) and n.id == '_ignored_target_labels'
+        self.assertFalse(any(isinstance(n, ast.Name) and n.id == 'unused_target_labels'
                              and isinstance(n.ctx, ast.Load) for n in ast.walk(scanner)))
         self.assertIn('if i % args.source_refresh_interval == 0:', self.source)
         self.assertIn('prototype_update_mask |= final_mask', self.source)

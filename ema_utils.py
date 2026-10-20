@@ -65,10 +65,8 @@ def select_dual_view_pseudo_labels(logits1, logits2, thresholds):
     pseudo_targets = pred1
     thresholds = thresholds.to(device=logits1.device, dtype=conf1.dtype)
     sample_threshold = thresholds.index_select(0, pseudo_targets)
-    reliable = (
-        agreement
-        & (conf1 >= sample_threshold)
-        & (conf2 >= sample_threshold)
-    )
+    # One score and one comparison; >= preserves the original inclusive boundary.
+    min_confidence = torch.minimum(conf1, conf2)
+    reliable = agreement & (min_confidence >= sample_threshold)
 
     return pseudo_targets, reliable.float(), int(agreement.sum().item())

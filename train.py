@@ -12,7 +12,6 @@ from torchvision import transforms
 import Networks
 from dataset import RafDataSet, FER
 from ema_utils import create_ema_teacher, select_dual_view_pseudo_labels, update_ema_teacher
-from adaptive_confidence import DualViewClassMeans
 from prototype_utils import FeatureHook, PrototypeBank, prototype_weight_for_epoch
 from source_prototype_radius import SourcePrototypeRadiusBank
 from reliability_roles import ReliabilityRoles
@@ -20,7 +19,7 @@ from dual_domain_ds import DSConfig, EvidenceBank, audit_source
 import image_utils as util
 from randaugment import RandAugmentMC
 # 总训练入口与调度器。串起数据、Source 预训练、EMA Teacher、
-# 双视图类别均值置信度直接接纳 + Source Radius / Source-only DS 补救；无 JS。
+# 原类别自适应阈值 + 双视图最小置信度直接接纳 + Source Radius / DS 补救；无 JS。
 
 #随机种子
 seed = 1314
@@ -62,6 +61,12 @@ def parse_args(argv=None):
                         help='gamma: classifier modulation loss weight')
     parser.add_argument('--ema_decay', type=float, default=0.999,
                         help='fixed EMA decay for teacher parameters and floating buffers')
+    parser.add_argument('--threshold_base', type=float, default=0.85)
+    parser.add_argument('--threshold_beta', type=float, default=0.5)
+    parser.add_argument('--threshold_margin', type=float, default=0.02)
+    parser.add_argument('--threshold_min', type=float, default=0.80)
+    parser.add_argument('--threshold_max', type=float, default=0.95)
+
     # Prototype-consistency regularizer retained from v1/v2.
     parser.add_argument('--proto_weight', type=float, default=0.10,
                         help='maximum prototype-consistency loss weight')
@@ -90,7 +95,7 @@ def parse_args(argv=None):
                              'MMD anchor promotion is unchanged')
     parser.add_argument('--promotion_epochs', type=int, default=3,
                         help='consecutive eligible epochs before anchor promotion')
-    parser.add_argument('--run_name', type=str, default='classmean_minconf_radius_ds_nojs_v18',
+    parser.add_argument('--run_name', type=str, default='adaptive_minconf_radius_ds_nojs_v18',
                         help='checkpoint suffix; use distinct names for ablations')
     parser.add_argument('--device', choices=['cuda', 'cpu'], default='cuda',
                         help='CPU is supported for smoke tests; CUDA recommended for FER training')
@@ -119,6 +124,12 @@ def parse_args(argv=None):
         parser.error('epoch counts must be nonnegative')
     if args.pre_epochs == 0 and not args.checkpoint:
         parser.error('--pre_epochs 0 requires --checkpoint with pretrained model weights')
+    if not 0 < args.threshold_min <= args.threshold_base <= args.threshold_max <= 1:
+        parser.error('require 0 < threshold_min <= threshold_base <= threshold_max <= 1')
+    if not np.isfinite(args.threshold_beta) or args.threshold_beta < 0:
+        parser.error('threshold_beta must be finite and nonnegative')
+    if not np.isfinite(args.threshold_margin) or args.threshold_margin < 0:
+        parser.error('threshold_margin must be finite and nonnegative')
     if args.promotion_epochs < 1:
         parser.error('--promotion_epochs must be positive')
     if not args.run_name or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-' for c in args.run_name):
@@ -188,25 +199,65 @@ def classifier_modulation_loss(model):
     return torch.mean((matrix + 1.0) / 2.0)
 
 
-@torch.no_grad()
-def calculate_target_thresholds(teacher, loader, class_num):
-    """Scan both weak views of target TRAIN once; never consume target labels.
+def calculate_target_thresholds(model, loader, class_num, threshold_base,
+                                threshold_beta, threshold_margin,
+                                threshold_min, threshold_max):
 
-    Aggregate sample sums/counts across all batches, not means of batch means.
-    The returned thresholds are frozen for the upcoming training epoch.
-    """
-    teacher.eval()
-    device = next(teacher.parameters()).device
-    statistics = DualViewClassMeans(class_num)
-    for weak1, weak2, _ignored_target_labels in loader:
-        logits1, _ = teacher(weak1.to(device, non_blocking=True), None, None,
-                             mode='test', task='target')
-        logits2, _ = teacher(weak2.to(device, non_blocking=True), None, None,
-                             mode='test', task='target')
-        statistics.update(F.softmax(logits1, dim=1).cpu().numpy(),
-                          F.softmax(logits2, dim=1).cpu().numpy())
-    thresholds, counts = statistics.finalize()
-    return torch.from_numpy(thresholds).float(), counts
+    # EMA Teacher 扫描整个target train，根据各预测类别平均confidence 生成类别自适应置信度阈值
+
+    class_sum = torch.zeros(class_num, dtype=torch.float64)
+    # 记录每个预测类别包含的样本数量
+    class_count = torch.zeros(class_num, dtype=torch.float64)
+    device = next(model.parameters()).device
+    # 切换到评估模式，关闭 Dropout、固定 BatchNorm 等
+    model.eval()
+
+    # 这里只进行推理，不计算梯度，减少显存和计算开销
+    with torch.no_grad():
+        for batch in loader:
+            imgs = batch[0].to(device, non_blocking=True)
+
+            # 使用模型对目标域图像进行预测
+            # logits：分类输出
+            # _：其他不需要使用的输出
+            logits, _ = model(imgs, None, None, mode='test', task='target')
+
+            #转化成类别概率
+            probs = F.softmax(logits, dim=1).cpu()
+            # 获取每个样本的最大预测概率和对应预测类别
+            # max_prob：模型预测的最高置信度
+            # pred_label：最高置信度对应的类别
+            max_prob, pred_label = torch.max(probs, dim=1)
+
+            class_sum.scatter_add_(0, pred_label, max_prob.double())
+            class_count.scatter_add_(
+                0, pred_label, torch.ones_like(max_prob, dtype=torch.float64)
+            )
+
+    valid = class_count > 0
+    class_mean = class_sum / class_count.clamp_min(1.0)
+    if torch.any(valid):
+        global_mean = class_mean[valid].mean()
+    else:
+        global_mean = class_mean.new_tensor(float(threshold_base))
+
+    threshold_center = max(
+        float(threshold_base),
+        float(global_mean.item()) + float(threshold_margin),
+    )
+    threshold_center = min(threshold_center, float(threshold_max))
+
+    thresholds = threshold_center + threshold_beta * (class_mean - global_mean)
+    thresholds = torch.clamp(
+        thresholds, min=threshold_min, max=threshold_max
+    ).float()
+    thresholds[~valid] = float(threshold_max)
+    return (
+        thresholds,
+        class_mean.float(),
+        float(global_mean.item()),
+        float(threshold_center),
+    )
 
 
 def evaluate(model, loader, criterion, num_samples, epoch, split_name):
@@ -375,7 +426,7 @@ def run_training():
     )
 
     print('---------------------------------------------------------------------------------------')
-    print('EMA + Class-Mean Dual-View Confidence + Source Radius / DS Rescue (no JS): '
+    print('EMA + Original Adaptive Threshold / Minimum Dual-View Confidence + Radius / DS Rescue (no JS): '
           '%s with source %s and target %s' %
           (args.backbone, args.data1, args.data2))
     print('alpha(w1):%s beta(w2):%s gamma(w3):%s ema:%s' %
@@ -418,7 +469,7 @@ def run_training():
     )
     target_threshold = FER(
         args.target_path, phase='train', transform=weak_transform,
-        weak2_transform=weak_transform, strong_transform=None, basic_aug=False
+        strong_transform=None, basic_aug=False
     )
     target_val = FER(
         args.target_path, phase='val', transform=test_transform,
@@ -578,13 +629,16 @@ def run_training():
     global_step = 0
 
     for i in range(args.epochs):
-        thresholds, threshold_counts = calculate_target_thresholds(
-            teacher, threshold_loader_target, class_num)
+        thresholds, class_mean, global_mean, threshold_center = calculate_target_thresholds(
+            teacher, threshold_loader_target, class_num, args.threshold_base,
+            args.threshold_beta, args.threshold_margin, args.threshold_min, args.threshold_max)
         enable_radius_rescue = i >= args.radius_rescue_warmup_epochs
-        print('[Target Epoch %d] Confidence_Thresholds: %s Agreement_Class_Counts: %s '
-              'Radius_Rescue_Enabled: %s Threshold_Mode: class_mean_min_conf' %
+        print('[Target Epoch %d] Confidence_Thresholds: %s Class_Mean_Confidence: %s '
+              'Global_Class_Mean: %.4f Threshold_Center: %.4f Radius_Rescue_Enabled: %s '
+              'Threshold_Mode: original_adaptive_min_conf' %
               (i, np.array2string(thresholds.numpy(), precision=6),
-               np.array2string(threshold_counts, separator=', '), enable_radius_rescue))
+               np.array2string(class_mean.numpy(), precision=6), global_mean,
+               threshold_center, enable_radius_rescue))
         if args.ds_neighbor:
             ds_source = refresh_ds_source_bank(
                 teacher, teacher_feature_hook, prototype_loader_source, class_num)
