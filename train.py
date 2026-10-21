@@ -18,6 +18,7 @@ from reliability_roles import ReliabilityRoles
 from dual_domain_ds import DSConfig
 from neighbor_support import MeanSupportBank, audit_mean_support, select_support_threshold
 from calibration_rng import isolated_rng
+from source_downsample import RandomSourceDownsample
 import image_utils as util
 from randaugment import RandAugmentMC
 # 总训练入口与调度器。串起数据、Source 预训练、EMA Teacher、
@@ -124,7 +125,13 @@ def parse_args(argv=None):
     parser.add_argument('--support_min_separation', type=float, default=0.7)
     parser.add_argument('--support_min_group_fraction', type=float, default=0.05)
     parser.add_argument('--calibration_seed', type=int, default=101314)
+    parser.add_argument('--source_downsample_prob', type=float, default=0.0)
+    parser.add_argument('--source_downsample_size', type=int, default=48)
     args = parser.parse_args(argv)
+    try:
+        RandomSourceDownsample(args.source_downsample_prob, args.source_downsample_size)
+    except ValueError as error:
+        parser.error(str(error))
     try:
         select_support_threshold([], args.support_threshold_mode,
             args.support_fixed_threshold, args.support_min_count,
@@ -281,7 +288,7 @@ def evaluate(model, loader, criterion, num_samples, epoch, split_name):
     val_loss = 0.0
     iter_cnt = 0
     bingo_cnt = 0
-    preds, labels = [], []
+    preds, labels, fear_ranks = [], [], []
     device = next(model.parameters()).device
 
     model.eval()
@@ -294,6 +301,9 @@ def evaluate(model, loader, criterion, num_samples, epoch, split_name):
             val_loss += loss.item()
             iter_cnt += 1
 
+            order = torch.argsort(out, dim=1, descending=True, stable=True)
+            rank = (order == 1).long().argmax(dim=1) + 1
+            fear_ranks.append(rank[targets == 1].cpu())
             predicts = torch.argmax(out, dim=1)
             bingo_cnt += torch.eq(predicts, targets).sum().item()
             preds.append(predicts.cpu())
@@ -331,6 +341,18 @@ def evaluate(model, loader, criterion, num_samples, epoch, split_name):
                    f1[c].item() * 100, int(cm[c].sum().item())))
         print('Recall = correct predictions / true class samples.')
 
+    if preds:
+        prediction, truth = torch.cat(preds), torch.cat(labels)
+        classes = model.fc.out_features
+        cm = torch.bincount(truth * classes + prediction, minlength=classes**2).reshape(classes, classes).float()
+        recall = cm.diag() / cm.sum(1).clamp_min(1)
+        f1 = 2*cm.diag() / (cm.sum(1)+cm.sum(0)).clamp_min(1)
+        ranks = torch.cat(fear_ranks)
+        top3 = (ranks <= 3).float().mean().item() if ranks.numel() else float('nan')
+        print('[Epoch %d] %s_Diagnostic Accuracy: %.4f Macro_F1: %.4f Fear_Recall: %.4f '
+              'Fear_Top3: %.4f Fear_Last: %d Fear_Support: %d' %
+              (epoch, split_name, acc, f1.mean().item(), recall[1].item(), top3,
+               int((ranks == classes).sum()), ranks.numel()))
     return acc
 
 
@@ -493,8 +515,14 @@ def run_training():
     if args.data1 != 'rafdb' or args.data2 != 'fer':
         raise ValueError('This branch implements RAF-DB -> FER2013.')
 
+    source_transform = transforms.Compose([
+        RandomSourceDownsample(args.source_downsample_prob, args.source_downsample_size),
+        weak_transform,
+    ])
+    print('Source_Downsample: probability=%s size=%s; source train only; no class weighting' %
+          (args.source_downsample_prob, args.source_downsample_size))
     source_train = RafDataSet(
-        args.source_path, phase='train', transform=weak_transform,
+        args.source_path, phase='train', transform=source_transform,
         strong_transform=None, basic_aug=False
     )
     source_prototype = RafDataSet(
@@ -603,8 +631,6 @@ def run_training():
             train_loss2 += aff_loss.item()
             train_loss3 += weight_loss.item()
             batch_count += 1
-        print('[Target Epoch %d] Rescue_Accept_Rate: %.6f' %
-              (i, rescue_accept_num / max(ds_totals[0], 1)))
         # 更新学习率
         scheduler.step()
         train_acc = float(bingo_cnt) / max(sample_count, 1)
@@ -1015,6 +1041,7 @@ def run_training():
 
 if __name__ == '__main__':
     run_training()
+
 
 
 
