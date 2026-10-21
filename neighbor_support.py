@@ -22,6 +22,54 @@ def otsu_threshold(scores):
     return float(levels[np.argmax(variance) + 1])
 
 
+def select_support_threshold(scores, mode='otsu', fixed=0.92, min_count=128,
+                             min_spread=0.01, min_separation=0.7,
+                             min_group_fraction=0.05):
+    """Select a threshold; guard defaults are experimental, not calibrated accuracy."""
+    if mode not in ('otsu', 'fixed', 'otsu_guarded'):
+        raise ValueError('invalid support threshold mode')
+    if not np.isfinite(fixed) or not 0 <= fixed <= 1:
+        raise ValueError('fixed support must be in [0, 1]')
+    if min_count < 2 or not np.isfinite(min_spread) or min_spread < 0:
+        raise ValueError('invalid count/spread guard')
+    if not 0 <= min_separation <= 1 or not 0 <= min_group_fraction <= .5:
+        raise ValueError('invalid separation/group guard')
+    values = np.asarray(scores, dtype=float)
+    values = values[np.isfinite(values)]
+    raw = otsu_threshold(values)
+    quantiles = np.quantile(values, [.05, .5, .95]) if len(values) else [np.nan] * 3
+    separation = fraction = 0.0
+    if np.isfinite(raw):
+        high = values >= raw
+        w = high.mean()
+        fraction = min(w, 1 - w)
+        total = values.var()
+        if total > 0:
+            separation = float(np.clip(w * (1-w) *
+                (values[high].mean() - values[~high].mean()) ** 2 / total, 0, 1))
+    reason = 'none'
+    if mode == 'otsu_guarded':
+        if not len(values):
+            reason = 'no_candidates'
+        elif len(values) < min_count:
+            reason = 'too_few_candidates'
+        elif not np.isfinite(raw):
+            reason = 'constant_scores'
+        elif quantiles[2] - quantiles[0] < min_spread:
+            reason = 'narrow_distribution'
+        elif separation < min_separation:
+            reason = 'weak_separation'
+        elif fraction < min_group_fraction:
+            reason = 'small_group'
+    effective_mode = ('fixed' if mode == 'fixed' else
+                      'fixed_fallback' if reason != 'none' else 'otsu')
+    threshold = raw if effective_mode == 'otsu' else fixed
+    return dict(threshold=threshold, raw_otsu=raw, count=len(values),
+                p05=float(quantiles[0]), p50=float(quantiles[1]), p95=float(quantiles[2]),
+                separation=separation, min_group_fraction=fraction,
+                mode=effective_mode, reason=reason)
+
+
 class MeanSupportBank(EvidenceBank):
     def evaluate(self, queries, query_ids, config, exclude_self=False):
         z = np.asarray(queries, dtype=np.float32)
@@ -70,3 +118,4 @@ def audit_mean_support(source, pseudo_labels, threshold):
                 available=source['available'], support=support,
                 margin=support - competitors.max(1),
                 uncertainty=source['uncertainty'], mass=mass)
+

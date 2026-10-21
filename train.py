@@ -16,7 +16,8 @@ from prototype_utils import FeatureHook, PrototypeBank, prototype_weight_for_epo
 from source_prototype_radius import SourcePrototypeRadiusBank
 from reliability_roles import ReliabilityRoles
 from dual_domain_ds import DSConfig
-from neighbor_support import MeanSupportBank, audit_mean_support, otsu_threshold
+from neighbor_support import MeanSupportBank, audit_mean_support, select_support_threshold
+from calibration_rng import isolated_rng
 import image_utils as util
 from randaugment import RandAugmentMC
 # 总训练入口与调度器。串起数据、Source 预训练、EMA Teacher、
@@ -116,7 +117,21 @@ def parse_args(argv=None):
     parser.add_argument('--ds_conflict_threshold', type=float, default=0.5)
     parser.add_argument('--ds_strength_cap', type=float, default=0.95)
 
+    parser.add_argument('--support_threshold_mode', choices=['otsu', 'fixed', 'otsu_guarded'], default='otsu')
+    parser.add_argument('--support_fixed_threshold', type=float, default=0.92)
+    parser.add_argument('--support_min_count', type=int, default=128)
+    parser.add_argument('--support_min_spread', type=float, default=0.01)
+    parser.add_argument('--support_min_separation', type=float, default=0.7)
+    parser.add_argument('--support_min_group_fraction', type=float, default=0.05)
+    parser.add_argument('--calibration_seed', type=int, default=101314)
     args = parser.parse_args(argv)
+    try:
+        select_support_threshold([], args.support_threshold_mode,
+            args.support_fixed_threshold, args.support_min_count,
+            args.support_min_spread, args.support_min_separation,
+            args.support_min_group_fraction)
+    except ValueError as error:
+        parser.error(str(error))
     if not np.isfinite(args.source_radius_quantile) or not 0 < args.source_radius_quantile <= 1:
         parser.error('source_radius_quantile must be finite and in (0, 1]')
     if args.source_refresh_interval < 1:
@@ -413,7 +428,7 @@ def calibrate_neighbor_support(teacher, hook, loader, source, config, radius, th
     device = next(teacher.parameters()).device
     teacher.eval()
     scores = []
-    for weak1, weak2, _, _, sample_ids in loader:
+    for weak1, weak2, _, sample_ids in loader:
         logits1, _ = teacher(weak1.to(device), None, None, 'test', 'target')
         f1 = F.normalize(hook.output.detach(), dim=1)
         logits2, _ = teacher(weak2.to(device), None, None, 'test', 'target')
@@ -428,7 +443,7 @@ def calibrate_neighbor_support(teacher, hook, loader, source, config, radius, th
                                    sample_ids[idx.cpu()].cpu().numpy(), config)
         result = audit_mean_support(evidence, labels[idx].cpu().numpy(), np.inf)
         scores.extend(result['support'][result['available']].tolist())
-    return otsu_threshold(scores), len(scores)
+    return scores
 
 
 def run_training():
@@ -492,6 +507,12 @@ def run_training():
         weak2_transform=weak_transform, strong_transform=strong_transform,
         basic_aug=False, return_index=True
     )
+    target_calibration = FER(
+        args.target_path, phase='train', transform=weak_transform,
+        weak2_transform=weak_transform, basic_aug=False, return_index=True
+    )
+    if target_calibration.file_paths != target_train.file_paths:
+        raise RuntimeError('calibration and training sample IDs differ')
     target_threshold = FER(
         args.target_path, phase='train', transform=weak_transform,
         strong_transform=None, basic_aug=False
@@ -515,9 +536,15 @@ def run_training():
         source_prototype, batch_size=test_batch, num_workers=args.workers,
         shuffle=False, pin_memory=True, worker_init_fn=_init_fn,
     )
+    calibration_loader = torch.utils.data.DataLoader(
+        target_calibration, batch_size=test_batch, num_workers=0,
+        shuffle=False, pin_memory=True,
+        generator=torch.Generator().manual_seed(args.calibration_seed),
+    )
     train_loader_target = torch.utils.data.DataLoader(
         target_train, batch_size=train_batch, num_workers=args.workers,
         shuffle=True, pin_memory=True, worker_init_fn=_init_fn,
+        generator=torch.Generator().manual_seed(seed),
     )
     threshold_loader_target = torch.utils.data.DataLoader(
         target_threshold, batch_size=test_batch, num_workers=args.workers,
@@ -576,6 +603,8 @@ def run_training():
             train_loss2 += aff_loss.item()
             train_loss3 += weight_loss.item()
             batch_count += 1
+        print('[Target Epoch %d] Rescue_Accept_Rate: %.6f' %
+              (i, rescue_accept_num / max(ds_totals[0], 1)))
         # 更新学习率
         scheduler.step()
         train_acc = float(bingo_cnt) / max(sample_count, 1)
@@ -682,13 +711,26 @@ def run_training():
                    np.array2string(reliability_bank.class_radii.cpu().numpy(), precision=8),
                    reliability_bank.distribution_initialized.cpu().tolist()))
             log_source_prototypes(reliability_bank)
-        support_threshold, support_calibration_count = (float('inf'), 0)
+        support_threshold = float('inf')
         if enable_radius_rescue:
-            support_threshold, support_calibration_count = calibrate_neighbor_support(
-                teacher, teacher_feature_hook, train_loader_target, ds_source,
-                ds_config, reliability_bank, thresholds)
-        print('[Target Epoch %d] Neighbor_Support_Otsu: %s Calibration_Count: %d' %
-              (i, support_threshold, support_calibration_count))
+            # All modes scan identically so diagnostics and RNG behavior are paired.
+            with isolated_rng(args.calibration_seed + i):
+                scores = calibrate_neighbor_support(
+                    teacher, teacher_feature_hook, calibration_loader, ds_source,
+                    ds_config, reliability_bank, thresholds)
+            stats = select_support_threshold(scores, args.support_threshold_mode,
+                args.support_fixed_threshold, args.support_min_count,
+                args.support_min_spread, args.support_min_separation,
+                args.support_min_group_fraction)
+            support_threshold = stats['threshold']
+            print('[Target Epoch %d] Support_Calibration: %s' % (i, stats))
+            print('[Target Epoch %d] Neighbor_Support_Otsu: %s Calibration_Count: %d '
+                  'Support_P05: %.6f Support_P50: %.6f Support_P95: %.6f '
+                  'Otsu_Separation: %.6f Threshold_Mode: %s Fallback_Reason: %s '
+                  'Applied_Support_Threshold: %.6f' %
+                  (i, stats['raw_otsu'], stats['count'], stats['p05'], stats['p50'],
+                   stats['p95'], stats['separation'], stats['mode'], stats['reason'],
+                   support_threshold))
         current_proto_weight = prototype_weight_for_epoch(
             i, args.proto_weight, args.proto_warmup_epochs, args.proto_ramp_epochs
         )
@@ -892,6 +934,8 @@ def run_training():
                   'DS_Passed: %d Mean_Support: %.4f Mean_Margin: %.4f '
                   'Mean_Unknown: %.4f Mean_Source_Conflict: %.4f' %
                   (i, *ds_totals[:3].astype(int), *(ds_totals[3:] / n)))
+        print('[Target Epoch %d] Rescue_Accept_Rate: %.6f' %
+              (i, rescue_accept_num / max(ds_totals[0], 1)))
         # 更新学习率
         scheduler.step()
         # 求均值
@@ -971,6 +1015,7 @@ def run_training():
 
 if __name__ == '__main__':
     run_training()
+
 
 
 
