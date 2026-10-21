@@ -18,6 +18,7 @@ from reliability_roles import ReliabilityRoles
 from dual_domain_ds import DSConfig
 from neighbor_support import MeanSupportBank, audit_mean_support, select_support_threshold
 from calibration_rng import isolated_rng
+from source_class_weights import source_class_weights
 import image_utils as util
 from randaugment import RandAugmentMC
 # 总训练入口与调度器。串起数据、Source 预训练、EMA Teacher、
@@ -124,6 +125,8 @@ def parse_args(argv=None):
     parser.add_argument('--support_min_separation', type=float, default=0.7)
     parser.add_argument('--support_min_group_fraction', type=float, default=0.05)
     parser.add_argument('--calibration_seed', type=int, default=101314)
+    parser.add_argument('--source_class_weighting', choices=['none', 'sqrt_inverse'],
+                        default='none', help='source CE only; target pseudo-label CE remains unweighted')
     args = parser.parse_args(argv)
     try:
         select_support_threshold([], args.support_threshold_mode,
@@ -564,7 +567,15 @@ def run_training():
     optimizer = torch.optim.Adam(model.parameters(), args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
     # 交叉熵损失
+    # Evaluation and target pseudo-label CE stay unweighted.
     criterion = torch.nn.CrossEntropyLoss(reduction='none')
+    source_counts = np.bincount(np.asarray(source_train.label, dtype=np.int64), minlength=class_num)
+    source_weights = torch.as_tensor(
+        source_class_weights(source_counts, args.source_class_weighting),
+        dtype=torch.float32, device=device)
+    source_criterion = torch.nn.CrossEntropyLoss(weight=source_weights, reduction='none')
+    print('Source_Class_Weighting: %s Counts: %s Weights: %s' %
+          (args.source_class_weighting, source_counts.tolist(), source_weights.cpu().tolist()))
 
     if args.checkpoint:
         print('Loading pretrained weights...', args.checkpoint)
@@ -587,7 +598,7 @@ def run_training():
             # 清空梯度
             optimizer.zero_grad()
             output = model(imgs, targets, None, 'train', 'source')
-            cls_loss = torch.mean(criterion(output[0], targets))
+            cls_loss = source_criterion(output[0], targets).sum() / source_weights[targets].sum().clamp_min(1e-8)
             aff_loss = output[1]
             weight_loss = classifier_modulation_loss(model)
             loss = cls_loss * args.w1 + aff_loss * args.w2 + weight_loss * args.w3
@@ -603,8 +614,6 @@ def run_training():
             train_loss2 += aff_loss.item()
             train_loss3 += weight_loss.item()
             batch_count += 1
-        print('[Target Epoch %d] Rescue_Accept_Rate: %.6f' %
-              (i, rescue_accept_num / max(ds_totals[0], 1)))
         # 更新学习率
         scheduler.step()
         train_acc = float(bingo_cnt) / max(sample_count, 1)
@@ -889,9 +898,15 @@ def run_training():
                 source_count=source_imgs.shape[0],
             )
             # 分类损失
-            per_sample_loss = criterion(output[0], train_targets) * train_con_idx
-            # 对真正有效的源域和目标域样本求平均分类损失
-            cls_loss = per_sample_loss.sum() / train_con_idx.sum().clamp_min(1.0)
+            source_count = source_imgs.shape[0]
+            source_labels = train_targets[:source_count]
+            source_losses = source_criterion(output[0][:source_count], source_labels)
+            target_mask = train_con_idx[source_count:]
+            target_losses = criterion(output[0][source_count:], train_targets[source_count:])
+            # Weighted source CE + unweighted accepted target CE.
+            # Unit weights reproduce the original joint normalization exactly.
+            denominator = source_weights[source_labels].sum() + target_mask.sum()
+            cls_loss = (source_losses.sum() + (target_losses * target_mask).sum()) / denominator.clamp_min(1e-8)
             aff_loss = output[1]
             # 分类器权重之间的正则项
             weight_loss = classifier_modulation_loss(model)
