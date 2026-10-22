@@ -62,6 +62,8 @@ def parse_args(argv=None):
                         help='gamma: classifier modulation loss weight')
     parser.add_argument('--ema_decay', type=float, default=0.999,
                         help='fixed EMA decay for teacher parameters and floating buffers')
+    parser.add_argument('--threshold_mode', choices=('global', 'class_adaptive'),
+                        default='global', help='adaptive shared or original per-class confidence threshold')
     parser.add_argument('--threshold_base', type=float, default=0.85)
     parser.add_argument('--threshold_beta', type=float, default=0.5)
     parser.add_argument('--threshold_margin', type=float, default=0.02)
@@ -96,7 +98,7 @@ def parse_args(argv=None):
                              'MMD anchor promotion is unchanged')
     parser.add_argument('--promotion_epochs', type=int, default=3,
                         help='consecutive eligible epochs before anchor promotion')
-    parser.add_argument('--run_name', type=str, default='adaptive_minconf_radius_or_vote6of11_v22',
+    parser.add_argument('--run_name', type=str, default='global_minconf_radius_or_vote6of11_v23',
                         help='checkpoint suffix; use distinct names for ablations')
     parser.add_argument('--device', choices=['cuda', 'cpu'], default='cuda',
                         help='CPU is supported for smoke tests; CUDA recommended for FER training')
@@ -202,7 +204,8 @@ def classifier_modulation_loss(model):
 
 def calculate_target_thresholds(model, loader, class_num, threshold_base,
                                 threshold_beta, threshold_margin,
-                                threshold_min, threshold_max):
+                                threshold_min, threshold_max,
+                                threshold_mode="class_adaptive"):
 
     # EMA Teacher 扫描整个target train，根据各预测类别平均confidence 生成类别自适应置信度阈值
 
@@ -253,6 +256,18 @@ def calculate_target_thresholds(model, loader, class_num, threshold_base,
         thresholds, min=threshold_min, max=threshold_max
     ).float()
     thresholds[~valid] = float(threshold_max)
+    if threshold_mode == "global":
+        # Sample-weighted mean across the entire target training split.
+        # No target labels are used; all classes share the same adaptive tau.
+        global_mean = class_sum.sum() / class_count.sum().clamp_min(1.0)
+        if not torch.any(valid):
+            global_mean = class_sum.new_tensor(float(threshold_base))
+        threshold_center = min(
+            max(float(global_mean.item()) + float(threshold_margin),
+                float(threshold_min)),
+            float(threshold_max),
+        )
+        thresholds.fill_(threshold_center)
     return (
         thresholds,
         class_mean.float(),
@@ -632,14 +647,15 @@ def run_training():
     for i in range(args.epochs):
         thresholds, class_mean, global_mean, threshold_center = calculate_target_thresholds(
             teacher, threshold_loader_target, class_num, args.threshold_base,
-            args.threshold_beta, args.threshold_margin, args.threshold_min, args.threshold_max)
+            args.threshold_beta, args.threshold_margin, args.threshold_min, args.threshold_max,
+            threshold_mode=args.threshold_mode)
         enable_radius_rescue = i >= args.radius_rescue_warmup_epochs
         print('[Target Epoch %d] Confidence_Thresholds: %s Class_Mean_Confidence: %s '
               'Global_Class_Mean: %.4f Threshold_Center: %.4f Radius_Rescue_Enabled: %s '
-              'Threshold_Mode: original_adaptive_min_conf' %
+              'Threshold_Mode: %s' %
               (i, np.array2string(thresholds.numpy(), precision=6),
                np.array2string(class_mean.numpy(), precision=6), global_mean,
-               threshold_center, enable_radius_rescue))
+               threshold_center, enable_radius_rescue, args.threshold_mode))
         if args.ds_neighbor:
             ds_source = refresh_ds_source_bank(
                 teacher, teacher_feature_hook, prototype_loader_source, class_num)
