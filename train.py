@@ -16,8 +16,7 @@ from prototype_utils import FeatureHook, PrototypeBank, prototype_weight_for_epo
 from source_prototype_radius import SourcePrototypeRadiusBank
 from reliability_roles import ReliabilityRoles
 from dual_domain_ds import DSConfig
-from neighbor_support import MeanSupportBank, audit_mean_support, select_support_threshold
-from calibration_rng import isolated_rng
+from neighbor_vote import NeighborVoteBank, audit_vote, rescue_union
 import image_utils as util
 from randaugment import RandAugmentMC
 # 总训练入口与调度器。串起数据、Source 预训练、EMA Teacher、
@@ -97,14 +96,14 @@ def parse_args(argv=None):
                              'MMD anchor promotion is unchanged')
     parser.add_argument('--promotion_epochs', type=int, default=3,
                         help='consecutive eligible epochs before anchor promotion')
-    parser.add_argument('--run_name', type=str, default='adaptive_minconf_radius_mean_support_otsu_nojs_v18',
+    parser.add_argument('--run_name', type=str, default='adaptive_minconf_radius_or_vote6of11_v22',
                         help='checkpoint suffix; use distinct names for ablations')
     parser.add_argument('--device', choices=['cuda', 'cpu'], default='cuda',
                         help='CPU is supported for smoke tests; CUDA recommended for FER training')
 
     parser.add_argument('--ds_neighbor', action='store_true', default=True,
                         help='compatibility flag: source-only DS is always enabled in this branch')
-    parser.add_argument('--ds_k', type=int, default=20)
+    parser.add_argument('--ds_k', type=int, choices=[11], default=11)
     parser.add_argument('--ds_min_neighbors', type=int, default=3)
     parser.add_argument('--ds_max_distance', type=float, default=0.5,
                         help='maximum normalized-feature Euclidean neighbor distance')
@@ -117,21 +116,7 @@ def parse_args(argv=None):
     parser.add_argument('--ds_conflict_threshold', type=float, default=0.5)
     parser.add_argument('--ds_strength_cap', type=float, default=0.95)
 
-    parser.add_argument('--support_threshold_mode', choices=['otsu', 'fixed', 'otsu_guarded'], default='otsu')
-    parser.add_argument('--support_fixed_threshold', type=float, default=0.92)
-    parser.add_argument('--support_min_count', type=int, default=128)
-    parser.add_argument('--support_min_spread', type=float, default=0.01)
-    parser.add_argument('--support_min_separation', type=float, default=0.7)
-    parser.add_argument('--support_min_group_fraction', type=float, default=0.05)
-    parser.add_argument('--calibration_seed', type=int, default=101314)
     args = parser.parse_args(argv)
-    try:
-        select_support_threshold([], args.support_threshold_mode,
-            args.support_fixed_threshold, args.support_min_count,
-            args.support_min_spread, args.support_min_separation,
-            args.support_min_group_fraction)
-    except ValueError as error:
-        parser.error(str(error))
     if not np.isfinite(args.source_radius_quantile) or not 0 < args.source_radius_quantile <= 1:
         parser.error('source_radius_quantile must be finite and in (0, 1]')
     if args.source_refresh_interval < 1:
@@ -419,31 +404,7 @@ def refresh_ds_source_bank(teacher, feature_hook, source_loader, classes):
         sy.append(labels.numpy())
     x, y = np.concatenate(sx), np.concatenate(sy)
     # Source IDs and target query IDs are separate namespaces: do not exclude self.
-    return MeanSupportBank(x, y, np.arange(len(y)), np.ones(len(y)), classes)
-
-
-@torch.no_grad()
-def calibrate_neighbor_support(teacher, hook, loader, source, config, radius, thresholds):
-    """One epoch-wide Otsu threshold using training rescue candidates only."""
-    device = next(teacher.parameters()).device
-    teacher.eval()
-    scores = []
-    for weak1, weak2, _, sample_ids in loader:
-        logits1, _ = teacher(weak1.to(device), None, None, 'test', 'target')
-        f1 = F.normalize(hook.output.detach(), dim=1)
-        logits2, _ = teacher(weak2.to(device), None, None, 'test', 'target')
-        features = F.normalize(f1 + F.normalize(hook.output.detach(), dim=1), dim=1)
-        labels, accepted, _ = select_dual_view_pseudo_labels(logits1, logits2, thresholds)
-        candidates = labels.eq(logits2.argmax(dim=1)) & ~accepted.bool()
-        candidates &= radius.in_distribution(features, labels)
-        idx = torch.where(candidates)[0]
-        if not len(idx):
-            continue
-        evidence = source.evaluate(features[idx].cpu().numpy(),
-                                   sample_ids[idx.cpu()].cpu().numpy(), config)
-        result = audit_mean_support(evidence, labels[idx].cpu().numpy(), np.inf)
-        scores.extend(result['support'][result['available']].tolist())
-    return scores
+    return NeighborVoteBank(x, y, np.arange(len(y)), np.ones(len(y)), classes)
 
 
 def run_training():
@@ -507,12 +468,6 @@ def run_training():
         weak2_transform=weak_transform, strong_transform=strong_transform,
         basic_aug=False, return_index=True
     )
-    target_calibration = FER(
-        args.target_path, phase='train', transform=weak_transform,
-        weak2_transform=weak_transform, basic_aug=False, return_index=True
-    )
-    if target_calibration.file_paths != target_train.file_paths:
-        raise RuntimeError('calibration and training sample IDs differ')
     target_threshold = FER(
         args.target_path, phase='train', transform=weak_transform,
         strong_transform=None, basic_aug=False
@@ -535,11 +490,6 @@ def run_training():
     prototype_loader_source = torch.utils.data.DataLoader(
         source_prototype, batch_size=test_batch, num_workers=args.workers,
         shuffle=False, pin_memory=True, worker_init_fn=_init_fn,
-    )
-    calibration_loader = torch.utils.data.DataLoader(
-        target_calibration, batch_size=test_batch, num_workers=0,
-        shuffle=False, pin_memory=True,
-        generator=torch.Generator().manual_seed(args.calibration_seed),
     )
     train_loader_target = torch.utils.data.DataLoader(
         target_train, batch_size=train_batch, num_workers=args.workers,
@@ -603,8 +553,6 @@ def run_training():
             train_loss2 += aff_loss.item()
             train_loss3 += weight_loss.item()
             batch_count += 1
-        print('[Target Epoch %d] Rescue_Accept_Rate: %.6f' %
-              (i, rescue_accept_num / max(ds_totals[0], 1)))
         # 更新学习率
         scheduler.step()
         train_acc = float(bingo_cnt) / max(sample_count, 1)
@@ -668,16 +616,12 @@ def run_training():
                     if args.role_separation else None)
 
     ds_config = ds_config_from_args(args)
-    print('Neighbor support uses only ds_k/ds_min_neighbors; legacy DS distance, '
-          'bandwidth, strength cap and four thresholds are inactive.')
-    print('DS_Neighbor: %s DS_Config: %s Scope: low_confidence_radius_rescue_only Evidence: source_only Mean_Support_Otsu'
-           %
-          (args.ds_neighbor, ds_config))
+    print('Rescue=agreement & low_confidence & (radius OR vote); KNN_Vote: K=11 Minimum_Votes=6 Vote_Ratio=6/11; full neighborhood required; source true labels; no DS/Otsu/cosine weighting')
     ds_csv_path = os.path.join(model_path, args.run_name + '_ds_diagnostics.csv')
     ds_columns = ['epoch', 'sample_id', 'pseudo_label', 'source_count',
                   'source_available', 'source_support', 'source_unknown',
                   'source_conflict', 'support', 'margin', 'unknown',
-                  'ds_pass', 'accepted']
+                  'ds_pass', 'accepted', 'supporting_votes', 'vote_ratio', 'radius_pass', 'vote_pass']
     if args.ds_neighbor:
         with open(ds_csv_path, 'w', newline='') as handle:
             csv.writer(handle).writerow(ds_columns)
@@ -701,6 +645,7 @@ def run_training():
                 teacher, teacher_feature_hook, prototype_loader_source, class_num)
             print('[Target Epoch %d] DS_Source_Refs: %d' % (i, len(ds_source.x)))
         ds_totals = np.zeros(7, dtype=np.float64)
+        rescue_route_counts = np.zeros(3, dtype=np.int64)
 
         if i % args.source_refresh_interval == 0:
             refresh_source_radius_bank(
@@ -711,26 +656,7 @@ def run_training():
                    np.array2string(reliability_bank.class_radii.cpu().numpy(), precision=8),
                    reliability_bank.distribution_initialized.cpu().tolist()))
             log_source_prototypes(reliability_bank)
-        support_threshold = float('inf')
-        if enable_radius_rescue:
-            # All modes scan identically so diagnostics and RNG behavior are paired.
-            with isolated_rng(args.calibration_seed + i):
-                scores = calibrate_neighbor_support(
-                    teacher, teacher_feature_hook, calibration_loader, ds_source,
-                    ds_config, reliability_bank, thresholds)
-            stats = select_support_threshold(scores, args.support_threshold_mode,
-                args.support_fixed_threshold, args.support_min_count,
-                args.support_min_spread, args.support_min_separation,
-                args.support_min_group_fraction)
-            support_threshold = stats['threshold']
-            print('[Target Epoch %d] Support_Calibration: %s' % (i, stats))
-            print('[Target Epoch %d] Neighbor_Support_Otsu: %s Calibration_Count: %d '
-                  'Support_P05: %.6f Support_P50: %.6f Support_P95: %.6f '
-                  'Otsu_Separation: %.6f Threshold_Mode: %s Fallback_Reason: %s '
-                  'Applied_Support_Threshold: %.6f' %
-                  (i, stats['raw_otsu'], stats['count'], stats['p05'], stats['p50'],
-                   stats['p95'], stats['separation'], stats['mode'], stats['reason'],
-                   support_threshold))
+        print('[Target Epoch %d] KNN_Vote_K: 11 Minimum_Votes: 6 Ratio_Threshold: %.6f Rescue_Enabled: %s' % (i, 6/11, enable_radius_rescue))
         current_proto_weight = prototype_weight_for_epoch(
             i, args.proto_weight, args.proto_warmup_epochs, args.proto_ramp_epochs
         )
@@ -788,17 +714,23 @@ def run_training():
                     teacher_mean_features, pseudo_targets
                 )
                 # Direct confidence acceptance; only remaining agreeing samples need rescue.
-                radius_candidates = agreement_mask & ~confidence_mask & region_ok
+                rescue_candidates = agreement_mask & ~confidence_mask
+                radius_candidates = rescue_candidates & region_ok
                 rescue_mask = torch.zeros_like(agreement_mask)
-                if enable_radius_rescue and radius_candidates.any():
-                    query_idx = torch.where(radius_candidates)[0]
+                if enable_radius_rescue and rescue_candidates.any():
+                    query_idx = torch.where(rescue_candidates)[0]
                     queries = teacher_mean_features[query_idx].cpu().numpy()
                     query_ids = sample_ids[query_idx.cpu()].cpu().numpy()
                     source_ds = ds_source.evaluate(queries, query_ids, ds_config)
-                    ds_result = audit_mean_support(
-                        source_ds, pseudo_targets[query_idx].cpu().numpy(), support_threshold)
-                    rescue_mask[query_idx] = torch.as_tensor(
-                        ds_result['pass_mask'], device=device, dtype=torch.bool)
+                    ds_result = audit_vote(
+                        source_ds, pseudo_targets[query_idx].cpu().numpy(), 6)
+                    vote_pass = torch.as_tensor(ds_result['pass_mask'], device=device, dtype=torch.bool)
+                    radius_pass = region_ok[query_idx]
+                    rescue_mask[query_idx] = rescue_union(radius_pass, vote_pass)
+                    rescue_route_counts += np.array([
+                        int((radius_pass & ~vote_pass).sum()),
+                        int((~radius_pass & vote_pass).sum()),
+                        int((radius_pass & vote_pass).sum())])
                     ds_totals += np.array([
                         len(query_idx), source_ds['available'].sum(),
                         ds_result['pass_mask'].sum(), ds_result['support'].sum(),
@@ -814,7 +746,9 @@ def run_training():
                             source_ds['conflict'][row], ds_result['support'][row],
                             ds_result['margin'][row], ds_result['uncertainty'][row],
                             bool(ds_result['pass_mask'][row]),
-                            bool(rescue_mask[query_idx[row]].item())])
+                            bool(rescue_mask[query_idx[row]].item()),
+                            int(ds_result['vote_count'][row]), float(ds_result['support'][row]),
+                            bool(radius_pass[row]), bool(vote_pass[row])])
                     with open(ds_csv_path, 'a', newline='') as handle:
                         csv.writer(handle).writerows(rows)
 
@@ -931,11 +865,13 @@ def run_training():
         if args.ds_neighbor:
             n = max(ds_totals[0], 1)
             print('[Target Epoch %d] DS_Audited: %d Source_Available: %d '
-                  'DS_Passed: %d Mean_Support: %.4f Mean_Margin: %.4f '
+                  'DS_Passed: %d Mean_Vote_Ratio: %.4f Mean_Margin: %.4f '
                   'Mean_Unknown: %.4f Mean_Source_Conflict: %.4f' %
                   (i, *ds_totals[:3].astype(int), *(ds_totals[3:] / n)))
         print('[Target Epoch %d] Rescue_Accept_Rate: %.6f' %
               (i, rescue_accept_num / max(ds_totals[0], 1)))
+        print('[Target Epoch %d] Rescue_Radius_Only: %d Rescue_Vote_Only: %d Rescue_Both: %d' %
+              (i, *rescue_route_counts.tolist()))
         # 更新学习率
         scheduler.step()
         # 求均值
@@ -1015,6 +951,7 @@ def run_training():
 
 if __name__ == '__main__':
     run_training()
+
 
 
 
