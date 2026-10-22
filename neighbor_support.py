@@ -72,6 +72,7 @@ def select_support_threshold(scores, mode='otsu', fixed=0.92, min_count=128,
 
 class MeanSupportBank(EvidenceBank):
     def evaluate(self, queries, query_ids, config, exclude_self=False):
+        # 查找源域邻居，计算各类别平均支持度。
         z = np.asarray(queries, dtype=np.float32)
         ids = np.asarray(query_ids, dtype=np.int64)
         n = len(z)
@@ -80,23 +81,28 @@ class MeanSupportBank(EvidenceBank):
         result = dict(mass=np.zeros((n, self.classes)), uncertainty=np.ones(n),
                       conflict=np.zeros(n), count=np.zeros(n, dtype=np.int64),
                       available=np.zeros(n, dtype=bool))
+        # 归一化
         norm = np.linalg.norm(z, axis=1)
         valid = np.isfinite(z).all(1) & (norm > 1e-8)
         z = np.nan_to_num(z) / np.maximum(np.nan_to_num(norm[:, None]), 1e-8)
         for start in range(0, n, 32):
+            # 计算目标样本与所有源域样本的相似度，两边特征都归一化后，点积就是余弦相似度。
             similarities = z[start:start + 32] @ self.x.T
             for offset, similarity in enumerate(similarities):
                 i = start + offset
                 if not valid[i]:
                     continue
+                # 按相似度从大到小，取前 K 个
                 allowed = np.ones(len(self.x), dtype=bool)
                 if exclude_self:
                     allowed &= self.ids != ids[i]
                 candidates = np.flatnonzero(allowed)
                 selected = candidates[np.argsort(-similarity[candidates], kind='stable')[:config.k]]
                 result['count'][i] = len(selected)
+                # 邻居不足就不审核
                 if len(selected) < config.min_neighbors:
                     continue
+                # 根据邻居类别计算支持度
                 strength = np.clip(similarity[selected], 0, 1)
                 mass = np.bincount(self.labels[selected], weights=strength,
                                    minlength=self.classes) / len(selected)

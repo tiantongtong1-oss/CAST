@@ -2,6 +2,7 @@
 
 Historical Gaussian experiments live in global_gaussian_knn_reliability.py;
 this bank does not calculate variances or Mahalanobis distances.
+0.9分位数半径判断
 """
 import math
 import torch

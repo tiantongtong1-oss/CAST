@@ -4,7 +4,10 @@ import torch.nn.functional as F
 
 
 class FeatureHook:
-    """Capture the exact feature tensor produced by a module during forward."""
+    """Capture the exact feature tensor produced by a module during forward.
+                原型一致性学习
+             特征钩子、源/目标原型、动量更新、一致性损失及权重调度
+    """
 
     def __init__(self, module):
         self.output = None

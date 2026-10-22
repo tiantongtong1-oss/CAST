@@ -13,6 +13,8 @@ class ReliabilityRoles(nn.Module):
     Neighbor roles are snapshotted at refresh, so rescue cannot feed itself within
     the same refresh. Checkpoints preserve history, but train.py remains weights-
     initialization-only (not an exact resume implementation).
+
+    保留角色分离:ReliabilityRoles，连续符合条件后晋升 anchor
     """
 
     def __init__(self, num_samples, promotion_epochs=3):

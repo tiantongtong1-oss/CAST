@@ -10,6 +10,8 @@ import itertools
 from sklearn.cluster import SpectralClustering
 import torch.nn.functional as F
 
+# 图像辅助处理与评估
+
 def add_gaussian_noise(image_array, mean=0.0, var=30):
     std = var**0.5
     noisy_img = image_array + np.random.normal(mean, std, image_array.shape)

@@ -1,6 +1,9 @@
 from torch import nn
 import torch
 from torchvision import models
+# Student/Teacher 的网络结构
+
+# 骨干网络、分类器、BatchNorm、MMD 对齐与类间分离
 
 
 def compute_kernel_matrix(source, target, kernel_mul=2.0, kernel_num=5):

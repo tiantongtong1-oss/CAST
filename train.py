@@ -252,6 +252,7 @@ def calculate_target_thresholds(model, loader, class_num, threshold_base,
 
     valid = class_count > 0
     class_mean = class_sum / class_count.clamp_min(1.0)
+    # 有预测样本的各类别平均置信度，再取平均
     if torch.any(valid):
         global_mean = class_mean[valid].mean()
     else:
