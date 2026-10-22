@@ -17,6 +17,7 @@ from source_prototype_radius import SourcePrototypeRadiusBank
 from reliability_roles import ReliabilityRoles
 from dual_domain_ds import DSConfig
 from neighbor_vote import NeighborVoteBank, audit_vote, rescue_union
+from source_class_weights import source_class_weights
 import image_utils as util
 from randaugment import RandAugmentMC
 # 总训练入口与调度器。串起数据、Source 预训练、EMA Teacher、
@@ -54,6 +55,11 @@ def parse_args(argv=None):
                         help='source-domain pre-training epochs')
     parser.add_argument('--epochs', type=int, default=30,
                         help='target-domain self-training epochs')
+    parser.add_argument('--source_class_weight', choices=['none', 'inverse_power'], default='none',
+                        help='class weighting of labeled source CE only, in both training stages')
+    parser.add_argument('--source_class_weight_power', type=float, default=0.5)
+    parser.add_argument('--source_class_weight_max', type=float, default=2.0,
+                        help='upper cap after mean normalization')
     parser.add_argument('--w1', type=float, default=4.0,
                         help='alpha: classification loss weight')
     parser.add_argument('--w2', type=float, default=0.3,
@@ -117,6 +123,11 @@ def parse_args(argv=None):
     parser.add_argument('--ds_strength_cap', type=float, default=0.95)
 
     args = parser.parse_args(argv)
+    try:
+        source_class_weights([1], args.source_class_weight,
+                             args.source_class_weight_power, args.source_class_weight_max)
+    except ValueError as error:
+        parser.error(str(error))
     if not np.isfinite(args.source_radius_quantile) or not 0 < args.source_radius_quantile <= 1:
         parser.error('source_radius_quantile must be finite and in (0, 1]')
     if args.source_refresh_interval < 1:
@@ -515,6 +526,13 @@ def run_training():
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
     # 交叉熵损失
     criterion = torch.nn.CrossEntropyLoss(reduction='none')
+    source_counts = np.bincount(source_train.label, minlength=class_num)
+    source_weights = torch.as_tensor(source_class_weights(
+        source_counts, args.source_class_weight,
+        args.source_class_weight_power, args.source_class_weight_max), device=device)
+    print('Source_Class_Weight: %s Counts: %s Weights: %s Power: %.3f Max: %.3f' %
+          (args.source_class_weight, source_counts.tolist(), source_weights.tolist(),
+           args.source_class_weight_power, args.source_class_weight_max))
 
     if args.checkpoint:
         print('Loading pretrained weights...', args.checkpoint)
@@ -537,7 +555,8 @@ def run_training():
             # 清空梯度
             optimizer.zero_grad()
             output = model(imgs, targets, None, 'train', 'source')
-            cls_loss = torch.mean(criterion(output[0], targets))
+            source_sample_weights = source_weights[targets]
+            cls_loss = (criterion(output[0], targets) * source_sample_weights).sum() / source_sample_weights.sum().clamp_min(1e-12)
             aff_loss = output[1]
             weight_loss = classifier_modulation_loss(model)
             loss = cls_loss * args.w1 + aff_loss * args.w2 + weight_loss * args.w3
@@ -823,9 +842,13 @@ def run_training():
                 source_count=source_imgs.shape[0],
             )
             # 分类损失
-            per_sample_loss = criterion(output[0], train_targets) * train_con_idx
+            # Source class weights affect CE only, never affinity/anchor masks or target pseudo labels.
+            ce_weights = train_con_idx.clone()
+            source_count = source_imgs.shape[0]
+            ce_weights[:source_count] *= source_weights[train_targets[:source_count]]
+            per_sample_loss = criterion(output[0], train_targets) * ce_weights
             # 对真正有效的源域和目标域样本求平均分类损失
-            cls_loss = per_sample_loss.sum() / train_con_idx.sum().clamp_min(1.0)
+            cls_loss = per_sample_loss.sum() / ce_weights.sum().clamp_min(1e-12)
             aff_loss = output[1]
             # 分类器权重之间的正则项
             weight_loss = classifier_modulation_loss(model)
