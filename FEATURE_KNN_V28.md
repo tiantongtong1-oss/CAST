@@ -52,3 +52,37 @@ Check classifier_head accuracy against deterministic uniform validation 51.07%.
 Checkpoint backbone must match. No ImageNet download or retraining needed.
 Seven numerical tests + syntax/help checks pass; full PyTorch/GPU/data inference
 not executed in editing environment. No performance guarantee.
+
+## RAF official test queries (addition)
+
+```bash
+python -u diagnose_feature_knn.py \
+  --checkpoint ./models/rafdb_fer/mobilenet_v2_rafdb_fer_source_uniform_control_v27_source_best.pth \
+  --source_path /workspace/ttt/code/test-upload-clean/datesets/raf-basic \
+  --query_dataset raf_test \
+  --backbone mobilenet_v2 --device cuda --batch_size 128 --workers 0 \
+  --k 11 --query_chunk 64 \
+  --output_dir ./diagnostics/uniform_raf_test_v28 \
+  2>&1 | tee test_logs/uniform_raf_test_v28.log
+```
+
+RAF train remains the only source reference set; RAF official test is query-only.
+FER is not instantiated in raf_test mode and target_path is unnecessary. Default
+fer_val keeps old behavior and requires target_path. RAF query wrapper adds IDs
+without changing dataset.py or its train/test behavior. Query forward task=source
+in RAF mode. All three predictions/evidence saved before query labels join metrics.
+
+Audit verifies complete official split basename membership and shuffled path-label
+alignment for RAF train and RAF test. Resolved image paths must be disjoint and
+unique within each split. This is a PATH check, not a content duplicate hash audit;
+it does not independently establish checkpoint training provenance. It is assumed
+the supplied source-only model was trained on official RAF train, not test.
+Audit records RAF 1..7 -> class names and checks expected FER mapping, verifies
+both current loader implementations explicitly contain BGR->RGB conversion,
+and records shared deterministic transform. It does not infer semantic annotation
+quality from image content. No training code changed.
+Summary includes dataset_audit and split=RAF official test only. Compare per-class
+recall/F1 along with precision due to differing RAF/FER class frequencies. Repeated
+use to tune models makes RAF test a development evaluation set, not untouched
+final test evidence. Ten data-audit/retrieval/metric tests pass plus syntax/help
+checks; no end-to-end PyTorch/data execution in editing environment.

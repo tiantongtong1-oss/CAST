@@ -1,4 +1,4 @@
-"""Validation-only comparison: classifier vs global and per-class source KNN."""
+"""FER validation or RAF official test comparison against RAF training references."""
 import argparse
 import csv
 import json
@@ -6,13 +6,23 @@ from pathlib import Path
 import numpy as np
 from feature_knn_diagnostics import predict_from_source,compare_predictions
 from topk_diagnostics import NAMES
+from diagnostic_data_audit import assert_disjoint_paths,audit_raf_labels,EXPECTED_FER_TO_CAST
+
+
+class IndexedQuery:
+    def __init__(self,dataset): self.dataset=dataset
+    def __len__(self): return len(self.dataset)
+    def __getitem__(self,index):
+        image,label=self.dataset[index]
+        return image,label,index
 
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--checkpoint',required=True)
     p.add_argument('--source_path',required=True)
-    p.add_argument('--target_path',required=True)
+    p.add_argument('--target_path',help='required only for fer_val queries')
+    p.add_argument('--query_dataset',choices=['fer_val','raf_test'],default='fer_val')
     p.add_argument('--output_dir',required=True)
     p.add_argument('--backbone',default='mobilenet_v2',choices=['mobilenet_v2','resnet18','resnet50'])
     p.add_argument('--device',choices=['cuda','cpu'],default='cuda')
@@ -22,6 +32,7 @@ def main():
     p.add_argument('--query_chunk',type=int,default=64)
     a=p.parse_args()
     if min(a.batch_size,a.k,a.query_chunk)<1 or a.workers<0:p.error('invalid batch/K/chunk/workers')
+    if a.query_dataset=='fer_val' and not a.target_path:p.error('--target_path required for fer_val')
     import torch
     from torchvision import transforms
     import Networks
@@ -39,7 +50,26 @@ def main():
         transforms.CenterCrop(224),transforms.ToTensor(),
         transforms.Normalize([.485,.456,.406],[.229,.224,.225])])
     source=RafDataSet(a.source_path,phase='train',transform=transform,basic_aug=False)
-    target=FER(a.target_path,phase='val',transform=transform,basic_aug=False,return_index=True)
+    audit=dict(reference=audit_raf_labels(a.source_path,source.file_paths,source.label,'train'))
+    if dict(FER.FER_TO_CAST)!=EXPECTED_FER_TO_CAST:raise ValueError('unexpected FER label mapping')
+    if a.query_dataset=='raf_test':
+        target=RafDataSet(a.source_path,phase='test',transform=transform,basic_aug=False)
+        query_loader_dataset=IndexedQuery(target)
+        audit['query']=audit_raf_labels(a.source_path,target.file_paths,target.label,'test')
+    else:
+        target=FER(a.target_path,phase='val',transform=transform,basic_aug=False,return_index=True)
+        query_loader_dataset=target
+    audit['split_check']=assert_disjoint_paths(source.file_paths,target.file_paths)
+    # Verify the current loaders retain the explicit BGR -> RGB conversion.
+    import inspect
+    for cls in [RafDataSet,FER]:
+        code=inspect.getsource(cls.__getitem__).replace(' ','')
+        if 'image=image[:,:,::-1]' not in code:raise ValueError('BGR/RGB conversion changed in '+cls.__name__)
+    audit['raf_raw_to_class']={str(i+1):name for i,name in enumerate(NAMES)}
+    audit['fer_raw_to_class']={str(i):NAMES[c] for i,c in FER.FER_TO_CAST.items()}
+    audit['channels']='Both loader implementations explicitly convert cv2 BGR to RGB'
+    audit['transform']='Shared Resize256 CenterCrop224 ToTensor ImageNet normalization; basic_aug=False'
+    print('Dataset audit:',json.dumps(audit,ensure_ascii=False))
     model=Networks.Model(backbone=a.backbone,num_classes=7,pretrained=False).to(a.device)
     try:checkpoint=torch.load(a.checkpoint,map_location=a.device,weights_only=False)
     except TypeError:checkpoint=torch.load(a.checkpoint,map_location=a.device)
@@ -51,8 +81,8 @@ def main():
             for images,labels in torch.utils.data.DataLoader(source,batch_size=a.batch_size,shuffle=False,num_workers=a.workers):
                 model(images.to(a.device),None,None,mode='test',task='source')
                 sx.append(hook.output.detach().cpu().numpy());sy.append(labels.numpy())
-            for images,_unused_truth,batch_ids in torch.utils.data.DataLoader(target,batch_size=a.batch_size,shuffle=False,num_workers=a.workers):
-                logits,_=model(images.to(a.device),None,None,mode='test',task='target')
+            for images,_unused_truth,batch_ids in torch.utils.data.DataLoader(query_loader_dataset,batch_size=a.batch_size,shuffle=False,num_workers=a.workers):
+                logits,_=model(images.to(a.device),None,None,mode='test',task=('source' if a.query_dataset=='raf_test' else 'target'))
                 tx.append(hook.output.detach().cpu().numpy())
                 prob.append(torch.softmax(logits,dim=1).cpu().numpy());ids.extend(batch_ids.tolist())
     finally:hook.close()
@@ -69,7 +99,8 @@ def main():
             NAMES[predictions['classwise'][i]]]+prob[i].tolist()+predictions['votes'][i].tolist()+predictions['classwise_mean_distance'][i].tolist())
     truth=np.asarray(target.label)
     result=compare_predictions(head,predictions['knn'],predictions['classwise'],truth)
-    summary=dict(checkpoint=str(Path(a.checkpoint).resolve()),split='FER validation only',
+    summary=dict(checkpoint=str(Path(a.checkpoint).resolve()),split=('RAF official test only' if a.query_dataset=='raf_test' else 'FER validation only'),
+        dataset_audit=audit,
         source_split='RAF training references',k=a.k,class_order=NAMES,
         feature='model.feature; L2 normalization; Euclidean distance',methods=result)
     (out/'feature_summary.json').write_text(json.dumps(summary,indent=2,allow_nan=False))
