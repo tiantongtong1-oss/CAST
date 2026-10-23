@@ -86,3 +86,34 @@ recall/F1 along with precision due to differing RAF/FER class frequencies. Repea
 use to tune models makes RAF test a development evaluation set, not untouched
 final test evidence. Ten data-audit/retrieval/metric tests pass plus syntax/help
 checks; no end-to-end PyTorch/data execution in editing environment.
+
+## RGB versus grayscale input diagnostic
+
+--color_mode rgb (default) or gray controls query preprocessing. Gray adds
+Grayscale(num_output_channels=3) AFTER CenterCrop and BEFORE ToTensor/normalization.
+--reference_color_mode same (default) applies same mode to RAF reference images.
+Thus gray mode re-extracts references and queries; no model retraining. Classifier
+head comparison is independent of reference mode. To isolate query-only changes
+in retrieval, use --reference_color_mode rgb in BOTH runs. Changing references
+and queries together measures combined effect, not only query color dependence.
+ImageNet normalization stays identical across modes: grayscale channels are equal
+before normalization, not after different channel means/stds are applied.
+
+Run four evaluations (query datasets raf_test/fer_val x modes rgb/gray) using same
+checkpoint, K, source data and deterministic geometry. Original RGB results should
+match prior diagnostics. Do not infer improved train-time grayscale augmentation
+from a test-time change alone. FER images may already be gray in RGB storage;
+input_audit.json measures sample channel differences to check that possibility.
+
+--audit_images 32 samples first 32 loader paths per domain (0 disables). Saves
+input_audit.json with raw dimensions, stored mode, mean RGB channel spread and
+fraction spread>2. input_preview.jpg shows first six reference/query images as
+raw thumbnail, center crop and gray crop. Preview illustrates geometry only (PIL
+resizing may differ from model transform interpolation); it is not an exact model
+tensor. No labels or model decisions determine sample selection. These are small
+nonrandom samples, not exhaustive face alignment/annotation checks; upscaling a
+48x48 source image does not recover detail. Path disjoint audit is unchanged.
+Output directory must be new/empty for each run. No model/state updates or target
+train/test queries in fer_val mode. Existing RAF official test option unchanged.
+Nine numerical/image/data/retrieval tests and syntax/help checks pass; full
+PyTorch color-transform/inference not executed here. Inspect previews manually.

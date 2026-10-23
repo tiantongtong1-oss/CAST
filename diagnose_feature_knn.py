@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 from feature_knn_diagnostics import predict_from_source,compare_predictions
 from topk_diagnostics import NAMES
+from input_image_audit import audit_images,save_preview
 from diagnostic_data_audit import assert_disjoint_paths,audit_raf_labels,EXPECTED_FER_TO_CAST
 
 
@@ -30,7 +31,14 @@ def main():
     p.add_argument('--workers',type=int,default=0)
     p.add_argument('--k',type=int,default=11)
     p.add_argument('--query_chunk',type=int,default=64)
+    p.add_argument('--color_mode',choices=['rgb','gray'],default='rgb',
+                   help='query color; gray converts to grayscale and replicates three channels before normalization')
+    p.add_argument('--reference_color_mode',choices=['same','rgb','gray'],default='same',
+                   help='reference color; same applies query color to both domains')
+    p.add_argument('--audit_images',type=int,default=32,
+                   help='first N images per domain audited, 0 disables; previews first six')
     a=p.parse_args()
+    if not 0 <= a.audit_images <= 256:p.error('audit_images must be in [0,256]')
     if min(a.batch_size,a.k,a.query_chunk)<1 or a.workers<0:p.error('invalid batch/K/chunk/workers')
     if a.query_dataset=='fer_val' and not a.target_path:p.error('--target_path required for fer_val')
     import torch
@@ -46,10 +54,15 @@ def main():
     torch.backends.cudnn.benchmark=False;torch.backends.cudnn.deterministic=True
     if a.device=='cuda' and hasattr(torch.backends.cuda.matmul,'allow_tf32'):
         torch.backends.cuda.matmul.allow_tf32=False
-    transform=transforms.Compose([transforms.ToPILImage(),transforms.Resize((256,256)),
-        transforms.CenterCrop(224),transforms.ToTensor(),
-        transforms.Normalize([.485,.456,.406],[.229,.224,.225])])
-    source=RafDataSet(a.source_path,phase='train',transform=transform,basic_aug=False)
+    def make_transform(mode):
+        steps=[transforms.ToPILImage(),transforms.Resize((256,256)),transforms.CenterCrop(224)]
+        if mode=='gray':steps.append(transforms.Grayscale(num_output_channels=3))
+        steps += [transforms.ToTensor(),transforms.Normalize([.485,.456,.406],[.229,.224,.225])]
+        return transforms.Compose(steps)
+    reference_mode=a.color_mode if a.reference_color_mode=='same' else a.reference_color_mode
+    transform=make_transform(a.color_mode)
+    reference_transform=make_transform(reference_mode)
+    source=RafDataSet(a.source_path,phase='train',transform=reference_transform,basic_aug=False)
     audit=dict(reference=audit_raf_labels(a.source_path,source.file_paths,source.label,'train'))
     if dict(FER.FER_TO_CAST)!=EXPECTED_FER_TO_CAST:raise ValueError('unexpected FER label mapping')
     if a.query_dataset=='raf_test':
@@ -68,7 +81,14 @@ def main():
     audit['raf_raw_to_class']={str(i+1):name for i,name in enumerate(NAMES)}
     audit['fer_raw_to_class']={str(i):NAMES[c] for i,c in FER.FER_TO_CAST.items()}
     audit['channels']='Both loader implementations explicitly convert cv2 BGR to RGB'
-    audit['transform']='Shared Resize256 CenterCrop224 ToTensor ImageNet normalization; basic_aug=False'
+    audit['transform']='Resize256 CenterCrop224 [optional Grayscale3] ToTensor ImageNet normalization; basic_aug=False'
+    audit['color_modes']=dict(query=a.color_mode,reference=reference_mode,
+        note='Three equal grayscale channels BEFORE normalization; per-channel ImageNet normalization remains unchanged')
+    if a.audit_images:
+        audit['image_samples']=dict(reference=audit_images(source.file_paths,a.audit_images),
+                                    query=audit_images(target.file_paths,a.audit_images))
+        save_preview(source.file_paths,target.file_paths,out/'input_preview.jpg')
+        (out/'input_audit.json').write_text(json.dumps(audit,indent=2))
     print('Dataset audit:',json.dumps(audit,ensure_ascii=False))
     model=Networks.Model(backbone=a.backbone,num_classes=7,pretrained=False).to(a.device)
     try:checkpoint=torch.load(a.checkpoint,map_location=a.device,weights_only=False)
