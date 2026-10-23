@@ -1,0 +1,54 @@
+# Feature-based source neighbor comparison (v28 addition)
+
+Run diagnose_feature_knn.py on the same source uniform checkpoint. Adds standalone
+scripts only; training and diagnose_initial_model.py are unchanged.
+
+Reference: RAF training features + true source labels. Queries: FER validation
+only. Forward uses labels=None, model.eval and no_grad, pretrained=False, strict
+full model load. No target training/test data, optimizer, EMA or prototype updates.
+All outputs are decided and raw_predictions.csv saved BEFORE evaluation joins
+FER labels. Paths can contain class folders, but paths are not model inputs.
+
+Feature: existing FeatureHook(model.feature), same as training KNN bank. L2
+normalize, Euclidean distance. Deterministic Resize256/CenterCrop224/ImageNet
+normalization, no random augmentation. GPU block matrix multiplication by default;
+only query-chunk x source_count distances are retained. Use --device cpu if needed.
+
+Methods:
+- classifier_head: logits argmax.
+- source_knn: global nearest K=11, unweighted true source label majority.
+- classwise_distance: nearest K=11 within EACH source class; smallest average
+  Euclidean distance wins. Every class must have >=K valid references, else error.
+No candidate labels, distance cuts, confidence filtering or rejection. Prediction
+may be any of seven classes. Stable source-order tie ranking; class ties use
+lowest class ID. Small floating CPU/GPU differences may affect near ties.
+Per-class equal K reduces count dominance but does NOT remove density/diversity
+bias and is not a claimed optimal classifier.
+
+```bash
+mkdir -p test_logs
+set -o pipefail
+python -u diagnose_feature_knn.py \
+  --checkpoint ./models/rafdb_fer/mobilenet_v2_rafdb_fer_source_uniform_control_v27_source_best.pth \
+  --source_path /workspace/ttt/code/test-upload-clean/datesets/raf-basic \
+  --target_path /workspace/ttt/code/data/fer2013 \
+  --backbone mobilenet_v2 --device cuda --batch_size 128 --workers 0 \
+  --k 11 --query_chunk 64 \
+  --output_dir ./diagnostics/uniform_feature_knn_v28 \
+  2>&1 | tee test_logs/uniform_feature_knn_v28.log
+```
+
+Output directory must be new/empty:
+- feature_summary.json: all three methods' Accuracy/UAR/Macro-F1, per-class
+  precision/recall/F1, confusion, Fear recovery/loss vs head.
+- raw_predictions.csv: no target true labels; IDs, image paths, head/KNN/classwise
+  predictions, seven probabilities, seven votes, seven mean distances.
+- per_image_evaluation.csv: true labels joined only after inference, three outputs.
+- confusions.csv: method, true class, seven predicted-class counts.
+
+new_fear_precision uses ONLY predictions newly changed to Fear vs head. Also
+report lost_head_correct_fear and net_correct_fear_change. Undefined ratios=null.
+Check classifier_head accuracy against deterministic uniform validation 51.07%.
+Checkpoint backbone must match. No ImageNet download or retraining needed.
+Seven numerical tests + syntax/help checks pass; full PyTorch/GPU/data inference
+not executed in editing environment. No performance guarantee.
