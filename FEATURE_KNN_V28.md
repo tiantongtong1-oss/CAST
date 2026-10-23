@@ -117,3 +117,29 @@ Output directory must be new/empty for each run. No model/state updates or targe
 train/test queries in fer_val mode. Existing RAF official test option unchanged.
 Nine numerical/image/data/retrieval tests and syntax/help checks pass; full
 PyTorch color-transform/inference not executed here. Inspect previews manually.
+
+## Resolution bottleneck diagnostic
+
+--query_lowres_size 0 (default): native query input, original results unchanged.
+--query_lowres_size 48: PIL bilinear resize to 48x48 BEFORE the existing
+Resize256 -> CenterCrop224 -> optional Grayscale3 -> ToTensor/normalization.
+--reference_lowres_size 0 (default): keep source training reference images native.
+Set reference size explicitly only for a separate matched-reference experiment.
+
+For a controlled RAF test, run query_lowres_size 0 and 48 with query_dataset
+raf_test, color_mode rgb and reference_color_mode rgb, reference_lowres_size 0.
+Use separate output directories. Reference library thus stays unchanged; both
+classifier and retrieval methods see only the query resolution intervention.
+No source/target retraining, teacher, optimizer or prototype writes. Test labels
+join after predictions as before. Lowres0 results should reproduce RAF RGB baseline.
+
+Summary dataset_audit.resolution_modes records both sizes. 0 means native, not
+zero pixels. When audit_images>0 and query lowres>0, resolution_preview.jpg shows
+first six query images' original and bottleneck crops. It illustrates geometry;
+preview PIL interpolation may not be pixel-identical to model's final resize.
+input_audit.json dimensions describe original files, NOT transformed tensor size.
+Images are not overwritten. Downsampled RAF does not replicate FER annotation,
+face alignment, grayscale style or all camera artifacts; a performance change is
+resolution sensitivity evidence, not proof of the whole domain-gap cause.
+Four resolution tests + four retrieval tests, help/syntax checks pass. Full model
+inference not executed in editing environment (PyTorch/data unavailable).
