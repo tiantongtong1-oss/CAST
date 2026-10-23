@@ -16,8 +16,8 @@ from prototype_utils import FeatureHook, PrototypeBank, prototype_weight_for_epo
 from source_prototype_radius import SourcePrototypeRadiusBank
 from reliability_roles import ReliabilityRoles
 from dual_domain_ds import DSConfig
-from neighbor_vote import NeighborVoteBank, audit_vote, rescue_union
 from competition_gate import competition_audit, supervision_mask
+from adaptive_distance_vote import AdaptiveDistanceVoteBank, audit_adaptive_vote
 import image_utils as util
 from randaugment import RandAugmentMC
 # 总训练入口与调度器。串起数据、Source 预训练、EMA Teacher、
@@ -97,7 +97,7 @@ def parse_args(argv=None):
                              'MMD anchor promotion is unchanged')
     parser.add_argument('--promotion_epochs', type=int, default=3,
                         help='consecutive eligible epochs before anchor promotion')
-    parser.add_argument('--run_name', type=str, default='stable_rescue_competition_v24',
+    parser.add_argument('--run_name', type=str, default='adaptive_distance_vote_v25',
                         help='checkpoint suffix; use distinct names for ablations')
     parser.add_argument('--device', choices=['cuda', 'cpu'], default='cuda',
                         help='CPU is supported for smoke tests; CUDA recommended for FER training')
@@ -117,10 +117,15 @@ def parse_args(argv=None):
     parser.add_argument('--ds_conflict_threshold', type=float, default=0.5)
     parser.add_argument('--ds_strength_cap', type=float, default=0.95)
 
+    parser.add_argument('--neighbor_distance_quantile', type=float, default=0.90)
     parser.add_argument('--rescue_probability_margin', type=float, default=0.10)
     parser.add_argument('--rescue_prototype_margin', type=float, default=0.02)
     parser.add_argument('--rescue_vote_margin', type=int, default=3)
     args = parser.parse_args(argv)
+    if not np.isfinite(args.neighbor_distance_quantile) or not 0 < args.neighbor_distance_quantile <= 1:
+        parser.error('neighbor_distance_quantile must be finite and in (0,1]')
+    if args.rescue_vote_margin != 3:
+        parser.error('adaptive vote uses fixed margin=3 for 6-11 neighbors; keep --rescue_vote_margin 3')
     if args.immediate_prototype_update or not args.role_separation:
         parser.error('stable anchors required: remove --immediate_prototype_update and --no_role_separation')
     if not np.isfinite(args.rescue_probability_margin) or not 0 <= args.rescue_probability_margin <= 1:
@@ -405,7 +410,7 @@ def refresh_source_radius_bank(teacher, feature_hook, source_loader, reliability
 
 
 @torch.no_grad()
-def refresh_ds_source_bank(teacher, feature_hook, source_loader, classes):
+def refresh_ds_source_bank(teacher, feature_hook, source_loader, classes, distance_quantile=0.90):
     """Freeze source-label evidence in current Teacher coordinates for this epoch."""
     device = next(teacher.parameters()).device
     teacher.eval()
@@ -416,7 +421,9 @@ def refresh_ds_source_bank(teacher, feature_hook, source_loader, classes):
         sy.append(labels.numpy())
     x, y = np.concatenate(sx), np.concatenate(sy)
     # Source IDs and target query IDs are separate namespaces: do not exclude self.
-    return NeighborVoteBank(x, y, np.arange(len(y)), np.ones(len(y)), classes)
+    bank = AdaptiveDistanceVoteBank(x, y, np.arange(len(y)), np.ones(len(y)), classes)
+    bank.calibrate(distance_quantile)
+    return bank
 
 
 def run_training():
@@ -627,14 +634,14 @@ def run_training():
     role_tracker = ReliabilityRoles(len(target_train), args.promotion_epochs).to(device)
 
     ds_config = ds_config_from_args(args)
-    print('Rescue=agreement & low_confidence & (radius OR vote) & competition; rescue learns only after stable promotion; no class quotas; competing SOURCE prototypes; K=11 is neighbor count, not per-class selection quota; KNN_Vote: K=11 Minimum_Votes=6 Vote_Ratio=6/11; full neighborhood required; source true labels; no DS/Otsu/cosine weighting')
+    print('Rescue=agreement & low_confidence & adaptive_vote & probability/prototype_competition; radius required for anchor promotion; rescue learns only after stable promotion; no class quotas; competing SOURCE prototypes; K=11 is neighbor count, not per-class selection quota; AdaptiveVote: maxK=11 distance-filtered; K_eff<3 unavailable; K_eff=3..5 unanimous; K_eff=6..11 ratio>=0.75 and gap>=3; adaptive vote required on both rescue routes; source true labels; no DS/Otsu/cosine weighting')
     print('Competition margins: probability=%s prototype=%s vote=%s' %
           (args.rescue_probability_margin, args.rescue_prototype_margin, args.rescue_vote_margin))
     ds_csv_path = os.path.join(model_path, args.run_name + '_ds_diagnostics.csv')
     ds_columns = ['epoch', 'sample_id', 'pseudo_label', 'source_count',
                   'source_available', 'source_support', 'source_unknown',
                   'source_conflict', 'support', 'margin', 'unknown',
-                  'ds_pass', 'accepted', 'supporting_votes', 'vote_ratio', 'radius_pass', 'vote_pass', 'probability_gap', 'prototype_gap', 'vote_gap', 'competition_pass']
+                  'ds_pass', 'accepted', 'supporting_votes', 'vote_ratio', 'radius_pass', 'vote_pass', 'probability_gap', 'prototype_gap', 'vote_gap', 'competition_pass', 'raw_neighbor_count', 'distance_threshold', 'mean_neighbor_distance', 'max_neighbor_distance']
     if args.ds_neighbor:
         with open(ds_csv_path, 'w', newline='') as handle:
             csv.writer(handle).writerow(ds_columns)
@@ -655,8 +662,8 @@ def run_training():
                threshold_center, enable_radius_rescue))
         if args.ds_neighbor:
             ds_source = refresh_ds_source_bank(
-                teacher, teacher_feature_hook, prototype_loader_source, class_num)
-            print('[Target Epoch %d] DS_Source_Refs: %d' % (i, len(ds_source.x)))
+                teacher, teacher_feature_hook, prototype_loader_source, class_num, args.neighbor_distance_quantile)
+            print('[Target Epoch %d] DS_Source_Refs: %d Neighbor_Distance_Thresholds: %s' % (i, len(ds_source.x), ds_source.distance_thresholds))
         ds_totals = np.zeros(7, dtype=np.float64)
         rescue_route_counts = np.zeros(3, dtype=np.int64)
 
@@ -669,7 +676,7 @@ def run_training():
                    np.array2string(reliability_bank.class_radii.cpu().numpy(), precision=8),
                    reliability_bank.distribution_initialized.cpu().tolist()))
             log_source_prototypes(reliability_bank)
-        print('[Target Epoch %d] KNN_Vote_K: 11 Minimum_Votes: 6 Ratio_Threshold: %.6f Rescue_Enabled: %s' % (i, 6/11, enable_radius_rescue))
+        print('[Target Epoch %d] Adaptive_KNN_MaxK: 11 MinK: 3 LargeK_Ratio: 0.75 Rescue_Enabled: %s' % (i, enable_radius_rescue))
         current_proto_weight = prototype_weight_for_epoch(
             i, args.proto_weight, args.proto_warmup_epochs, args.proto_ramp_epochs
         )
@@ -693,6 +700,7 @@ def run_training():
         pseudo_distribution_anchors = np.zeros(class_num, dtype=np.int64)
         anchor_num = 0
         supervised_num = pending_rescue_num = competition_pass_num = 0
+        effective_k_histogram = np.zeros(12, dtype=np.int64)
         pseudo_distribution_supervised = np.zeros(class_num, dtype=np.int64)
         prototype_update_num = immediate_update_num = 0
 
@@ -736,9 +744,10 @@ def run_training():
                     query_idx = torch.where(rescue_candidates)[0]
                     queries = teacher_mean_features[query_idx].cpu().numpy()
                     query_ids = sample_ids[query_idx.cpu()].cpu().numpy()
-                    source_ds = ds_source.evaluate(queries, query_ids, ds_config)
-                    ds_result = audit_vote(
-                        source_ds, pseudo_targets[query_idx].cpu().numpy(), 6)
+                    source_ds = ds_source.evaluate(queries, query_ids, ds_config, pseudo_targets[query_idx].cpu().numpy())
+                    effective_k_histogram += np.bincount(source_ds['count'], minlength=12)
+                    ds_result = audit_adaptive_vote(
+                        source_ds, pseudo_targets[query_idx].cpu().numpy())
                     vote_pass = torch.as_tensor(ds_result['pass_mask'], device=device, dtype=torch.bool)
                     radius_pass = region_ok[query_idx]
                     competition = competition_audit(
@@ -753,7 +762,10 @@ def run_training():
                     )
                     competition_pass = torch.as_tensor(competition['pass_mask'], device=device)
                     competition_pass_num += int(competition_pass.sum().item())
-                    rescue_mask[query_idx] = rescue_union(radius_pass, vote_pass) & competition_pass
+                    # Adaptive vote is mandatory on both v24 rescue routes, so
+                    # (radius | vote) & vote simplifies to vote. Radius still
+                    # controls eligibility for stable anchor promotion.
+                    rescue_mask[query_idx] = vote_pass & competition_pass
                     rescue_route_counts += np.array([
                         int((radius_pass & ~vote_pass).sum()),
                         int((~radius_pass & vote_pass).sum()),
@@ -778,7 +790,9 @@ def run_training():
                             bool(radius_pass[row]), bool(vote_pass[row]),
                             float(competition['probability_gap'][row]),
                             float(competition['prototype_gap'][row]),
-                            int(competition['vote_gap'][row]), bool(competition['pass_mask'][row])])
+                            int(competition['vote_gap'][row]), bool(competition['pass_mask'][row]), int(source_ds['raw_count'][row]),
+                            float(source_ds['distance_threshold'][row]),
+                            float(source_ds['mean_distance'][row]), float(source_ds['max_distance'][row])])
                     with open(ds_csv_path, 'a', newline='') as handle:
                         csv.writer(handle).writerows(rows)
 
@@ -926,6 +940,7 @@ def run_training():
               (i, np.array2string(pseudo_distribution_rescued, separator=', ')))
         print('[Target Epoch %d] Pseudo_Distribution_Final: %s' %
               (i, np.array2string(pseudo_distribution_final, separator=', ')))
+        print('[Target Epoch %d] Effective_Neighbor_Count_Histogram_0_to_11: %s' % (i, effective_k_histogram))
         print('[Target Epoch %d] Supervised_Num: %d Pending_Rescue_Num: %d Competition_Pass_Num: %d Supervised_Distribution: %s' %
               (i, supervised_num, pending_rescue_num, competition_pass_num,
                np.array2string(pseudo_distribution_supervised, separator=', ')))
