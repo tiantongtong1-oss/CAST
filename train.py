@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from torchvision import transforms
 
 import Networks
+from balanced_soft_losses import classification_with_soft_rescue
 from dataset import RafDataSet, FER
 from ema_utils import create_ema_teacher, select_dual_view_pseudo_labels, update_ema_teacher
 from prototype_utils import FeatureHook, PrototypeBank, prototype_weight_for_epoch
@@ -97,7 +98,7 @@ def parse_args(argv=None):
                              'MMD anchor promotion is unchanged')
     parser.add_argument('--promotion_epochs', type=int, default=3,
                         help='consecutive eligible epochs before anchor promotion')
-    parser.add_argument('--run_name', type=str, default='stable_rescue_competition_v24',
+    parser.add_argument('--run_name', type=str, default='class_balanced_align_soft_rescue_v29',
                         help='checkpoint suffix; use distinct names for ablations')
     parser.add_argument('--device', choices=['cuda', 'cpu'], default='cuda',
                         help='CPU is supported for smoke tests; CUDA recommended for FER training')
@@ -120,7 +121,14 @@ def parse_args(argv=None):
     parser.add_argument('--rescue_probability_margin', type=float, default=0.10)
     parser.add_argument('--rescue_prototype_margin', type=float, default=0.02)
     parser.add_argument('--rescue_vote_margin', type=int, default=3)
+    parser.add_argument('--soft_rescue_weight', type=float, default=0.25)
+    parser.add_argument('--balanced_alignment_weight', type=float, default=0.03,
+                        help='separate coefficient on equal-active-class intra-domain MMD')
     args = parser.parse_args(argv)
+    if not np.isfinite(args.soft_rescue_weight) or not 0 <= args.soft_rescue_weight <= 1:
+        parser.error('soft_rescue_weight must be finite and in [0,1]')
+    if not np.isfinite(args.balanced_alignment_weight) or args.balanced_alignment_weight < 0:
+        parser.error('balanced_alignment_weight must be finite and nonnegative')
     if args.immediate_prototype_update or not args.role_separation:
         parser.error('stable anchors required: remove --immediate_prototype_update and --no_role_separation')
     if not np.isfinite(args.rescue_probability_margin) or not 0 <= args.rescue_probability_margin <= 1:
@@ -679,6 +687,9 @@ def run_training():
         train_loss2 = 0.0
         train_loss3 = 0.0
         train_proto_loss = 0.0
+        train_balanced_alignment = train_soft_rescue = 0.0
+        alignment_class_batches = np.zeros(class_num, dtype=np.int64)
+        soft_rescue_distribution = np.zeros(class_num, dtype=np.int64)
         batch_count = 0
         agreement_num = 0
         radius_pass_num = 0
@@ -800,6 +811,10 @@ def run_training():
                 prototype_update_mask = anchor_mask.clone()
                 learn_mask = supervision_mask(confidence_mask, rescue_mask, anchor_mask)
                 con_idx = learn_mask.float()
+                stable_soft_rescue = rescue_mask & anchor_mask & ~confidence_mask
+                teacher_soft_targets = (F.softmax(logits1, dim=1) + F.softmax(logits2, dim=1)) / 2
+                soft_rescue_distribution += np.bincount(
+                    pseudo_targets[stable_soft_rescue].cpu().numpy(), minlength=class_num)
                 supervised_num += int(learn_mask.sum().item())
                 pending_rescue_num += int((rescue_mask & ~anchor_mask).sum().item())
                 pseudo_distribution_supervised += np.bincount(
@@ -853,12 +868,16 @@ def run_training():
             optimizer.zero_grad()
             output = model(
                 train_imgs, train_targets, train_anchor_idx, 'train', 'target',
-                source_count=source_imgs.shape[0],
+                source_count=source_imgs.shape[0], balanced_target_alignment=True,
             )
             # 分类损失
-            per_sample_loss = criterion(output[0], train_targets) * train_con_idx
-            # 对真正有效的源域和目标域样本求平均分类损失
-            cls_loss = per_sample_loss.sum() / train_con_idx.sum().clamp_min(1.0)
+            cls_loss, classification_parts = classification_with_soft_rescue(
+                output[0], train_targets[:source_imgs.shape[0]], pseudo_targets,
+                confidence_mask, stable_soft_rescue, teacher_soft_targets,
+                args.soft_rescue_weight,
+            )
+            balanced_alignment = output[2]
+            alignment_class_batches[output[3]] += 1
             aff_loss = output[1]
             # 分类器权重之间的正则项
             weight_loss = classifier_modulation_loss(model)
@@ -868,7 +887,7 @@ def run_training():
             proto_loss = prototype_bank.consistency_loss(
                 target_student_features,
                 pseudo_targets,
-                con_idx,
+                confidence_mask.float(),
                 temperature=args.proto_temperature,
             )
             # 总损失
@@ -877,6 +896,7 @@ def run_training():
                 + aff_loss * args.w2
                 + weight_loss * args.w3
                 + proto_loss * current_proto_weight
+                + balanced_alignment * args.balanced_alignment_weight
             )
             #反向传播
             loss.backward()
@@ -894,6 +914,8 @@ def run_training():
             train_loss2 += aff_loss.item()
             train_loss3 += weight_loss.item()
             train_proto_loss += proto_loss.item()
+            train_balanced_alignment += balanced_alignment.item()
+            train_soft_rescue += classification_parts['soft_rescue_mean'].item()
             batch_count += 1
         if args.ds_neighbor:
             n = max(ds_totals[0], 1)
@@ -926,6 +948,10 @@ def run_training():
               (i, np.array2string(pseudo_distribution_rescued, separator=', ')))
         print('[Target Epoch %d] Pseudo_Distribution_Final: %s' %
               (i, np.array2string(pseudo_distribution_final, separator=', ')))
+        print('[Target Epoch %d] Balanced_Alignment: %.6f AlignWeight: %.4f Active_Class_Batches: %s Soft_Rescue_CE: %.6f SoftWeight: %.3f Soft_Rescue_Distribution: %s' %
+              (i, train_balanced_alignment / max(batch_count, 1), args.balanced_alignment_weight,
+               alignment_class_batches.tolist(), train_soft_rescue / max(batch_count, 1),
+               args.soft_rescue_weight, soft_rescue_distribution.tolist()))
         print('[Target Epoch %d] Supervised_Num: %d Pending_Rescue_Num: %d Competition_Pass_Num: %d Supervised_Distribution: %s' %
               (i, supervised_num, pending_rescue_num, competition_pass_num,
                np.array2string(pseudo_distribution_supervised, separator=', ')))

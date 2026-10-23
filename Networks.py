@@ -1,6 +1,7 @@
 from torch import nn
 import torch
 from torchvision import models
+from balanced_soft_losses import equal_class_alignment
 
 
 def compute_kernel_matrix(source, target, kernel_mul=2.0, kernel_num=5):
@@ -95,7 +96,7 @@ class Model(nn.Module):
             raise ValueError('Backbone Error!')
 
     def forward(self, x, targets=None, idx=None, mode='train', task='target',
-                epoch=0, source_count=None):
+                epoch=0, source_count=None, balanced_target_alignment=False):
         fea = self.feature(x)
         out = self.bn(self.fc(fea))
         # 测试模式
@@ -149,7 +150,7 @@ class Model(nn.Module):
 
                 fea_s = source_features[i]
                 fea_t = target_features[i]
-                if fea_s.size(0) >= 2 and fea_t.size(0) >= 2:
+                if not balanced_target_alignment and fea_s.size(0) >= 2 and fea_t.size(0) >= 2:
                     # 类内：源域第 i 类 vs 目标域第 i 类，乘以该类的权重 eta[i]
                     intra_loss += mmd_loss(fea_s, fea_t) * eta[i]
 
@@ -161,6 +162,11 @@ class Model(nn.Module):
 
             # Paper Eq. (12): intra-class domain alignment + inter-class separation.
             # 特征分布对齐损失
+            if balanced_target_alignment:
+                balanced_intra,active=equal_class_alignment(source_features,target_features,mmd_loss)
+                # Preserve existing inter-class term; replace, do not duplicate,
+                # the original density-weighted intra-domain alignment term.
+                return [out, -inter_loss / self.num_classes, balanced_intra, active]
             affinity_loss = (intra_loss - inter_loss) / self.num_classes
             return [out, affinity_loss]
 
