@@ -17,7 +17,7 @@ from source_prototype_radius import SourcePrototypeRadiusBank
 from reliability_roles import ReliabilityRoles
 from dual_domain_ds import DSConfig
 from neighbor_vote import NeighborVoteBank, audit_vote, rescue_union
-from source_class_weights import source_class_weights
+from source_class_weights import source_class_weights, domain_normalized_classification_loss
 import image_utils as util
 from randaugment import RandAugmentMC
 # 总训练入口与调度器。串起数据、Source 预训练、EMA Teacher、
@@ -533,6 +533,8 @@ def run_training():
     print('Source_Class_Weight: %s Counts: %s Weights: %s Power: %.3f Max: %.3f' %
           (args.source_class_weight, source_counts.tolist(), source_weights.tolist(),
            args.source_class_weight_power, args.source_class_weight_max))
+    print('Classification_Normalization: separate_source_weighted_mean; '
+          'domain_mix=source_count:accepted_target_count')
 
     if args.checkpoint:
         print('Loading pretrained weights...', args.checkpoint)
@@ -843,12 +845,12 @@ def run_training():
             )
             # 分类损失
             # Source class weights affect CE only, never affinity/anchor masks or target pseudo labels.
-            ce_weights = train_con_idx.clone()
             source_count = source_imgs.shape[0]
-            ce_weights[:source_count] *= source_weights[train_targets[:source_count]]
-            per_sample_loss = criterion(output[0], train_targets) * ce_weights
-            # 对真正有效的源域和目标域样本求平均分类损失
-            cls_loss = per_sample_loss.sum() / ce_weights.sum().clamp_min(1e-12)
+            cls_loss = domain_normalized_classification_loss(
+                criterion(output[0], train_targets),
+                source_weights[train_targets[:source_count]],
+                train_con_idx[source_count:],
+            )
             aff_loss = output[1]
             # 分类器权重之间的正则项
             weight_loss = classifier_modulation_loss(model)

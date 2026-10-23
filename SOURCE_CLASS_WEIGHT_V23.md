@@ -7,10 +7,14 @@ Enable with --source_class_weight inverse_power. Default none preserves unweight
 Counts come only from source_train.label. Present-class weights are n**(-power),
 normalized to class mean 1, then capped at max (no second normalization).
 Defaults: power=0.5, max=2.0. Absent classes get zero in enabled mode.
-CE uses sum(weight * loss) / sum(weight). In the mixed target-stage batch, only
-source rows receive class weights; accepted target rows retain their existing
-confidence masks. The joint denominator includes these source weights and target
-masks. Source/target relative contribution can consequently change. Evaluation CE,
+Source pretraining CE uses sum(weight * loss) / sum(weight).
+Target-stage CE now normalizes source and target separately:
+Ls = sum(source_weight * source_CE) / sum(source_weight)
+Lt_sum = sum(target_acceptance_mask * target_CE)
+Lcls = (Ns * Ls + Lt_sum) / (Ns + Naccepted_target).
+Thus domain mixing uses actual source count and accepted target count, as in v22.
+Zero accepted targets reduces to Ls. Unit weights recover v22 mathematically.
+Only source rows receive class weights; target acceptance masks are unchanged. Evaluation CE,
 source sampling, affinity/anchor masks, prototypes, EMA, thresholds and 6/11 rescue
 are unchanged. This is a loss-weighting ablation, not balanced sampling.
 
@@ -31,14 +35,14 @@ python -u train.py \
   --source_radius_quantile 0.90 --source_refresh_interval 1 \
   --radius_rescue_warmup_epochs 3 --immediate_prototype_update \
   --ds_k 11 \
-  --run_name adaptive_minconf_radius_or_vote6of11_source_sqrt_v23 \
-  2>&1 | tee test_logs/adaptive_minconf_radius_or_vote6of11_source_sqrt_v23.log
+  --run_name adaptive_minconf_radius_or_vote6of11_source_sqrt_domainnorm_v23 \
+  2>&1 | tee test_logs/adaptive_minconf_radius_or_vote6of11_source_sqrt_domainnorm_v23.log
 ```
 
 For a disabled control, set --source_class_weight none and use another run_name.
 To also retrain source from the same initialization use --pre_epochs 30; this is
 an additional experiment rather than the same-checkpoint target-only ablation.
 
-Validation: 4 weight tests + 4 neighbor vote tests; syntax and diff checks pass.
+Validation: 4 weight tests + 4 neighbor vote tests + 4 domain-normalization formula tests pass; syntax and diff checks pass. PyTorch gradient test is skipped when PyTorch is unavailable.
 No PyTorch/CUDA or RAF/FER data available in the editing environment; full training
 and tensor integration have not been run. No accuracy improvement is claimed.

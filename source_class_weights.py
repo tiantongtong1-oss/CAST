@@ -2,6 +2,21 @@
 import numpy as np
 
 
+def domain_normalized_classification_loss(per_sample_loss, source_weights, target_mask):
+    """Weighted source mean, mixed using unweighted effective domain counts.
+
+    Inputs are torch tensors; source rows precede target rows. Target masks are
+    binary acceptance masks. Empty acceptance contributes zero without branching.
+    """
+    source_count = source_weights.numel()
+    source_loss = (per_sample_loss[:source_count] * source_weights).sum()
+    source_loss = source_loss / source_weights.sum().clamp_min(1e-12)
+    target_sum = (per_sample_loss[source_count:] * target_mask).sum()
+    target_count = target_mask.sum()
+    # target_sum == target_count * target_mean, including target_count == 0.
+    return (source_count * source_loss + target_sum) / (source_count + target_count).clamp_min(1.0)
+
+
 def source_class_weights(counts, mode='none', power=0.5, max_weight=2.0):
     counts = np.asarray(counts, dtype=np.float64)
     if counts.ndim != 1 or counts.size == 0 or not np.isfinite(counts).all() or (counts < 0).any() or not (counts > 0).any():
