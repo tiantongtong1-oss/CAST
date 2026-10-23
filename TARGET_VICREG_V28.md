@@ -68,3 +68,37 @@ three VICReg tensor/gradient tests skipped because PyTorch unavailable. Syntax a
 CLI help pass. Full training, CUDA memory requirements and gradients not executed
 here. Run test_vicreg_adaptation.py on training host before training; all five tests
 should pass. No target true labels used in optimization or batch sampling.
+
+## Stabilization options
+
+--freeze_backbone_bn: after model.train each epoch, call eval on BN modules under
+model.feature only. Running mean/variance remain fixed, affine parameters still
+train. Source classifier BN and projector BN remain train-mode. Default disabled
+retains prior behavior. This is stats freezing, not freezing the whole backbone.
+
+--grad_log_interval 100: sample at global steps 0,100,..., log gradient L2 norms
+of weighted source CE and weighted SSL on SHARED model.feature parameters, ratio,
+and cosine to gradient_diagnostics.csv. autograd.grad retains graph, does not
+populate/modify parameter.grad; normal total.backward follows. Includes both loss
+weights; excludes projector/classifier-only parameters for comparable gradients.
+Zero norms yield undefined cosine/ratio as blanks. Default 0 disables diagnostics.
+Sampled extra backwards add overhead, not every step. Negative cosine signals
+conflicting gradients on that sampled batch, not proof of whole-run conflict.
+
+Suggested short stability run FROM ORIGINAL uniform source model: epochs=2,
+ssl_weight=.01, source_weight=1, lr=.0001, freeze_backbone_bn, grad_log_interval=100,
+NEW output_dir target_vicreg_bnfreeze_w001_v28. This changes BN stats and SSL
+strength together for a practical stability trial, NOT a causal isolation of the
+two effects. No universally correct gradient ratio threshold; compare validation
+MacroF1 and Fear precision/coverage rather than loss scale alone. Use matching
+ssl_weight=0 + BN freeze as an optional baseline if attribution is later needed.
+
+Evaluate previous best.pth separately using diagnose_initial_model.py. Best may
+change if the previous job continues; consult checkpoint epoch/current log before
+calling it epoch0. Preserve previous run directory. Do not initialize new trial
+from degraded last.pth. Full diagnostic eval has no training/state updates.
+
+Added three Torch tests for BN stats/affine gradients, weighted gradient ratio,
+nonmutation, and opposing/zero gradients. All skipped here (no PyTorch); run on
+training host. Syntax/help and two unlabeled-data tests pass. Full stability trial
+not executed; no guarantee of performance recovery.

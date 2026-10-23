@@ -9,6 +9,7 @@ from vicreg_adaptation_utils import discover_unlabeled_train,vicreg_loss
 from topk_diagnostics import summarize
 from feature_knn_diagnostics import classification_metrics
 from diagnostic_data_audit import assert_disjoint_paths
+from adaptation_stability import freeze_backbone_bn_statistics,shared_gradient_metrics
 
 
 class UnlabeledTwoViews:
@@ -45,7 +46,12 @@ def main():
     p.add_argument('--source_weight',type=float,default=1.)
     p.add_argument('--projection_dim',type=int,default=512)
     p.add_argument('--seed',type=int,default=1314)
+    p.add_argument('--freeze_backbone_bn',action='store_true',
+                   help='freeze feature-extractor BN running statistics; affine gradients remain enabled')
+    p.add_argument('--grad_log_interval',type=int,default=0,
+                   help='sample weighted loss gradients on shared feature parameters every N steps; 0 disables')
     a=p.parse_args()
+    if a.grad_log_interval<0:p.error('grad_log_interval must be nonnegative')
     if a.epochs<1 or a.batch_size<2 or a.workers<0 or a.projection_dim<2:p.error('invalid epochs/batch/workers/dimension')
     if not all(np.isfinite(v) for v in [a.lr,a.ssl_weight,a.source_weight]) or a.lr<=0 or a.ssl_weight<0 or a.source_weight<=0:p.error('invalid learning rate/loss weights')
     import torch
@@ -115,11 +121,16 @@ def main():
 
     print('Target train images:',len(target),'NO target labels parsed/returned; no pseudo-label/EMA/MMD/prototype loss')
     print('Loss = %.3f * source_CE + %.3f * (25*invariance + 25*variance + covariance)' % (a.source_weight,a.ssl_weight))
+    print('Freeze backbone BN statistics:',a.freeze_backbone_bn,'Gradient interval:',a.grad_log_interval)
     best=evaluate(-1);best_epoch=-1;save(out/'best.pth',-1,best)
+    global_step=0
     with (out/'training.csv').open('w',newline='') as f:
         writer=csv.writer(f);writer.writerow(['epoch','total','source_ce','vicreg','invariance','variance','covariance','projected_std_mean','projected_fraction_std_below1','encoder_std_mean'])
         for epoch in range(a.epochs):
-            model.train();projector.train();source_iter=iter(sl);sums=np.zeros(9);batches=0
+            model.train();projector.train()
+            if a.freeze_backbone_bn:
+                print('Frozen feature BN modules:',freeze_backbone_bn_statistics(model.feature))
+            source_iter=iter(sl);sums=np.zeros(9);batches=0
             for view1,view2 in tl:
                 try:images,labels=next(source_iter)
                 except StopIteration:source_iter=iter(sl);images,labels=next(source_iter)
@@ -134,7 +145,16 @@ def main():
                 z=projector(torch.cat([f1,f2],0));ssl,parts=vicreg_loss(z[:nt],z[nt:])
                 total=a.source_weight*ce+a.ssl_weight*ssl
                 if not torch.isfinite(total):raise FloatingPointError('nonfinite adaptation loss')
-                total.backward();optimizer.step()
+                if a.grad_log_interval and global_step % a.grad_log_interval == 0:
+                    gradient=shared_gradient_metrics(a.source_weight*ce,a.ssl_weight*ssl,model.feature.parameters())
+                    print('Gradient step=%d epoch=%d %s' % (global_step,epoch,gradient),flush=True)
+                    gradient_path=out/'gradient_diagnostics.csv'
+                    fresh=not gradient_path.exists()
+                    with gradient_path.open('a',newline='') as gf:
+                        gw=csv.DictWriter(gf,fieldnames=['step','epoch']+list(gradient))
+                        if fresh:gw.writeheader()
+                        gw.writerow(dict(step=global_step,epoch=epoch,**gradient))
+                total.backward();optimizer.step();global_step+=1
                 encoder_std=(f1.detach().std(0,unbiased=False).mean()+f2.detach().std(0,unbiased=False).mean())/2
                 values=[total,ce,ssl,parts['invariance'],parts['variance'],parts['covariance'],
                         parts['projected_std_mean'],parts['projected_fraction_std_below1'],encoder_std]
