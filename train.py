@@ -17,6 +17,7 @@ from source_prototype_radius import SourcePrototypeRadiusBank
 from reliability_roles import ReliabilityRoles
 from dual_domain_ds import DSConfig
 from neighbor_vote import NeighborVoteBank, audit_vote, rescue_union
+from competition_gate import competition_audit, supervision_mask
 import image_utils as util
 from randaugment import RandAugmentMC
 # 总训练入口与调度器。串起数据、Source 预训练、EMA Teacher、
@@ -96,7 +97,7 @@ def parse_args(argv=None):
                              'MMD anchor promotion is unchanged')
     parser.add_argument('--promotion_epochs', type=int, default=3,
                         help='consecutive eligible epochs before anchor promotion')
-    parser.add_argument('--run_name', type=str, default='adaptive_minconf_radius_or_vote6of11_v22',
+    parser.add_argument('--run_name', type=str, default='stable_rescue_competition_v24',
                         help='checkpoint suffix; use distinct names for ablations')
     parser.add_argument('--device', choices=['cuda', 'cpu'], default='cuda',
                         help='CPU is supported for smoke tests; CUDA recommended for FER training')
@@ -116,7 +117,18 @@ def parse_args(argv=None):
     parser.add_argument('--ds_conflict_threshold', type=float, default=0.5)
     parser.add_argument('--ds_strength_cap', type=float, default=0.95)
 
+    parser.add_argument('--rescue_probability_margin', type=float, default=0.10)
+    parser.add_argument('--rescue_prototype_margin', type=float, default=0.02)
+    parser.add_argument('--rescue_vote_margin', type=int, default=3)
     args = parser.parse_args(argv)
+    if args.immediate_prototype_update or not args.role_separation:
+        parser.error('stable anchors required: remove --immediate_prototype_update and --no_role_separation')
+    if not np.isfinite(args.rescue_probability_margin) or not 0 <= args.rescue_probability_margin <= 1:
+        parser.error('rescue_probability_margin must be finite and in [0,1]')
+    if not np.isfinite(args.rescue_prototype_margin) or not 0 <= args.rescue_prototype_margin <= 2:
+        parser.error('rescue_prototype_margin must be finite and in [0,2]')
+    if not 0 <= args.rescue_vote_margin <= 11:
+        parser.error('rescue_vote_margin must be in [0,11]')
     if not np.isfinite(args.source_radius_quantile) or not 0 < args.source_radius_quantile <= 1:
         parser.error('source_radius_quantile must be finite and in (0, 1]')
     if args.source_refresh_interval < 1:
@@ -612,16 +624,17 @@ def run_training():
     reliability_bank = SourcePrototypeRadiusBank(
         class_num, model.fc.in_features, source_radius_quantile=args.source_radius_quantile,
     ).to(device)
-    role_tracker = (ReliabilityRoles(len(target_train), args.promotion_epochs).to(device)
-                    if args.role_separation else None)
+    role_tracker = ReliabilityRoles(len(target_train), args.promotion_epochs).to(device)
 
     ds_config = ds_config_from_args(args)
-    print('Rescue=agreement & low_confidence & (radius OR vote); KNN_Vote: K=11 Minimum_Votes=6 Vote_Ratio=6/11; full neighborhood required; source true labels; no DS/Otsu/cosine weighting')
+    print('Rescue=agreement & low_confidence & (radius OR vote) & competition; rescue learns only after stable promotion; no class quotas; competing SOURCE prototypes; K=11 is neighbor count, not per-class selection quota; KNN_Vote: K=11 Minimum_Votes=6 Vote_Ratio=6/11; full neighborhood required; source true labels; no DS/Otsu/cosine weighting')
+    print('Competition margins: probability=%s prototype=%s vote=%s' %
+          (args.rescue_probability_margin, args.rescue_prototype_margin, args.rescue_vote_margin))
     ds_csv_path = os.path.join(model_path, args.run_name + '_ds_diagnostics.csv')
     ds_columns = ['epoch', 'sample_id', 'pseudo_label', 'source_count',
                   'source_available', 'source_support', 'source_unknown',
                   'source_conflict', 'support', 'margin', 'unknown',
-                  'ds_pass', 'accepted', 'supporting_votes', 'vote_ratio', 'radius_pass', 'vote_pass']
+                  'ds_pass', 'accepted', 'supporting_votes', 'vote_ratio', 'radius_pass', 'vote_pass', 'probability_gap', 'prototype_gap', 'vote_gap', 'competition_pass']
     if args.ds_neighbor:
         with open(ds_csv_path, 'w', newline='') as handle:
             csv.writer(handle).writerow(ds_columns)
@@ -679,6 +692,8 @@ def run_training():
         pseudo_distribution_final = np.zeros(class_num, dtype=np.int64)
         pseudo_distribution_anchors = np.zeros(class_num, dtype=np.int64)
         anchor_num = 0
+        supervised_num = pending_rescue_num = competition_pass_num = 0
+        pseudo_distribution_supervised = np.zeros(class_num, dtype=np.int64)
         prototype_update_num = immediate_update_num = 0
 
         for weak1, weak2, strong, _, sample_ids in train_loader_target:
@@ -726,7 +741,19 @@ def run_training():
                         source_ds, pseudo_targets[query_idx].cpu().numpy(), 6)
                     vote_pass = torch.as_tensor(ds_result['pass_mask'], device=device, dtype=torch.bool)
                     radius_pass = region_ok[query_idx]
-                    rescue_mask[query_idx] = rescue_union(radius_pass, vote_pass)
+                    competition = competition_audit(
+                        F.softmax(logits1[query_idx], dim=1).cpu().numpy(),
+                        F.softmax(logits2[query_idx], dim=1).cpu().numpy(),
+                        queries, pseudo_targets[query_idx].cpu().numpy(),
+                        reliability_bank.class_means.cpu().numpy(),
+                        reliability_bank.distribution_initialized.cpu().numpy(),
+                        source_ds['votes'], source_ds['available'],
+                        args.rescue_probability_margin, args.rescue_prototype_margin,
+                        args.rescue_vote_margin,
+                    )
+                    competition_pass = torch.as_tensor(competition['pass_mask'], device=device)
+                    competition_pass_num += int(competition_pass.sum().item())
+                    rescue_mask[query_idx] = rescue_union(radius_pass, vote_pass) & competition_pass
                     rescue_route_counts += np.array([
                         int((radius_pass & ~vote_pass).sum()),
                         int((~radius_pass & vote_pass).sum()),
@@ -748,14 +775,16 @@ def run_training():
                             bool(ds_result['pass_mask'][row]),
                             bool(rescue_mask[query_idx[row]].item()),
                             int(ds_result['vote_count'][row]), float(ds_result['support'][row]),
-                            bool(radius_pass[row]), bool(vote_pass[row])])
+                            bool(radius_pass[row]), bool(vote_pass[row]),
+                            float(competition['probability_gap'][row]),
+                            float(competition['prototype_gap'][row]),
+                            int(competition['vote_gap'][row]), bool(competition['pass_mask'][row])])
                     with open(ds_csv_path, 'a', newline='') as handle:
                         csv.writer(handle).writerows(rows)
 
                 final_mask = confidence_mask | rescue_mask
 
                 # Learning is distinct from updating shared class knowledge.
-                con_idx = final_mask.float()
                 if role_tracker is not None:
                     conf1 = F.softmax(logits1, dim=1).max(dim=1).values
                     conf2 = F.softmax(logits2, dim=1).max(dim=1).values
@@ -764,13 +793,17 @@ def run_training():
                         torch.minimum(conf1, conf2), epoch=i,
                     )
                 else:
-                    anchor_mask = final_mask.clone()
+                    raise RuntimeError('stable role tracking is required')
                 # Binary mask required by Networks.forward(idx == 1).
                 anchor_idx = anchor_mask.float()
-                # Only prototype writes are relaxed; do not mutate anchor_mask.
+                # Target prototype writes are restricted to promoted stable anchors.
                 prototype_update_mask = anchor_mask.clone()
-                if args.immediate_prototype_update:
-                    prototype_update_mask |= final_mask
+                learn_mask = supervision_mask(confidence_mask, rescue_mask, anchor_mask)
+                con_idx = learn_mask.float()
+                supervised_num += int(learn_mask.sum().item())
+                pending_rescue_num += int((rescue_mask & ~anchor_mask).sum().item())
+                pseudo_distribution_supervised += np.bincount(
+                    pseudo_targets[learn_mask].cpu().numpy(), minlength=class_num)
 
                 # 评估函数，用来统计在“可靠样本”上，模型特征与原型之间的预测一致性和相似度，会只检查 con_idx=1 的最终可靠目标样本
                 proto_agree, proto_checked, proto_similarity = (
@@ -893,6 +926,9 @@ def run_training():
               (i, np.array2string(pseudo_distribution_rescued, separator=', ')))
         print('[Target Epoch %d] Pseudo_Distribution_Final: %s' %
               (i, np.array2string(pseudo_distribution_final, separator=', ')))
+        print('[Target Epoch %d] Supervised_Num: %d Pending_Rescue_Num: %d Competition_Pass_Num: %d Supervised_Distribution: %s' %
+              (i, supervised_num, pending_rescue_num, competition_pass_num,
+               np.array2string(pseudo_distribution_supervised, separator=', ')))
         print('[Target Epoch %d] Anchor_Num: %d Anchor_Distribution: %s' %
               (i, anchor_num, np.array2string(pseudo_distribution_anchors, separator=', ')))
         print('[Target Epoch %d] Prototype_Update_Num: %d Immediate_Update_Num: %d' %
