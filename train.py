@@ -96,10 +96,9 @@ def parse_args(argv=None):
                         help='refresh source prototypes and radii every N target epochs')
     parser.set_defaults(role_separation=True)
     parser.add_argument('--no_role_separation', dest='role_separation', action='store_false',
-                        help='accepted samples may immediately update shared knowledge')
+                        help='deprecated; rejected because stable-anchor promotion is required')
     parser.add_argument('--immediate_prototype_update', action='store_true',
-                        help='all finally accepted samples immediately update target prototypes; '
-                             'MMD anchor promotion is unchanged')
+                        help='deprecated; rejected because only stable anchors may update prototypes')
     parser.add_argument('--promotion_epochs', type=int, default=3,
                         help='consecutive eligible epochs before anchor promotion')
     parser.add_argument('--run_name', type=str, default='adaptive_minconf_radius_or_vote6of11_v22',
@@ -123,6 +122,9 @@ def parse_args(argv=None):
     parser.add_argument('--ds_strength_cap', type=float, default=0.95)
 
     args = parser.parse_args(argv)
+    if args.immediate_prototype_update or not args.role_separation:
+        parser.error('stable-anchor-only prototype updates require role separation; '
+                     'remove --immediate_prototype_update and --no_role_separation')
     try:
         source_class_weights([1], args.source_class_weight,
                              args.source_class_weight_power, args.source_class_weight_max)
@@ -633,8 +635,7 @@ def run_training():
     reliability_bank = SourcePrototypeRadiusBank(
         class_num, model.fc.in_features, source_radius_quantile=args.source_radius_quantile,
     ).to(device)
-    role_tracker = (ReliabilityRoles(len(target_train), args.promotion_epochs).to(device)
-                    if args.role_separation else None)
+    role_tracker = ReliabilityRoles(len(target_train), args.promotion_epochs).to(device)
 
     ds_config = ds_config_from_args(args)
     print('Rescue=agreement & low_confidence & (radius OR vote); KNN_Vote: K=11 Minimum_Votes=6 Vote_Ratio=6/11; full neighborhood required; source true labels; no DS/Otsu/cosine weighting')
@@ -777,21 +778,16 @@ def run_training():
 
                 # Learning is distinct from updating shared class knowledge.
                 con_idx = final_mask.float()
-                if role_tracker is not None:
-                    conf1 = F.softmax(logits1, dim=1).max(dim=1).values
-                    conf2 = F.softmax(logits2, dim=1).max(dim=1).values
-                    anchor_mask = role_tracker.observe(
-                        sample_ids, pseudo_targets, final_mask & region_ok,
-                        torch.minimum(conf1, conf2), epoch=i,
-                    )
-                else:
-                    anchor_mask = final_mask.clone()
+                conf1 = F.softmax(logits1, dim=1).max(dim=1).values
+                conf2 = F.softmax(logits2, dim=1).max(dim=1).values
+                anchor_mask = role_tracker.observe(
+                    sample_ids, pseudo_targets, final_mask & region_ok,
+                    torch.minimum(conf1, conf2), epoch=i,
+                )
                 # Binary mask required by Networks.forward(idx == 1).
                 anchor_idx = anchor_mask.float()
-                # Only prototype writes are relaxed; do not mutate anchor_mask.
+                # Only currently eligible, promoted stable anchors may write prototypes.
                 prototype_update_mask = anchor_mask.clone()
-                if args.immediate_prototype_update:
-                    prototype_update_mask |= final_mask
 
                 # 评估函数，用来统计在“可靠样本”上，模型特征与原型之间的预测一致性和相似度，会只检查 con_idx=1 的最终可靠目标样本
                 proto_agree, proto_checked, proto_similarity = (

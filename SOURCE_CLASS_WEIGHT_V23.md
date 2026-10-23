@@ -33,10 +33,10 @@ python -u train.py \
   --source_class_weight inverse_power \
   --source_class_weight_power 0.5 --source_class_weight_max 2.0 \
   --source_radius_quantile 0.90 --source_refresh_interval 1 \
-  --radius_rescue_warmup_epochs 3 --immediate_prototype_update \
+  --radius_rescue_warmup_epochs 3 \
   --ds_k 11 \
-  --run_name adaptive_minconf_radius_or_vote6of11_source_sqrt_domainnorm_v23 \
-  2>&1 | tee test_logs/adaptive_minconf_radius_or_vote6of11_source_sqrt_domainnorm_v23.log
+  --run_name adaptive_minconf_radius_or_vote6of11_source_sqrt_domainnorm_anchoronly_v23 \
+  2>&1 | tee test_logs/adaptive_minconf_radius_or_vote6of11_source_sqrt_domainnorm_anchoronly_v23.log
 ```
 
 For a disabled control, set --source_class_weight none and use another run_name.
@@ -46,3 +46,20 @@ an additional experiment rather than the same-checkpoint target-only ablation.
 Validation: 4 weight tests + 4 neighbor vote tests + 4 domain-normalization formula tests pass; syntax and diff checks pass. PyTorch gradient test is skipped when PyTorch is unavailable.
 No PyTorch/CUDA or RAF/FER data available in the editing environment; full training
 and tensor integration have not been run. No accuracy improvement is claimed.
+
+## Stable-anchor-only prototype writes
+
+Target prototype updates now use anchor_mask exclusively. Every target sample must
+remain finally accepted AND inside its predicted source-class radius, with the
+same pseudo-label for promotion_epochs consecutive epochs (default 3). It may
+update on its promotion epoch. Ineligibility, a changed label, or an epoch gap
+resets the streak. Repeated observations in one epoch do not accelerate promotion.
+First two epochs have no target prototype updates when promotion_epochs=3.
+Source prototypes still refresh normally; accepted nonanchors may still supervise
+classification and prototype consistency loss, but cannot write target prototypes.
+The old --immediate_prototype_update and --no_role_separation flags now fail with
+an explicit instruction to remove them. Role tracking is mandatory.
+Expected per epoch: Prototype_Update_Num == Anchor_Num, Immediate_Update_Num == 0.
+Source class weighting and domain normalization are unchanged for this ablation.
+Existing RoleTests cover delayed promotion and revocation but require PyTorch,
+which is unavailable in the editing environment.
