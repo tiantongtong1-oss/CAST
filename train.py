@@ -20,6 +20,7 @@ from competition_gate import competition_audit, supervision_mask
 from adaptive_distance_vote import AdaptiveDistanceVoteBank, audit_adaptive_vote
 from stage_diagnostics import StageStats, stage_masks, validation_diagnostics
 from calibration_rng import isolated_rng
+from source_sampling import mild_sampling_weights
 import image_utils as util
 from randaugment import RandAugmentMC
 # 总训练入口与调度器。串起数据、Source 预训练、EMA Teacher、
@@ -99,7 +100,7 @@ def parse_args(argv=None):
                              'MMD anchor promotion is unchanged')
     parser.add_argument('--promotion_epochs', type=int, default=3,
                         help='consecutive eligible epochs before anchor promotion')
-    parser.add_argument('--run_name', type=str, default='v25_stage_diagnostics_v26',
+    parser.add_argument('--run_name', type=str, default='source_mild_sampling_v27',
                         help='checkpoint suffix; use distinct names for ablations')
     parser.add_argument('--device', choices=['cuda', 'cpu'], default='cuda',
                         help='CPU is supported for smoke tests; CUDA recommended for FER training')
@@ -123,7 +124,16 @@ def parse_args(argv=None):
     parser.add_argument('--rescue_probability_margin', type=float, default=0.10)
     parser.add_argument('--rescue_prototype_margin', type=float, default=0.02)
     parser.add_argument('--rescue_vote_margin', type=int, default=3)
+    parser.add_argument('--source_pretrain_sampling', choices=['uniform','mild'], default='uniform')
+    parser.add_argument('--source_sampling_power', type=float, default=0.5,
+                        help='per-image sampling weight n_class**(-power), source pretraining only')
+    parser.add_argument('--source_only', action='store_true',
+                        help='stop after source stage and validation; do not evaluate target test')
     args = parser.parse_args(argv)
+    if not np.isfinite(args.source_sampling_power) or not 0 <= args.source_sampling_power <= 1:
+        parser.error('source_sampling_power must be finite and in [0,1]')
+    if args.source_pretrain_sampling == 'mild' and args.pre_epochs == 0:
+        parser.error('mild sampling only applies to source pretraining; use --pre_epochs > 0')
     if not np.isfinite(args.neighbor_distance_quantile) or not 0 < args.neighbor_distance_quantile <= 1:
         parser.error('neighbor_distance_quantile must be finite and in (0,1]')
     if args.rescue_vote_margin != 3:
@@ -509,6 +519,23 @@ def run_training():
         source_train, batch_size=train_batch, num_workers=args.workers,
         shuffle=True, pin_memory=True, worker_init_fn=_init_fn,
     )
+    # Separate loader: never resample the source batches used in target adaptation,
+    # or the full source reference set used by prototypes and KNN.
+    pretrain_loader_source = train_loader_source
+    if args.source_pretrain_sampling == 'mild':
+        sample_weights, source_counts, expected_counts = mild_sampling_weights(
+            source_train.label, class_num, args.source_sampling_power)
+        sampler = torch.utils.data.WeightedRandomSampler(
+            torch.as_tensor(sample_weights, dtype=torch.double),
+            num_samples=len(source_train), replacement=True,
+            generator=torch.Generator().manual_seed(seed + 27))
+        pretrain_loader_source = torch.utils.data.DataLoader(
+            source_train, batch_size=train_batch, num_workers=args.workers,
+            sampler=sampler, shuffle=False, pin_memory=True, worker_init_fn=_init_fn)
+        print('Source_Pretrain_Sampling: mild Power: %.3f Source_Counts: %s Expected_Draws_Per_Epoch: %s' %
+              (args.source_sampling_power, source_counts.tolist(), np.round(expected_counts,1).tolist()))
+    else:
+        print('Source_Pretrain_Sampling: uniform (original shuffle)')
     prototype_loader_source = torch.utils.data.DataLoader(
         source_prototype, batch_size=test_batch, num_workers=args.workers,
         shuffle=False, pin_memory=True, worker_init_fn=_init_fn,
@@ -560,7 +587,9 @@ def run_training():
         bingo_cnt = 0
         sample_count = 0
 
-        for imgs, targets in train_loader_source:
+        drawn_counts = np.zeros(class_num, dtype=np.int64)
+        for imgs, targets in pretrain_loader_source:
+            drawn_counts += np.bincount(targets.numpy(), minlength=class_num)
             imgs = imgs.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
             # 清空梯度
@@ -582,6 +611,7 @@ def run_training():
             train_loss2 += aff_loss.item()
             train_loss3 += weight_loss.item()
             batch_count += 1
+        print('[Source Epoch %d] Actual_Source_Draws: %s' % (i, drawn_counts.tolist()))
         # 更新学习率
         scheduler.step()
         train_acc = float(bingo_cnt) / max(sample_count, 1)
@@ -613,6 +643,12 @@ def run_training():
         best_source_val_acc = evaluate(
             model, val_loader_target, criterion, len(target_val), -1, 'Validation'
         )
+
+    if args.source_only:
+        print('Source-only checkpoint:', source_best_path)
+        evaluate(model, val_loader_target, criterion, len(target_val), -1, 'Validation')
+        print('Source-only run finished; target adaptation and target test evaluation skipped.')
+        return
 
     # 构建 EMA 教师模型
     teacher = create_ema_teacher(model).to(device)
