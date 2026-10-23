@@ -18,6 +18,8 @@ from reliability_roles import ReliabilityRoles
 from dual_domain_ds import DSConfig
 from competition_gate import competition_audit, supervision_mask
 from adaptive_distance_vote import AdaptiveDistanceVoteBank, audit_adaptive_vote
+from stage_diagnostics import StageStats, stage_masks, validation_diagnostics
+from calibration_rng import isolated_rng
 import image_utils as util
 from randaugment import RandAugmentMC
 # 总训练入口与调度器。串起数据、Source 预训练、EMA Teacher、
@@ -97,7 +99,7 @@ def parse_args(argv=None):
                              'MMD anchor promotion is unchanged')
     parser.add_argument('--promotion_epochs', type=int, default=3,
                         help='consecutive eligible epochs before anchor promotion')
-    parser.add_argument('--run_name', type=str, default='adaptive_distance_vote_v25',
+    parser.add_argument('--run_name', type=str, default='v25_stage_diagnostics_v26',
                         help='checkpoint suffix; use distinct names for ablations')
     parser.add_argument('--device', choices=['cuda', 'cpu'], default='cuda',
                         help='CPU is supported for smoke tests; CUDA recommended for FER training')
@@ -314,6 +316,7 @@ def evaluate(model, loader, criterion, num_samples, epoch, split_name):
         truth = torch.cat(labels)
         classes = model.fc.out_features
         cm = torch.bincount(truth * classes + pred, minlength=classes ** 2).reshape(classes, classes).float()
+        print('[Epoch %d] %s Student confusion (rows=true, columns=predicted):\n%s' % (epoch, split_name, cm.long().numpy()))
         recall = cm.diag() / cm.sum(1).clamp_min(1)
         f1 = 2 * cm.diag() / (cm.sum(1) + cm.sum(0)).clamp_min(1)
         present = cm.sum(1) > 0
@@ -527,6 +530,13 @@ def run_training():
         target_test, batch_size=test_batch, num_workers=args.workers,
         shuffle=False, pin_memory=True,
     )
+    # Isolated dual-weak validation diagnostic stream; no train labels are read.
+    diagnostic_val = FER(args.target_path, phase='val', transform=weak_transform,
+                         weak2_transform=weak_transform, basic_aug=False, return_index=True)
+    diagnostic_loader = torch.utils.data.DataLoader(
+        diagnostic_val, batch_size=test_batch, shuffle=False, num_workers=0,
+        generator=torch.Generator().manual_seed(91314))
+    diagnostic_roles = ReliabilityRoles(len(diagnostic_val), args.promotion_epochs).to(device)
     # 输出分类 logits 和 source affinity loss
     model = Networks.Model(backbone=args.backbone, num_classes=class_num).to(device)
     # 训练组件初始化
@@ -646,6 +656,10 @@ def run_training():
         with open(ds_csv_path, 'w', newline='') as handle:
             csv.writer(handle).writerow(ds_columns)
         print('DS_Diagnostics:', ds_csv_path)
+    stage_csv_path = os.path.join(model_path, args.run_name + '_stage_diagnostics.csv')
+    for diagnostic_path in (stage_csv_path, stage_csv_path.replace('.csv', '_confusion.csv')):
+        if os.path.exists(diagnostic_path):
+            os.remove(diagnostic_path)
     best_target_val_acc = -1.0
     global_step = 0
 
@@ -680,6 +694,15 @@ def run_training():
         current_proto_weight = prototype_weight_for_epoch(
             i, args.proto_weight, args.proto_warmup_epochs, args.proto_ramp_epochs
         )
+        # Snapshot diagnostics BEFORE this epoch's optimizer steps, matching the
+        # teacher/source-bank/threshold coordinates at the start of training.
+        with isolated_rng(91314):
+            diagnostic_loader.generator.manual_seed(91314)
+            val_stats = validation_diagnostics(
+                teacher, teacher_feature_hook, diagnostic_loader, reliability_bank,
+                ds_source, ds_config, thresholds, diagnostic_roles, i, args)
+        val_stats.report(stage_csv_path, i, 'validation_teacher_start')
+        train_stage_stats = StageStats(class_num)
         model.train()
         source_train_iter = iter(train_loader_source)
         train_loss1 = 0.0
@@ -740,6 +763,10 @@ def run_training():
                 rescue_candidates = agreement_mask & ~confidence_mask
                 radius_candidates = rescue_candidates & region_ok
                 rescue_mask = torch.zeros_like(agreement_mask)
+                diag_distance = torch.zeros_like(agreement_mask)
+                diag_vote = torch.zeros_like(agreement_mask)
+                diag_probability = torch.zeros_like(agreement_mask)
+                diag_prototype = torch.zeros_like(agreement_mask)
                 if enable_radius_rescue and rescue_candidates.any():
                     query_idx = torch.where(rescue_candidates)[0]
                     queries = teacher_mean_features[query_idx].cpu().numpy()
@@ -760,6 +787,12 @@ def run_training():
                         args.rescue_probability_margin, args.rescue_prototype_margin,
                         args.rescue_vote_margin,
                     )
+                    diag_distance[query_idx] = torch.as_tensor(source_ds['available'], device=device)
+                    diag_vote[query_idx] = vote_pass
+                    diag_probability[query_idx] = torch.as_tensor(
+                        competition['probability_gap'] >= args.rescue_probability_margin, device=device)
+                    diag_prototype[query_idx] = torch.as_tensor(
+                        competition['prototype_gap'] > args.rescue_prototype_margin, device=device)
                     competition_pass = torch.as_tensor(competition['pass_mask'], device=device)
                     competition_pass_num += int(competition_pass.sum().item())
                     # Adaptive vote is mandatory on both v24 rescue routes, so
@@ -813,6 +846,10 @@ def run_training():
                 # Target prototype writes are restricted to promoted stable anchors.
                 prototype_update_mask = anchor_mask.clone()
                 learn_mask = supervision_mask(confidence_mask, rescue_mask, anchor_mask)
+                train_masks = stage_masks(*[v.cpu().numpy() for v in (
+                    agreement_mask, confidence_mask, diag_distance, diag_vote,
+                    diag_probability, diag_prototype, final_mask, learn_mask, anchor_mask)])
+                train_stage_stats.add(pseudo_targets.cpu().numpy(), train_masks)
                 con_idx = learn_mask.float()
                 supervised_num += int(learn_mask.sum().item())
                 pending_rescue_num += int((rescue_mask & ~anchor_mask).sum().item())
@@ -909,6 +946,7 @@ def run_training():
             train_loss3 += weight_loss.item()
             train_proto_loss += proto_loss.item()
             batch_count += 1
+        train_stage_stats.report(stage_csv_path, i, 'training_counts')
         if args.ds_neighbor:
             n = max(ds_totals[0], 1)
             print('[Target Epoch %d] DS_Audited: %d Source_Available: %d '
