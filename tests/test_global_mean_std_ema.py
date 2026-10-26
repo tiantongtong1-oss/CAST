@@ -29,6 +29,9 @@ class Tensor(np.ndarray):
     def numel(self):
         return np.asarray(self).size
 
+    def std(self, unbiased=False):
+        return np.asarray(self).std(ddof=1 if unbiased else 0)
+
     def mean(self):
         return np.asarray(self).mean()
 
@@ -78,54 +81,51 @@ def batch(scores1, scores2):
     return logits(scores1), logits(scores2), object()  # Labels must never be read.
 
 
-class GlobalQuantileTests(unittest.TestCase):
+class MeanStdTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.scan = staticmethod(load_function('train.py', 'calculate_global_quantile_threshold'))
-        cls.select = staticmethod(load_function('ema_utils.py', 'select_dual_view_pseudo_labels'))
+        cls.scan = staticmethod(load_function('train.py', 'calculate_global_mean_std_threshold'))
 
-    def test_higher_uses_pooled_scores_from_unequal_batches(self):
-        scores = [.60, .65, .70, .75, .80, .85, .90, .93, .96, .99]
-        result = self.scan(Teacher(), [batch(scores[:1], scores[:1]), batch(scores[1:], scores[1:])])
-        tau, count, total, rate = result
-        self.assertAlmostEqual(tau, .93, places=6)
-        self.assertEqual((count, total), (10, 10))
-        self.assertAlmostEqual(rate, .3, places=6)
+    def test_pooled_mean_std_and_rate(self):
+        scores = [.60, .70, .80, .90, .99]
+        r = self.scan(Teacher(), [batch(scores[:1], scores[:1]), batch(scores[1:], scores[1:])])
+        expected = np.mean(scores) + .5 * np.std(scores)
+        self.assertAlmostEqual(r[0], expected, places=6)
+        self.assertEqual(r[1:3], (5, 5))
+        self.assertAlmostEqual(r[3], 2/5, places=6)
 
-    def test_minimum_and_agreement_across_classes(self):
-        # Third sample disagrees. First two predict different classes.
-        tau, count, total, _ = self.scan(
-            Teacher(), [batch([.99, .20, .99], [.60, .10, .01])])
-        self.assertAlmostEqual(tau, .80, places=6)
-        self.assertEqual((count, total), (2, 3))
+    def test_smoothing_across_epochs(self):
+        first = self.scan(Teacher(), [batch([.9], [.9])])[0]
+        second = self.scan(Teacher(), [batch([.99], [.99])], previous_tau=first)[0]
+        self.assertAlmostEqual(first, .9, places=6)
+        self.assertAlmostEqual(second, .918, places=6)
 
-    def test_empty_disagreement_and_nonfinite_fallback(self):
+    def test_bounds_and_single_sample(self):
+        for score, expected in [(.6, .85), (.999, .99)]:
+            r = self.scan(Teacher(), [batch([score], [score])])
+            self.assertAlmostEqual(r[0], expected, places=6)
+            self.assertEqual(r[5], 0.)
+
+    def test_empty_hold_and_initial_fallback(self):
         for loader in ([], [batch([.9], [.1])],
                        [(tensor([[np.nan, 0]]), tensor([[np.nan, 0]]))]):
-            self.assertEqual(self.scan(Teacher(), loader)[0:2], (.85, 0))
+            self.assertEqual(self.scan(Teacher(), loader)[:2], (.85, 0))
+            self.assertEqual(self.scan(Teacher(), loader, previous_tau=.92)[:2], (.92, 0))
 
-    def test_no_floor_ceiling_or_cross_epoch_memory(self):
-        for score in (.60, .99):
-            tau, count, _, rate = self.scan(Teacher(), [batch([score], [score])])
-            self.assertAlmostEqual(tau, score, places=6)
-            self.assertEqual(count, 1)
-            self.assertEqual(rate, 1.)
+    def test_agreement_minimum_and_label_independence(self):
+        r = self.scan(Teacher(), [batch([.99,.20,.99], [.60,.10,.01])],
+                      threshold_min=.5, fallback=.5)
+        self.assertEqual(r[1:3], (2, 3))
+        self.assertAlmostEqual(r[4], .7, places=6)
+        self.assertAlmostEqual(r[0], .75, places=6)
 
-    def test_shared_threshold_inclusive_boundary_and_ties(self):
-        logits1, logits2, _ = batch([.9, .1, .9], [.9, .1, .1])
-        tau, _, _, rate = self.scan(Teacher(), [(logits1, logits2)])
-        _, mask, agree = self.select(logits1, logits2, tensor([tau, tau]))
-        self.assertEqual(mask.tolist(), [1., 1., 0.])
-        self.assertEqual(agree, 2)
-        self.assertEqual(rate, 1.)  # Ties can exceed the nominal top-30% fraction.
-
-    def test_invalid_parameters(self):
-        for q in (0., 1., -.1, np.nan, np.inf):
+    def test_invalid_settings(self):
+        for kw in ({'std_scale': -1}, {'std_scale': np.nan},
+                   {'smoothing': 1}, {'smoothing': -.1},
+                   {'threshold_min': .9}, {'threshold_max': np.nan},
+                   {'previous_tau': .1}, {'previous_tau': np.nan}):
             with self.assertRaises(ValueError):
-                self.scan(Teacher(), [], quantile=q)
-        for fallback in (0., 1.1, np.nan):
-            with self.assertRaises(ValueError):
-                self.scan(Teacher(), [], fallback=fallback)
+                self.scan(Teacher(), [], **kw)
 
 
 if __name__ == '__main__':

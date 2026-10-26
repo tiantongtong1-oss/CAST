@@ -21,7 +21,7 @@ from competition_gate import competition_audit, supervision_mask
 import image_utils as util
 from randaugment import RandAugmentMC
 # 总训练入口与调度器。串起数据、Source 预训练、EMA Teacher、
-# 全局 higher 分位数阈值 + 双视图最小置信度直接接纳 + Source Radius / DS 补救；无 JS。
+# 全局均值/标准差/EMA阈值 + 双视图最小置信度直接接纳 + Source Radius / DS 补救；无 JS。
 
 #随机种子
 seed = 1314
@@ -66,12 +66,14 @@ def parse_args(argv=None):
     parser.add_argument('--threshold_base', type=float, default=0.85,
                         help='fallback global confidence threshold when no agreeing samples exist')
     parser.add_argument('--threshold_quantile', type=float, default=0.70,
-                        help='global quantile of agreeing dual-view minimum confidence; higher interpolation')
-    # Legacy options retained for command-line compatibility; unused by global quantile mode.
+                        help='legacy option; unused in mean/std/EMA mode')
+    parser.add_argument('--threshold_std_scale', type=float, default=0.5)
+    parser.add_argument('--threshold_smoothing', type=float, default=0.8)
+    # beta/margin are unused legacy options; min/max bound the new threshold.
     parser.add_argument('--threshold_beta', type=float, default=0.5)
     parser.add_argument('--threshold_margin', type=float, default=0.02)
-    parser.add_argument('--threshold_min', type=float, default=0.80)
-    parser.add_argument('--threshold_max', type=float, default=0.95)
+    parser.add_argument('--threshold_min', type=float, default=0.85)
+    parser.add_argument('--threshold_max', type=float, default=0.99)
 
     # Prototype-consistency regularizer retained from v1/v2.
     parser.add_argument('--proto_weight', type=float, default=0.10,
@@ -88,7 +90,7 @@ def parse_args(argv=None):
                         help='epochs used to linearly ramp prototype loss to full weight')
 
     parser.add_argument('--radius_rescue_warmup_epochs', type=int, default=3,
-                        help='initial target epochs using only global quantile confidence acceptance')
+                        help='initial target epochs using only global mean/std/EMA confidence acceptance')
     parser.add_argument('--source_radius_quantile', type=float, default=0.90,
                         help='per-class quantile of all source-to-prototype Euclidean distances; 0 < q <= 1')
     parser.add_argument('--source_refresh_interval', type=int, default=1,
@@ -101,7 +103,7 @@ def parse_args(argv=None):
                              'MMD anchor promotion is unchanged')
     parser.add_argument('--promotion_epochs', type=int, default=3,
                         help='consecutive eligible epochs before anchor promotion')
-    parser.add_argument('--run_name', type=str, default='global_quantile_higher_v25',
+    parser.add_argument('--run_name', type=str, default='global_mean_std_ema_v26',
                         help='checkpoint suffix; use distinct names for ablations')
     parser.add_argument('--device', choices=['cuda', 'cpu'], default='cuda',
                         help='CPU is supported for smoke tests; CUDA recommended for FER training')
@@ -141,6 +143,12 @@ def parse_args(argv=None):
         parser.error('epoch counts must be nonnegative')
     if args.pre_epochs == 0 and not args.checkpoint:
         parser.error('--pre_epochs 0 requires --checkpoint with pretrained model weights')
+    if not np.isfinite(args.threshold_std_scale) or args.threshold_std_scale < 0:
+        parser.error('threshold_std_scale must be finite and nonnegative')
+    if not np.isfinite(args.threshold_smoothing) or not 0 <= args.threshold_smoothing < 1:
+        parser.error('threshold_smoothing must be finite and in [0, 1)')
+    if not 0 < args.threshold_min <= args.threshold_base <= args.threshold_max <= 1:
+        parser.error('require 0 < threshold_min <= threshold_base <= threshold_max <= 1')
     if not np.isfinite(args.threshold_quantile) or not 0 < args.threshold_quantile < 1:
         parser.error('threshold_quantile must be finite and in (0, 1)')
     if not np.isfinite(args.threshold_base) or not 0 < args.threshold_base <= 1:
@@ -219,16 +227,23 @@ def classifier_modulation_loss(model):
 
 
 @torch.no_grad()
-def calculate_global_quantile_threshold(teacher, loader, quantile=0.70, fallback=0.85):
-    """One epoch-wide scalar from agreeing dual-view minimum confidence.
+def calculate_global_mean_std_threshold(
+        teacher, loader, previous_tau=None, std_scale=0.5, smoothing=0.8,
+        threshold_min=0.85, threshold_max=0.99, fallback=0.85):
+    """Pool agreeing dual-view minimum confidence; bound mean+k*std, then EMA.
 
-    Pool all samples before taking the quantile (never average batch quantiles).
-    No class grouping, margin, floor or ceiling is applied. Labels are ignored.
+    Population std supports a single sample. Empty scans hold previous_tau,
+    or use fallback on the first epoch. Target labels are never read.
     """
-    if not np.isfinite(quantile) or not 0 < quantile < 1:
-        raise ValueError('quantile must be finite and in (0, 1)')
-    if not np.isfinite(fallback) or not 0 < fallback <= 1:
-        raise ValueError('fallback must be finite and in (0, 1]')
+    if not np.isfinite(std_scale) or std_scale < 0:
+        raise ValueError('std_scale must be finite and nonnegative')
+    if not np.isfinite(smoothing) or not 0 <= smoothing < 1:
+        raise ValueError('smoothing must be finite and in [0, 1)')
+    if not 0 < threshold_min <= fallback <= threshold_max <= 1:
+        raise ValueError('require 0 < min <= fallback <= max <= 1')
+    if previous_tau is not None and (
+            not np.isfinite(previous_tau) or not threshold_min <= previous_tau <= threshold_max):
+        raise ValueError('previous_tau must be finite and within threshold bounds')
 
     device = next(teacher.parameters()).device
     teacher.eval()
@@ -248,11 +263,17 @@ def calculate_global_quantile_threshold(teacher, loader, quantile=0.70, fallback
         total_count += weak1.size(0)
 
     if not score_parts:
-        return float(fallback), 0, total_count, 0.0
+        tau = float(fallback if previous_tau is None else previous_tau)
+        return tau, 0, total_count, 0.0, None, None, None
     all_scores = torch.cat(score_parts)
-    tau = float(torch.quantile(all_scores, quantile, interpolation='higher').item())
+    mean_conf = float(all_scores.mean().item())
+    std_conf = float(all_scores.std(unbiased=False).item())
+    candidate_tau = min(threshold_max, max(threshold_min, mean_conf + std_scale * std_conf))
+    tau = (candidate_tau if previous_tau is None else
+           smoothing * previous_tau + (1.0 - smoothing) * candidate_tau)
+    tau = float(min(threshold_max, max(threshold_min, tau)))
     scan_accept_rate = float((all_scores >= tau).float().mean().item())
-    return tau, all_scores.numel(), total_count, scan_accept_rate
+    return tau, all_scores.numel(), total_count, scan_accept_rate, mean_conf, std_conf, candidate_tau
 
 
 def evaluate(model, loader, criterion, num_samples, epoch, split_name):
@@ -421,7 +442,7 @@ def run_training():
     )
 
     print('---------------------------------------------------------------------------------------')
-    print('EMA + Original Adaptive Threshold / Minimum Dual-View Confidence + Radius / DS Rescue (no JS): '
+    print('EMA + Global Mean/Std/EMA Threshold / Minimum Dual-View Confidence + Radius / DS Rescue (no JS): '
           '%s with source %s and target %s' %
           (args.backbone, args.data1, args.data2))
     print('alpha(w1):%s beta(w2):%s gamma(w3):%s ema:%s' %
@@ -626,18 +647,27 @@ def run_training():
     best_target_val_acc = -1.0
     global_step = 0
 
+    previous_tau = None
     for i in range(args.epochs):
-        tau, scan_agree_count, scan_total, scan_accept_rate = calculate_global_quantile_threshold(
-            teacher, threshold_loader_target, args.threshold_quantile, args.threshold_base)
+        (tau, scan_agree_count, scan_total, scan_accept_rate,
+         mean_conf, std_conf, candidate_tau) = calculate_global_mean_std_threshold(
+            teacher, threshold_loader_target, previous_tau=previous_tau,
+            std_scale=args.threshold_std_scale, smoothing=args.threshold_smoothing,
+            threshold_min=args.threshold_min, threshold_max=args.threshold_max,
+            fallback=args.threshold_base)
+        previous_tau = tau
         # Existing selector takes a vector: every class gets the SAME global scalar.
         thresholds = torch.full((class_num,), tau, dtype=torch.float32)
         enable_radius_rescue = i >= args.radius_rescue_warmup_epochs
-        print('[Target Epoch %d] Threshold_Mode: global_quantile_higher '
-              'Quantile: %.4f Global_Threshold: %.6f Scan_Agreement: %d/%d '
-              'Scan_Accept_Among_Agreement: %.6f Threshold_Fallback: %s '
+        print('[Target Epoch %d] Threshold_Mode: global_mean_std_ema '
+              'Global_Threshold: %.6f Mean: %s Std: %s Candidate: %s '
+              'Std_Scale: %.4f Smoothing: %.4f Scan_Agreement: %d/%d '
+              'Scan_Accept_Among_Agreement: %.6f Empty_Scan: %s '
               'Radius_Rescue_Enabled: %s' %
-              (i, args.threshold_quantile, tau, scan_agree_count, scan_total,
-               scan_accept_rate, scan_agree_count == 0, enable_radius_rescue))
+              (i, tau, mean_conf, std_conf, candidate_tau,
+               args.threshold_std_scale, args.threshold_smoothing,
+               scan_agree_count, scan_total, scan_accept_rate,
+               scan_agree_count == 0, enable_radius_rescue))
         if args.ds_neighbor:
             ds_source = refresh_ds_source_bank(
                 teacher, teacher_feature_hook, prototype_loader_source, class_num)
