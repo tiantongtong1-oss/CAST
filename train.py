@@ -547,6 +547,8 @@ def run_training():
             train_loss2 += aff_loss.item()
             train_loss3 += weight_loss.item()
             batch_count += 1
+        print('[Target Epoch %d] Target_CE_Weight: %.4f (separate domain means)' %
+              (i, target_weight))
         # 更新学习率
         scheduler.step()
         train_acc = float(bingo_cnt) / max(sample_count, 1)
@@ -829,7 +831,6 @@ def run_training():
             # 源域图像+目标域strong augmentation
             train_imgs = torch.cat((source_imgs, strong.cpu()), dim=0).to(device, non_blocking=True)
             train_targets = torch.cat((source_targets, pseudo_targets.cpu()), dim=0).to(device, non_blocking=True)
-            train_con_idx = torch.cat((source_con_idx, con_idx.cpu()), dim=0).to(device, non_blocking=True)
             train_anchor_idx = torch.cat((source_con_idx, anchor_idx.cpu()), dim=0).to(device, non_blocking=True)
 
             # 清空模型参数的梯度
@@ -838,10 +839,20 @@ def run_training():
                 train_imgs, train_targets, train_anchor_idx, 'train', 'target',
                 source_count=source_imgs.shape[0],
             )
-            # 分类损失
-            per_sample_loss = criterion(output[0], train_targets) * train_con_idx
-            # 对真正有效的源域和目标域样本求平均分类损失
-            cls_loss = per_sample_loss.sum() / train_con_idx.sum().clamp_min(1.0)
+            # 分别归一化源域真实标签与目标域有效伪标签的交叉熵。
+            per_sample_loss = criterion(output[0], train_targets)
+            source_count = source_imgs.shape[0]
+            source_cls_loss = per_sample_loss[:source_count].mean()
+            target_losses = per_sample_loss[source_count:]
+            target_mask = con_idx.to(
+                device=target_losses.device, dtype=target_losses.dtype)
+            target_cls_loss = (
+                (target_losses * target_mask).sum()
+                / target_mask.sum().clamp_min(1.0)
+            )
+            # Epoch 0..4: 0.1, 0.2, 0.3, 0.4, 0.5; then remain at 0.5.
+            target_weight = 0.5 * min((i + 1) / 5.0, 1.0)
+            cls_loss = source_cls_loss + target_weight * target_cls_loss
             aff_loss = output[1]
             # 分类器权重之间的正则项
             weight_loss = classifier_modulation_loss(model)
