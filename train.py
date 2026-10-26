@@ -21,7 +21,7 @@ from competition_gate import competition_audit, supervision_mask
 import image_utils as util
 from randaugment import RandAugmentMC
 # 总训练入口与调度器。串起数据、Source 预训练、EMA Teacher、
-# 原类别自适应阈值 + 双视图最小置信度直接接纳 + Source Radius / DS 补救；无 JS。
+# 全局 higher 分位数阈值 + 双视图最小置信度直接接纳 + Source Radius / DS 补救；无 JS。
 
 #随机种子
 seed = 1314
@@ -63,7 +63,11 @@ def parse_args(argv=None):
                         help='gamma: classifier modulation loss weight')
     parser.add_argument('--ema_decay', type=float, default=0.999,
                         help='fixed EMA decay for teacher parameters and floating buffers')
-    parser.add_argument('--threshold_base', type=float, default=0.85)
+    parser.add_argument('--threshold_base', type=float, default=0.85,
+                        help='fallback global confidence threshold when no agreeing samples exist')
+    parser.add_argument('--threshold_quantile', type=float, default=0.70,
+                        help='global quantile of agreeing dual-view minimum confidence; higher interpolation')
+    # Legacy options retained for command-line compatibility; unused by global quantile mode.
     parser.add_argument('--threshold_beta', type=float, default=0.5)
     parser.add_argument('--threshold_margin', type=float, default=0.02)
     parser.add_argument('--threshold_min', type=float, default=0.80)
@@ -84,7 +88,7 @@ def parse_args(argv=None):
                         help='epochs used to linearly ramp prototype loss to full weight')
 
     parser.add_argument('--radius_rescue_warmup_epochs', type=int, default=3,
-                        help='initial target epochs using only class-mean confidence acceptance')
+                        help='initial target epochs using only global quantile confidence acceptance')
     parser.add_argument('--source_radius_quantile', type=float, default=0.90,
                         help='per-class quantile of all source-to-prototype Euclidean distances; 0 < q <= 1')
     parser.add_argument('--source_refresh_interval', type=int, default=1,
@@ -97,7 +101,7 @@ def parse_args(argv=None):
                              'MMD anchor promotion is unchanged')
     parser.add_argument('--promotion_epochs', type=int, default=3,
                         help='consecutive eligible epochs before anchor promotion')
-    parser.add_argument('--run_name', type=str, default='stable_rescue_competition_v24',
+    parser.add_argument('--run_name', type=str, default='global_quantile_higher_v25',
                         help='checkpoint suffix; use distinct names for ablations')
     parser.add_argument('--device', choices=['cuda', 'cpu'], default='cuda',
                         help='CPU is supported for smoke tests; CUDA recommended for FER training')
@@ -137,8 +141,10 @@ def parse_args(argv=None):
         parser.error('epoch counts must be nonnegative')
     if args.pre_epochs == 0 and not args.checkpoint:
         parser.error('--pre_epochs 0 requires --checkpoint with pretrained model weights')
-    if not 0 < args.threshold_min <= args.threshold_base <= args.threshold_max <= 1:
-        parser.error('require 0 < threshold_min <= threshold_base <= threshold_max <= 1')
+    if not np.isfinite(args.threshold_quantile) or not 0 < args.threshold_quantile < 1:
+        parser.error('threshold_quantile must be finite and in (0, 1)')
+    if not np.isfinite(args.threshold_base) or not 0 < args.threshold_base <= 1:
+        parser.error('threshold_base must be finite and in (0, 1]')
     if not np.isfinite(args.threshold_beta) or args.threshold_beta < 0:
         parser.error('threshold_beta must be finite and nonnegative')
     if not np.isfinite(args.threshold_margin) or args.threshold_margin < 0:
@@ -212,65 +218,41 @@ def classifier_modulation_loss(model):
     return torch.mean((matrix + 1.0) / 2.0)
 
 
-def calculate_target_thresholds(model, loader, class_num, threshold_base,
-                                threshold_beta, threshold_margin,
-                                threshold_min, threshold_max):
+@torch.no_grad()
+def calculate_global_quantile_threshold(teacher, loader, quantile=0.70, fallback=0.85):
+    """One epoch-wide scalar from agreeing dual-view minimum confidence.
 
-    # EMA Teacher 扫描整个target train，根据各预测类别平均confidence 生成类别自适应置信度阈值
+    Pool all samples before taking the quantile (never average batch quantiles).
+    No class grouping, margin, floor or ceiling is applied. Labels are ignored.
+    """
+    if not np.isfinite(quantile) or not 0 < quantile < 1:
+        raise ValueError('quantile must be finite and in (0, 1)')
+    if not np.isfinite(fallback) or not 0 < fallback <= 1:
+        raise ValueError('fallback must be finite and in (0, 1]')
 
-    class_sum = torch.zeros(class_num, dtype=torch.float64)
-    # 记录每个预测类别包含的样本数量
-    class_count = torch.zeros(class_num, dtype=torch.float64)
-    device = next(model.parameters()).device
-    # 切换到评估模式，关闭 Dropout、固定 BatchNorm 等
-    model.eval()
+    device = next(teacher.parameters()).device
+    teacher.eval()
+    score_parts = []
+    total_count = 0
+    for batch in loader:
+        weak1 = batch[0].to(device, non_blocking=True)
+        weak2 = batch[1].to(device, non_blocking=True)
+        logits1, _ = teacher(weak1, None, None, mode='test', task='target')
+        logits2, _ = teacher(weak2, None, None, mode='test', task='target')
+        conf1, pred1 = F.softmax(logits1.float(), dim=1).max(dim=1)
+        conf2, pred2 = F.softmax(logits2.float(), dim=1).max(dim=1)
+        scores = torch.minimum(conf1, conf2)
+        valid = pred1.eq(pred2) & torch.isfinite(scores)
+        if valid.any():
+            score_parts.append(scores[valid].cpu())
+        total_count += weak1.size(0)
 
-    # 这里只进行推理，不计算梯度，减少显存和计算开销
-    with torch.no_grad():
-        for batch in loader:
-            imgs = batch[0].to(device, non_blocking=True)
-
-            # 使用模型对目标域图像进行预测
-            # logits：分类输出
-            # _：其他不需要使用的输出
-            logits, _ = model(imgs, None, None, mode='test', task='target')
-
-            #转化成类别概率
-            probs = F.softmax(logits, dim=1).cpu()
-            # 获取每个样本的最大预测概率和对应预测类别
-            # max_prob：模型预测的最高置信度
-            # pred_label：最高置信度对应的类别
-            max_prob, pred_label = torch.max(probs, dim=1)
-
-            class_sum.scatter_add_(0, pred_label, max_prob.double())
-            class_count.scatter_add_(
-                0, pred_label, torch.ones_like(max_prob, dtype=torch.float64)
-            )
-
-    valid = class_count > 0
-    class_mean = class_sum / class_count.clamp_min(1.0)
-    if torch.any(valid):
-        global_mean = class_mean[valid].mean()
-    else:
-        global_mean = class_mean.new_tensor(float(threshold_base))
-
-    threshold_center = max(
-        float(threshold_base),
-        float(global_mean.item()) + float(threshold_margin),
-    )
-    threshold_center = min(threshold_center, float(threshold_max))
-
-    thresholds = threshold_center + threshold_beta * (class_mean - global_mean)
-    thresholds = torch.clamp(
-        thresholds, min=threshold_min, max=threshold_max
-    ).float()
-    thresholds[~valid] = float(threshold_max)
-    return (
-        thresholds,
-        class_mean.float(),
-        float(global_mean.item()),
-        float(threshold_center),
-    )
+    if not score_parts:
+        return float(fallback), 0, total_count, 0.0
+    all_scores = torch.cat(score_parts)
+    tau = float(torch.quantile(all_scores, quantile, interpolation='higher').item())
+    scan_accept_rate = float((all_scores >= tau).float().mean().item())
+    return tau, all_scores.numel(), total_count, scan_accept_rate
 
 
 def evaluate(model, loader, criterion, num_samples, epoch, split_name):
@@ -482,7 +464,7 @@ def run_training():
     )
     target_threshold = FER(
         args.target_path, phase='train', transform=weak_transform,
-        strong_transform=None, basic_aug=False
+        weak2_transform=weak_transform, strong_transform=None, basic_aug=False
     )
     target_val = FER(
         args.target_path, phase='val', transform=test_transform,
@@ -643,16 +625,17 @@ def run_training():
     global_step = 0
 
     for i in range(args.epochs):
-        thresholds, class_mean, global_mean, threshold_center = calculate_target_thresholds(
-            teacher, threshold_loader_target, class_num, args.threshold_base,
-            args.threshold_beta, args.threshold_margin, args.threshold_min, args.threshold_max)
+        tau, scan_agree_count, scan_total, scan_accept_rate = calculate_global_quantile_threshold(
+            teacher, threshold_loader_target, args.threshold_quantile, args.threshold_base)
+        # Existing selector takes a vector: every class gets the SAME global scalar.
+        thresholds = torch.full((class_num,), tau, dtype=torch.float32)
         enable_radius_rescue = i >= args.radius_rescue_warmup_epochs
-        print('[Target Epoch %d] Confidence_Thresholds: %s Class_Mean_Confidence: %s '
-              'Global_Class_Mean: %.4f Threshold_Center: %.4f Radius_Rescue_Enabled: %s '
-              'Threshold_Mode: original_adaptive_min_conf' %
-              (i, np.array2string(thresholds.numpy(), precision=6),
-               np.array2string(class_mean.numpy(), precision=6), global_mean,
-               threshold_center, enable_radius_rescue))
+        print('[Target Epoch %d] Threshold_Mode: global_quantile_higher '
+              'Quantile: %.4f Global_Threshold: %.6f Scan_Agreement: %d/%d '
+              'Scan_Accept_Among_Agreement: %.6f Threshold_Fallback: %s '
+              'Radius_Rescue_Enabled: %s' %
+              (i, args.threshold_quantile, tau, scan_agree_count, scan_total,
+               scan_accept_rate, scan_agree_count == 0, enable_radius_rescue))
         if args.ds_neighbor:
             ds_source = refresh_ds_source_bank(
                 teacher, teacher_feature_hook, prototype_loader_source, class_num)
@@ -987,6 +970,7 @@ def run_training():
 
 if __name__ == '__main__':
     run_training()
+
 
 
 
