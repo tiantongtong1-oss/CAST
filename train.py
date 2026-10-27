@@ -103,7 +103,7 @@ def parse_args(argv=None):
                              'MMD anchor promotion is unchanged')
     parser.add_argument('--promotion_epochs', type=int, default=3,
                         help='consecutive eligible epochs before anchor promotion')
-    parser.add_argument('--run_name', type=str, default='global_mean_std_ema_v26',
+    parser.add_argument('--run_name', type=str, default='global_mean_std_cast_ce_v27',
                         help='checkpoint suffix; use distinct names for ablations')
     parser.add_argument('--device', choices=['cuda', 'cpu'], default='cuda',
                         help='CPU is supported for smoke tests; CUDA recommended for FER training')
@@ -568,8 +568,6 @@ def run_training():
             train_loss2 += aff_loss.item()
             train_loss3 += weight_loss.item()
             batch_count += 1
-        print('[Target Epoch %d] Target_CE_Weight: %.4f (separate domain means)' %
-              (i, target_weight))
         # 更新学习率
         scheduler.step()
         train_acc = float(bingo_cnt) / max(sample_count, 1)
@@ -647,6 +645,7 @@ def run_training():
     best_target_val_acc = -1.0
     global_step = 0
 
+    print('Classification_Mode: cast_equivalent_domain_means; denominator=all source+target samples; no target weight ramp')
     previous_tau = None
     for i in range(args.epochs):
         (tau, scan_agree_count, scan_total, scan_accept_rate,
@@ -869,20 +868,21 @@ def run_training():
                 train_imgs, train_targets, train_anchor_idx, 'train', 'target',
                 source_count=source_imgs.shape[0],
             )
-            # 分别归一化源域真实标签与目标域有效伪标签的交叉熵。
+            # CAST-equivalent CE: rejected targets contribute zero but stay in denominator.
             per_sample_loss = criterion(output[0], train_targets)
             source_count = source_imgs.shape[0]
             source_cls_loss = per_sample_loss[:source_count].mean()
             target_losses = per_sample_loss[source_count:]
             target_mask = con_idx.to(
                 device=target_losses.device, dtype=target_losses.dtype)
-            target_cls_loss = (
-                (target_losses * target_mask).sum()
-                / target_mask.sum().clamp_min(1.0)
+            # Mean over ALL target examples, not only accepted examples.
+            target_cls_loss = (target_losses * target_mask).mean()
+            target_count = target_losses.shape[0]
+            total_count = source_count + target_count
+            cls_loss = (
+                (source_count / total_count) * source_cls_loss
+                + (target_count / total_count) * target_cls_loss
             )
-            # Epoch 0..4: 0.1, 0.2, 0.3, 0.4, 0.5; then remain at 0.5.
-            target_weight = 0.5 * min((i + 1) / 5.0, 1.0)
-            cls_loss = source_cls_loss + target_weight * target_cls_loss
             aff_loss = output[1]
             # 分类器权重之间的正则项
             weight_loss = classifier_modulation_loss(model)
