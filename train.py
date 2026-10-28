@@ -18,6 +18,7 @@ from reliability_roles import ReliabilityRoles
 from dual_domain_ds import DSConfig
 from neighbor_vote import NeighborVoteBank, audit_vote, rescue_union
 from competition_gate import competition_audit, supervision_mask
+from pseudo_label_metrics import PseudoLabelMetrics, initialize_metrics_csv
 import image_utils as util
 from randaugment import RandAugmentMC
 # 总训练入口与调度器。串起数据、Source 预训练、EMA Teacher、
@@ -643,6 +644,10 @@ def run_training():
             csv.writer(handle).writerow(ds_columns)
         print('DS_Diagnostics:', ds_csv_path)
     best_target_val_acc = -1.0
+    pseudo_metrics_path = os.path.join(model_path, args.run_name + '_pseudo_label_metrics.csv')
+    initialize_metrics_csv(pseudo_metrics_path)
+    print('Pseudo_Label_Metrics:', pseudo_metrics_path)
+    print('Pseudo_Label_Metrics_Mode: target-training IDs; ground truth for reporting only; accuracy fraction in CSV')
     global_step = 0
 
     print('Classification_Mode: cast_equivalent_domain_means; denominator=all source+target samples; no target weight ramp')
@@ -710,6 +715,8 @@ def run_training():
         pseudo_distribution_supervised = np.zeros(class_num, dtype=np.int64)
         prototype_update_num = immediate_update_num = 0
 
+        # FER.label is already mapped to CAST order; IDs index this exact dataset.
+        pseudo_metrics = PseudoLabelMetrics(target_train.label)
         for weak1, weak2, strong, _, sample_ids in train_loader_target:
             try:
                 source_imgs, source_targets = next(source_train_iter)
@@ -814,6 +821,16 @@ def run_training():
                 prototype_update_mask = anchor_mask.clone()
                 learn_mask = supervision_mask(confidence_mask, rescue_mask, anchor_mask)
                 con_idx = learn_mask.float()
+                # Observational only: labels never enter any selection/loss/update.
+                pseudo_metrics.update(
+                    sample_ids.detach().cpu().numpy(),
+                    pseudo_targets.detach().cpu().numpy(),
+                    {name: mask.detach().cpu().numpy() for name, mask in {
+                        'confidence': confidence_mask, 'rescued': rescue_mask,
+                        'final': final_mask, 'supervised': learn_mask,
+                        'anchors': anchor_mask,
+                    }.items()},
+                )
                 supervised_num += int(learn_mask.sum().item())
                 pending_rescue_num += int((rescue_mask & ~anchor_mask).sum().item())
                 pseudo_distribution_supervised += np.bincount(
@@ -919,6 +936,7 @@ def run_training():
             train_loss3 += weight_loss.item()
             train_proto_loss += proto_loss.item()
             batch_count += 1
+        pseudo_metrics.write_epoch(pseudo_metrics_path, i)
         if args.ds_neighbor:
             n = max(ds_totals[0], 1)
             print('[Target Epoch %d] DS_Audited: %d Source_Available: %d '
