@@ -4,6 +4,7 @@ import argparse
 import csv
 import os
 import random
+import shutil
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -18,6 +19,7 @@ from reliability_roles import ReliabilityRoles
 from dual_domain_ds import DSConfig
 from neighbor_vote import NeighborVoteBank, audit_vote, rescue_union
 from competition_gate import competition_audit, supervision_mask
+from run_history import RunHistory
 import image_utils as util
 from randaugment import RandAugmentMC
 # 总训练入口与调度器。串起数据、Source 预训练、EMA Teacher、
@@ -105,6 +107,8 @@ def parse_args(argv=None):
                         help='consecutive eligible epochs before anchor promotion')
     parser.add_argument('--run_name', type=str, default='global_mean_std_cast_ce_v27',
                         help='checkpoint suffix; use distinct names for ablations')
+    parser.add_argument('--history_root', type=str, default='./model_history',
+                        help='parent folder for unique branch-named training archives')
     parser.add_argument('--device', choices=['cuda', 'cpu'], default='cuda',
                         help='CPU is supported for smoke tests; CUDA recommended for FER training')
 
@@ -424,10 +428,15 @@ def refresh_ds_source_bank(teacher, feature_hook, source_loader, classes):
 
 def run_training():
     args = parse_args()
+    with RunHistory(args.history_root, args) as history:
+        return _run_training(args, history.path)
+
+
+def _run_training(args, run_directory):
     device = torch.device(args.device)
     if device.type == 'cuda' and not torch.cuda.is_available():
         raise RuntimeError('CUDA unavailable; use --device cpu for a smoke test')
-    model_path = os.path.join('./models', args.data1 + '_' + args.data2)
+    model_path = os.path.join(run_directory, 'models')
     os.makedirs(model_path, exist_ok=True)
 
     source_best_path = os.path.join(
@@ -595,7 +604,9 @@ def run_training():
         scheduler.load_state_dict(checkpoint['scheduler'])
     else:
         # Weights were loaded above; start target training with a fresh optimizer.
-        source_best_path = args.checkpoint
+        # Archive the reused source checkpoint in this run as well.
+        shutil.copy2(args.checkpoint, source_best_path)
+        print('Archived source checkpoint:', source_best_path)
         best_source_val_acc = evaluate(
             model, val_loader_target, criterion, len(target_val), -1, 'Validation'
         )
@@ -633,7 +644,7 @@ def run_training():
     print('Rescue=agreement & low_confidence & (radius OR vote) & competition; rescue learns only after stable promotion; no class quotas; competing SOURCE prototypes; K=11 is neighbor count, not per-class selection quota; KNN_Vote: K=11 Minimum_Votes=6 Vote_Ratio=6/11; full neighborhood required; source true labels; no DS/Otsu/cosine weighting')
     print('Competition margins: probability=%s prototype=%s vote=%s' %
           (args.rescue_probability_margin, args.rescue_prototype_margin, args.rescue_vote_margin))
-    ds_csv_path = os.path.join(model_path, args.run_name + '_ds_diagnostics.csv')
+    ds_csv_path = os.path.join(run_directory, 'logs', args.run_name + '_ds_diagnostics.csv')
     ds_columns = ['epoch', 'sample_id', 'pseudo_label', 'source_count',
                   'source_available', 'source_support', 'source_unknown',
                   'source_conflict', 'support', 'margin', 'unknown',

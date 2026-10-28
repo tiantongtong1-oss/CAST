@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 models/
+model_history/
 new_logs/
 docs/
 experiments/
