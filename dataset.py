@@ -11,27 +11,55 @@ import numpy as np
 "0: surprise, 1: fear, 2: disgust, 3: happy 4: sad  5: angry 6: neutral 7:attempt"
 
 
+def raf_validation_mask(labels, fraction, seed):
+    """Deterministic stratified holdout; same sample ordering in all RAF views."""
+    labels = np.asarray(labels)
+    if not np.isfinite(fraction) or not 0 < fraction < 1:
+        raise ValueError('RAF validation fraction must be in (0, 1)')
+    rng = np.random.RandomState(seed)
+    mask = np.zeros(len(labels), dtype=bool)
+    for label in np.unique(labels):
+        indices = np.flatnonzero(labels == label)
+        if len(indices) < 2:
+            raise ValueError('Each RAF class needs at least two training images for holdout')
+        indices = rng.permutation(indices)
+        count = min(len(indices) - 1, max(1, int(round(len(indices) * fraction))))
+        mask[indices[:count]] = True
+    return mask
+
+
 class RafDataSet(data.Dataset):
-    def __init__(self, raf_path, phase, transform=None, strong_transform=None, basic_aug=False, ratio=1):
+    def __init__(self, raf_path, phase, transform=None, strong_transform=None,
+                 basic_aug=False, ratio=1, weak2_transform=None,
+                 return_index=False, val_fraction=0.0, split_seed=2000):
         self.phase = phase
         self.transform = transform
         self.strong_transform = strong_transform
         self.raf_path = raf_path
+        self.weak2_transform = weak2_transform
+        self.return_index = bool(return_index)
+        if phase not in {'train', 'val', 'test'}:
+            raise ValueError('RAF phase must be train, val or test')
+        if not np.isfinite(val_fraction) or not 0 <= val_fraction < 1:
+            raise ValueError('RAF val_fraction must be in [0, 1)')
+        if phase == 'val' and val_fraction == 0:
+            raise ValueError('RAF validation requires a positive val_fraction')
 
         NAME_COLUMN = 0
         LABEL_COLUMN = 1
         df = pd.read_csv(os.path.join(self.raf_path, 'EmoLabel/list_patition_label.txt'), sep=' ', header=None)
-        if phase == 'train':
-            dataset = df[df[NAME_COLUMN].str.startswith('train')]
-        else:
-            dataset = df[df[NAME_COLUMN].str.startswith('test')]
-        file_names = dataset.iloc[:, NAME_COLUMN].values
-        self.label = dataset.iloc[:, LABEL_COLUMN].values - 1
-
-        seed = np.random.seed(2000)
-        np.random.shuffle(file_names)
-        seed = np.random.seed(2000)
-        np.random.shuffle(self.label)
+        # Validation is held out from official TRAIN; official TEST stays untouched.
+        prefix = 'test' if phase == 'test' else 'train'
+        dataset = df[df[NAME_COLUMN].str.startswith(prefix)]
+        file_names = dataset.iloc[:, NAME_COLUMN].to_numpy(copy=True)
+        labels = dataset.iloc[:, LABEL_COLUMN].to_numpy(copy=True) - 1
+        order = np.random.RandomState(2000).permutation(len(file_names))
+        file_names, labels = file_names[order], labels[order]
+        if phase != 'test' and val_fraction > 0:
+            validation = raf_validation_mask(labels, val_fraction, split_seed)
+            keep = validation if phase == 'val' else ~validation
+            file_names, labels = file_names[keep], labels[keep]
+        self.label = labels
 
         self.file_paths = []
         for f in file_names:
@@ -69,10 +97,22 @@ class RafDataSet(data.Dataset):
 
         img = self.transform(image) if self.transform is not None else image
 
+        if self.weak2_transform is not None:
+            img_weak2 = self.weak2_transform(image)
+            if self.strong_transform is not None:
+                img_strong = self.strong_transform(image)
+                result = (img, img_weak2, img_strong, label)
+            else:
+                result = (img, img_weak2, label)
+            return result + (idx,) if self.return_index else result
+
         if self.strong_transform is not None:
-            img_aug = self.strong_transform(image)
-            return img, img_aug, label
-        return img, label
+            img_strong = self.strong_transform(image)
+            result = (img, img_strong, label)
+            return result + (idx,) if self.return_index else result
+
+        result = (img, label)
+        return result + (idx,) if self.return_index else result
 
 
 class FER(data.Dataset):
@@ -182,3 +222,4 @@ class FER(data.Dataset):
 
         result = (img, label)
         return result + (idx,) if self.return_index else result
+

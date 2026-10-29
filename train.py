@@ -42,12 +42,15 @@ def _init_fn(worker_id):
 # 定义训练全部超参数
 def parse_args(argv=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data1', type=str, default='rafdb', help='source data')
-    parser.add_argument('--data2', type=str, default='fer', help='target data')
+    parser.add_argument('--data1', type=str, default='rafdb', choices=['rafdb', 'fer'], help='source data')
+    parser.add_argument('--data2', type=str, default='fer', choices=['rafdb', 'fer'], help='target data')
     parser.add_argument('--source_path', type=str,
                         default='/workspace/ttt/code/test-upload-clean/datesets/raf-basic')
     parser.add_argument('--target_path', type=str,
                         default='/workspace/ttt/code/data/fer2013')
+    parser.add_argument('--raf_val_fraction', type=float, default=0.10,
+                        help='RAF target: stratified validation holdout from official train')
+    parser.add_argument('--raf_split_seed', type=int, default=2000)
     parser.add_argument('-c', '--checkpoint', type=str, default=None, help='load model')
     parser.add_argument('--backbone', type=str, default='mobilenet_v2',
                         help='mobilenet_v2, resnet18 or resnet50')
@@ -131,6 +134,12 @@ def parse_args(argv=None):
     parser.add_argument('--rescue_prototype_margin', type=float, default=0.02)
     parser.add_argument('--rescue_vote_margin', type=int, default=3)
     args = parser.parse_args(argv)
+    if args.data1 == args.data2:
+        parser.error('source and target must be different datasets')
+    if not np.isfinite(args.raf_val_fraction) or not 0 < args.raf_val_fraction < 1:
+        parser.error('raf_val_fraction must be in (0, 1)')
+    if not 0 <= args.raf_split_seed < 2**32:
+        parser.error('raf_split_seed must be in [0, 2**32)')
     if args.immediate_prototype_update or not args.role_separation:
         parser.error('stable anchors required: remove --immediate_prototype_update and --no_role_separation')
     if not np.isfinite(args.rescue_probability_margin) or not 0 <= args.rescue_probability_margin <= 1:
@@ -475,35 +484,43 @@ def _run_training(args, run_directory):
 
     weak_transform, strong_transform, test_transform = build_transforms()
 
-    if args.data1 != 'rafdb' or args.data2 != 'fer':
-        raise ValueError('This branch implements RAF-DB -> FER2013.')
-
-    source_train = RafDataSet(
+    dataset_classes = {'rafdb': RafDataSet, 'fer': FER}
+    source_cls = dataset_classes[args.data1]
+    target_cls = dataset_classes[args.data2]
+    target_options = (
+        dict(val_fraction=args.raf_val_fraction, split_seed=args.raf_split_seed)
+        if args.data2 == 'rafdb' else {}
+    )
+    source_train = source_cls(
         args.source_path, phase='train', transform=weak_transform,
         strong_transform=None, basic_aug=False
     )
-    source_prototype = RafDataSet(
+    source_prototype = source_cls(
         args.source_path, phase='train', transform=test_transform,
         strong_transform=None, basic_aug=False
     )
-
-    target_train = FER(
+    target_train = target_cls(
         args.target_path, phase='train', transform=weak_transform,
         weak2_transform=weak_transform, strong_transform=strong_transform,
-        basic_aug=False, return_index=True
+        basic_aug=False, return_index=True, **target_options
     )
-    target_threshold = FER(
+    target_threshold = target_cls(
         args.target_path, phase='train', transform=weak_transform,
-        weak2_transform=weak_transform, strong_transform=None, basic_aug=False
+        weak2_transform=weak_transform, strong_transform=None,
+        basic_aug=False, **target_options
     )
-    target_val = FER(
+    target_val = target_cls(
         args.target_path, phase='val', transform=test_transform,
-        strong_transform=None
+        strong_transform=None, **target_options
     )
-    target_test = FER(
+    target_test = target_cls(
         args.target_path, phase='test', transform=test_transform,
-        strong_transform=None
+        strong_transform=None, **target_options
     )
+    if args.data2 == 'rafdb':
+        print('RAF target holdout: fraction=%s seed=%s; train=%d val=%d test=%d' %
+              (args.raf_val_fraction, args.raf_split_seed,
+               len(target_train), len(target_val), len(target_test)))
 
     class_num = 7
 
@@ -1022,6 +1039,7 @@ def _run_training(args, run_directory):
 
 if __name__ == '__main__':
     run_training()
+
 
 
 
