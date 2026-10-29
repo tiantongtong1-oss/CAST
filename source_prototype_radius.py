@@ -1,4 +1,4 @@
-"""Source-only prototypes and per-class Euclidean-distance quantile radii.
+"""Source-only prototypes and a class-balanced shared Euclidean radius.
 
 Historical Gaussian experiments live in global_gaussian_knn_reliability.py;
 this bank does not calculate variances or Mahalanobis distances.
@@ -7,6 +7,7 @@ import math
 import torch
 from torch import nn
 import torch.nn.functional as F
+from balanced_radius import balanced_radius_quantile
 
 
 class SourcePrototypeRadiusBank(nn.Module):
@@ -33,6 +34,9 @@ class SourcePrototypeRadiusBank(nn.Module):
         # CPU snapshots avoid retaining the whole source dataset on GPU. Distances
         # must be computed after the final class means are known (not batch means).
         self._source_batches = []
+        # Diagnostics are recomputed on refresh; checkpoint buffer keys stay compatible.
+        self.class_radius_coverage = [None] * self.num_classes
+        self.balanced_radius_coverage = None
 
     @torch.no_grad()
     def begin_source_refresh(self):
@@ -69,13 +73,22 @@ class SourcePrototypeRadiusBank(nn.Module):
             distances = (features - self.class_means[labels]).norm(dim=1)
             for c in labels.unique().tolist():
                 class_distances[c].append(distances[labels == c].cpu())
-        # Use all distances across batches, not a mean of batch quantiles.
-        for c, chunks in enumerate(class_distances):
-            if chunks:
-                values = torch.cat(chunks).float()
-                self.class_radii[c] = torch.quantile(
-                    values, self.source_radius_quantile, interpolation="linear"
-                ).to(self.class_radii)
+        # Each present class contributes the same total probability mass,
+        # regardless of its sample count. Keep the seven distinct class means.
+        values_by_class = [
+            torch.cat(chunks).numpy() if chunks else []
+            for chunks in class_distances
+        ]
+        radius = balanced_radius_quantile(values_by_class, self.source_radius_quantile)
+        self.class_radii.fill_(radius)
+        # Report the actual strict gate with the radius rounded to buffer dtype.
+        stored_radius = self.class_radii[0].item()
+        self.class_radius_coverage = [
+            float((values < stored_radius).mean()) if len(values) else None
+            for values in values_by_class
+        ]
+        coverage = [value for value in self.class_radius_coverage if value is not None]
+        self.balanced_radius_coverage = sum(coverage) / len(coverage) if coverage else None
         self._source_batches.clear()
         self.refresh_count.add_(1)
 
@@ -97,4 +110,5 @@ class SourcePrototypeRadiusBank(nn.Module):
         labels = labels.to(device=self.class_means.device, dtype=torch.long)
         # Strict inequality implements the requested rule, including radius=0.
         return self.distribution_distance(features, labels) < self.class_radii[labels.clamp(0, self.num_classes - 1)]
+
 
