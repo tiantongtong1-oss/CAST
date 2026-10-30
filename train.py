@@ -5,6 +5,8 @@ import csv
 import os
 import random
 import shutil
+import time
+from batch_progress import BatchProgress
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -572,9 +574,12 @@ def _run_training(args, run_directory):
         bingo_cnt = 0
         sample_count = 0
 
-        for imgs, targets in train_loader_source:
+        progress = BatchProgress("Source", i, len(train_loader_source))
+        for batch_idx, (imgs, targets) in enumerate(train_loader_source, 1):
+            progress.mark("data")
             imgs = imgs.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
+            progress.mark("transfer")
             # 清空梯度
             optimizer.zero_grad()
             output = model(imgs, targets, None, 'train', 'source')
@@ -594,6 +599,8 @@ def _run_training(args, run_directory):
             train_loss2 += aff_loss.item()
             train_loss3 += weight_loss.item()
             batch_count += 1
+            progress.mark("train")
+            progress.report(batch_idx)
         # 更新学习率
         scheduler.step()
         train_acc = float(bingo_cnt) / max(sample_count, 1)
@@ -676,12 +683,16 @@ def _run_training(args, run_directory):
     print('Classification_Mode: cast_equivalent_domain_means; denominator=all source+target samples; no target weight ramp')
     previous_tau = None
     for i in range(args.epochs):
+        setup_started = time.perf_counter()
+        print("[Target Epoch %d] Setup: threshold scan started" % i, flush=True)
         (tau, scan_agree_count, scan_total, scan_accept_rate,
          mean_conf, std_conf, candidate_tau) = calculate_global_mean_std_threshold(
             teacher, threshold_loader_target, previous_tau=previous_tau,
             std_scale=args.threshold_std_scale, smoothing=args.threshold_smoothing,
             threshold_min=args.threshold_min, threshold_max=args.threshold_max,
             fallback=args.threshold_base)
+        print("[Target Epoch %d] Setup: threshold scan finished in %.2fs" %
+              (i, time.perf_counter() - setup_started), flush=True)
         previous_tau = tau
         # Existing selector takes a vector: every class gets the SAME global scalar.
         thresholds = torch.full((class_num,), tau, dtype=torch.float32)
@@ -696,13 +707,17 @@ def _run_training(args, run_directory):
                scan_agree_count, scan_total, scan_accept_rate,
                scan_agree_count == 0, enable_radius_rescue))
         if args.ds_neighbor:
+            phase_started = time.perf_counter()
+            print("[Target Epoch %d] Setup: KNN source refresh started" % i, flush=True)
             ds_source = refresh_ds_source_bank(
                 teacher, teacher_feature_hook, prototype_loader_source, class_num)
-            print('[Target Epoch %d] DS_Source_Refs: %d' % (i, len(ds_source.x)))
+            print('[Target Epoch %d] DS_Source_Refs: %d Refresh_Time: %.2fs' %
+                  (i, len(ds_source.x), time.perf_counter() - phase_started), flush=True)
         ds_totals = np.zeros(7, dtype=np.float64)
         rescue_route_counts = np.zeros(3, dtype=np.int64)
 
         if i % args.source_refresh_interval == 0:
+            print("[Target Epoch %d] Setup: radius refresh started" % i, flush=True)
             refresh_source_radius_bank(
                 teacher, teacher_feature_hook, prototype_loader_source, reliability_bank,
             )
@@ -744,17 +759,26 @@ def _run_training(args, run_directory):
         pseudo_distribution_supervised = np.zeros(class_num, dtype=np.int64)
         prototype_update_num = immediate_update_num = 0
 
-        for weak1, weak2, strong, _, sample_ids in train_loader_target:
+        source_means_cpu = reliability_bank.class_means.detach().cpu().numpy()
+        source_ready_cpu = reliability_bank.distribution_initialized.detach().cpu().numpy()
+        print("[Target Epoch %d] Setup finished in %.2fs; training batches started" %
+              (i, time.perf_counter() - setup_started), flush=True)
+        progress = BatchProgress("Target", i, len(train_loader_target))
+        for batch_idx, (weak1, weak2, strong, _, sample_ids) in enumerate(train_loader_target, 1):
             try:
                 source_imgs, source_targets = next(source_train_iter)
             except StopIteration:
                 source_train_iter = iter(train_loader_source)
                 source_imgs, source_targets = next(source_train_iter)
 
+            progress.mark("data")
+            source_imgs = source_imgs.to(device, non_blocking=True)
+            source_targets = source_targets.to(device, non_blocking=True)
             weak1 = weak1.to(device, non_blocking=True)
             weak2 = weak2.to(device, non_blocking=True)
             strong = strong.to(device, non_blocking=True)
 
+            progress.mark("transfer")
             teacher.eval()
             # 用EMA Teacher对目标域样本的两个弱增强视图进行预测，生成伪标签，并提取一个融合后的teacher 特征，供后面的
             # 原型距离判断和prototype更新使用
@@ -780,38 +804,44 @@ def _run_training(args, run_directory):
                 rescue_candidates = agreement_mask & ~confidence_mask
                 radius_candidates = rescue_candidates & region_ok
                 rescue_mask = torch.zeros_like(agreement_mask)
+                progress.mark("teacher_gate")
                 if enable_radius_rescue and rescue_candidates.any():
                     query_idx = torch.where(rescue_candidates)[0]
                     queries = teacher_mean_features[query_idx].cpu().numpy()
-                    query_ids = sample_ids[query_idx.cpu()].cpu().numpy()
+                    query_ids = sample_ids[query_idx.cpu()].numpy()
+                    query_labels = pseudo_targets[query_idx].detach().cpu().numpy()
                     source_ds = ds_source.evaluate(queries, query_ids, ds_config)
                     ds_result = audit_vote(
-                        source_ds, pseudo_targets[query_idx].cpu().numpy(), 6)
+                        source_ds, query_labels, 6)
                     vote_pass = torch.as_tensor(ds_result['pass_mask'], device=device, dtype=torch.bool)
                     radius_pass = region_ok[query_idx]
                     competition = competition_audit(
                         F.softmax(logits1[query_idx], dim=1).cpu().numpy(),
                         F.softmax(logits2[query_idx], dim=1).cpu().numpy(),
-                        queries, pseudo_targets[query_idx].cpu().numpy(),
-                        reliability_bank.class_means.cpu().numpy(),
-                        reliability_bank.distribution_initialized.cpu().numpy(),
+                        queries, query_labels,
+                        source_means_cpu, source_ready_cpu,
                         source_ds['votes'], source_ds['available'],
                         args.rescue_probability_margin, args.rescue_prototype_margin,
                         args.rescue_vote_margin,
                     )
                     competition_pass = torch.as_tensor(competition['pass_mask'], device=device)
-                    competition_pass_num += int(competition_pass.sum().item())
+                    competition_pass_num += int(competition['pass_mask'].sum())
                     rescue_mask[query_idx] = rescue_union(radius_pass, vote_pass) & competition_pass
+                    # Copy masks in bulk; CSV rows only access CPU arrays.
+                    diagnostic_masks = torch.stack(
+                        (rescue_mask[query_idx], radius_pass, vote_pass), dim=1
+                    ).detach().cpu().numpy()
+                    accepted_cpu, radius_cpu, vote_cpu = diagnostic_masks.T
                     rescue_route_counts += np.array([
-                        int((radius_pass & ~vote_pass).sum()),
-                        int((~radius_pass & vote_pass).sum()),
-                        int((radius_pass & vote_pass).sum())])
+                        (radius_cpu & ~vote_cpu).sum(),
+                        (~radius_cpu & vote_cpu).sum(),
+                        (radius_cpu & vote_cpu).sum()])
                     ds_totals += np.array([
                         len(query_idx), source_ds['available'].sum(),
                         ds_result['pass_mask'].sum(), ds_result['support'].sum(),
                         ds_result['margin'].sum(), ds_result['uncertainty'].sum(),
                         source_ds['conflict'].sum()])
-                    query_labels = pseudo_targets[query_idx].cpu().numpy()
+                    progress.mark("knn_competition")
                     rows = []
                     for row, label in enumerate(query_labels):
                         rows.append([
@@ -821,15 +851,16 @@ def _run_training(args, run_directory):
                             source_ds['conflict'][row], ds_result['support'][row],
                             ds_result['margin'][row], ds_result['uncertainty'][row],
                             bool(ds_result['pass_mask'][row]),
-                            bool(rescue_mask[query_idx[row]].item()),
+                            bool(accepted_cpu[row]),
                             int(ds_result['vote_count'][row]), float(ds_result['support'][row]),
-                            bool(radius_pass[row]), bool(vote_pass[row]),
+                            bool(radius_cpu[row]), bool(vote_cpu[row]),
                             float(competition['probability_gap'][row]),
                             float(competition['prototype_gap'][row]),
                             int(competition['vote_gap'][row]), bool(competition['pass_mask'][row])])
                     with open(ds_csv_path, 'a', newline='') as handle:
                         csv.writer(handle).writerows(rows)
 
+                progress.mark("rescue_csv")
                 final_mask = confidence_mask | rescue_mask
 
                 # Learning is distinct from updating shared class knowledge.
@@ -888,13 +919,15 @@ def _run_training(args, run_directory):
                     final_labels, minlength=class_num
                 ).astype(np.int64)
 
+            progress.mark("roles_stats")
             model.train()
             # 给所有源域样本一个权重1，默认全可信
-            source_con_idx = torch.ones(source_imgs.shape[0])
+            source_con_idx = torch.ones(
+                source_imgs.shape[0], device=device, dtype=anchor_idx.dtype)
             # 源域图像+目标域strong augmentation
-            train_imgs = torch.cat((source_imgs, strong.cpu()), dim=0).to(device, non_blocking=True)
-            train_targets = torch.cat((source_targets, pseudo_targets.cpu()), dim=0).to(device, non_blocking=True)
-            train_anchor_idx = torch.cat((source_con_idx, anchor_idx.cpu()), dim=0).to(device, non_blocking=True)
+            train_imgs = torch.cat((source_imgs, strong), dim=0)
+            train_targets = torch.cat((source_targets, pseudo_targets), dim=0)
+            train_anchor_idx = torch.cat((source_con_idx, anchor_idx), dim=0)
 
             # 清空模型参数的梯度
             optimizer.zero_grad()
@@ -953,6 +986,8 @@ def _run_training(args, run_directory):
             train_loss3 += weight_loss.item()
             train_proto_loss += proto_loss.item()
             batch_count += 1
+            progress.mark("train_update")
+            progress.report(batch_idx)
         if args.ds_neighbor:
             n = max(ds_totals[0], 1)
             print('[Target Epoch %d] DS_Audited: %d Source_Available: %d '
@@ -1045,6 +1080,7 @@ def _run_training(args, run_directory):
 
 if __name__ == '__main__':
     run_training()
+
 
 
 
