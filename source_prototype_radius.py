@@ -1,4 +1,4 @@
-"""Source-only prototypes and a class-balanced shared Euclidean radius.
+"""Source-only prototypes and a coverage-minus-intrusion shared radius.
 
 Historical Gaussian experiments live in global_gaussian_knn_reliability.py;
 this bank does not calculate variances or Mahalanobis distances.
@@ -7,7 +7,7 @@ import math
 import torch
 from torch import nn
 import torch.nn.functional as F
-from balanced_radius import balanced_radius_quantile
+from discriminative_radius import select_discriminative_radius
 
 
 class SourcePrototypeRadiusBank(nn.Module):
@@ -37,6 +37,9 @@ class SourcePrototypeRadiusBank(nn.Module):
         # Diagnostics are recomputed on refresh; checkpoint buffer keys stay compatible.
         self.class_radius_coverage = [None] * self.num_classes
         self.balanced_radius_coverage = None
+        self.class_radius_intrusion = [None] * self.num_classes
+        self.balanced_radius_intrusion = None
+        self.radius_objective = None
 
     @torch.no_grad()
     def begin_source_refresh(self):
@@ -68,27 +71,35 @@ class SourcePrototypeRadiusBank(nn.Module):
         self.class_radii.zero_()
         self.distribution_initialized.copy_(self._source_count > 0)
         class_distances = [[] for _ in range(self.num_classes)]
+        negative_distances = [[] for _ in range(self.num_classes)]
         for features, labels in self._source_batches:
             features, labels = features.to(self.class_means), labels.to(self.class_means.device)
             distances = (features - self.class_means[labels]).norm(dim=1)
+            # Evaluate every initialized competing prototype, not target pseudo-labels.
+            all_distances = torch.stack([
+                (features - mean).norm(dim=1) for mean in self.class_means
+            ], dim=1)
+            all_distances[:, ~self.distribution_initialized] = float('inf')
+            all_distances.scatter_(1, labels[:, None], float('inf'))
+            nearest_other = all_distances.min(dim=1).values
             for c in labels.unique().tolist():
                 class_distances[c].append(distances[labels == c].cpu())
-        # Each present class contributes the same total probability mass,
-        # regardless of its sample count. Keep the seven distinct class means.
+                negative_distances[c].append(nearest_other[labels == c].cpu())
         values_by_class = [
             torch.cat(chunks).numpy() if chunks else []
             for chunks in class_distances
         ]
-        radius = balanced_radius_quantile(values_by_class, self.source_radius_quantile)
-        self.class_radii.fill_(radius)
-        # Report the actual strict gate with the radius rounded to buffer dtype.
-        stored_radius = self.class_radii[0].item()
-        self.class_radius_coverage = [
-            float((values < stored_radius).mean()) if len(values) else None
-            for values in values_by_class
+        negatives_by_class = [
+            torch.cat(chunks).numpy() if chunks else []
+            for chunks in negative_distances
         ]
-        coverage = [value for value in self.class_radius_coverage if value is not None]
-        self.balanced_radius_coverage = sum(coverage) / len(coverage) if coverage else None
+        result = select_discriminative_radius(values_by_class, negatives_by_class)
+        self.class_radii.fill_(result['radius'])
+        self.class_radius_coverage = result['class_coverage']
+        self.balanced_radius_coverage = result['coverage']
+        self.class_radius_intrusion = result['class_intrusion']
+        self.balanced_radius_intrusion = result['intrusion']
+        self.radius_objective = result['score']
         self._source_batches.clear()
         self.refresh_count.add_(1)
 

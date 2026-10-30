@@ -97,7 +97,7 @@ def parse_args(argv=None):
     parser.add_argument('--radius_rescue_warmup_epochs', type=int, default=3,
                         help='initial target epochs using only global mean/std/EMA confidence acceptance')
     parser.add_argument('--source_radius_quantile', type=float, default=0.90,
-                        help='class-balanced common quantile of source-to-own-prototype distances; 0 < q <= 1')
+                        help='legacy compatibility option; unused in coverage-minus-intrusion radius mode')
     parser.add_argument('--source_refresh_interval', type=int, default=1,
                         help='refresh source prototypes and radii every N target epochs')
     parser.set_defaults(role_separation=True)
@@ -365,6 +365,14 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch, best_val_acc, args
         state['prototype_bank'] = prototype_bank.state_dict()
     if reliability_bank is not None:
         state['reliability_bank'] = reliability_bank.state_dict()
+        state['radius_selection'] = {
+            'mode': 'balanced_coverage_minus_intrusion',
+            'class_coverage': reliability_bank.class_radius_coverage,
+            'class_intrusion': reliability_bank.class_radius_intrusion,
+            'coverage': reliability_bank.balanced_radius_coverage,
+            'intrusion': reliability_bank.balanced_radius_intrusion,
+            'objective': reliability_bank.radius_objective,
+        }
     if role_tracker is not None:
         state['role_tracker'] = role_tracker.state_dict()
     torch.save(state, path)
@@ -711,12 +719,16 @@ def _run_training(args, run_directory):
                    np.array2string(reliability_bank.class_radii.cpu().numpy(), precision=8),
                    reliability_bank.distribution_initialized.cpu().tolist()))
             log_source_prototypes(reliability_bank)
-            print('[Target Epoch %d] Radius_Mode: class_balanced_common '
-                  'Quantile: %.4f Common_Radius: %.8f Class_Coverage_Strict: %s '
-                  'Balanced_Coverage_Strict: %s' %
-                  (i, args.source_radius_quantile, reliability_bank.class_radii[0].item(),
+            print('[Target Epoch %d] Radius_Mode: balanced_coverage_minus_intrusion '
+                  'Common_Radius: %.8f Class_Coverage_Strict: %s '
+                  'Balanced_Coverage_Strict: %s Class_Intrusion_Strict: %s '
+                  'Balanced_Intrusion_Strict: %s Radius_Objective: %s' %
+                  (i, reliability_bank.class_radii[0].item(),
                    reliability_bank.class_radius_coverage,
-                   reliability_bank.balanced_radius_coverage))
+                   reliability_bank.balanced_radius_coverage,
+                   reliability_bank.class_radius_intrusion,
+                   reliability_bank.balanced_radius_intrusion,
+                   reliability_bank.radius_objective))
         print('[Target Epoch %d] KNN_Vote_K: 11 Minimum_Votes: 6 Ratio_Threshold: %.6f Rescue_Enabled: %s' % (i, 6/11, enable_radius_rescue))
         current_proto_weight = prototype_weight_for_epoch(
             i, args.proto_weight, args.proto_warmup_epochs, args.proto_ramp_epochs
