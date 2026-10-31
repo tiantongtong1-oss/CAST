@@ -7,11 +7,11 @@ import math
 import torch
 from torch import nn
 import torch.nn.functional as F
-from balanced_radius import balanced_radius_quantile
+from balanced_radius import balanced_radius_mean_std
 
 
 class SourcePrototypeRadiusBank(nn.Module):
-    def __init__(self, num_classes, feature_dim, source_radius_quantile=0.90, eps=1e-8):
+    def __init__(self, num_classes, feature_dim, source_radius_std_scale=1.0, eps=1e-8):
         super().__init__()
         for name, value in (("num_classes", num_classes), ("feature_dim", feature_dim)):
             if isinstance(value, bool) or int(value) != value or value < 1:
@@ -19,9 +19,9 @@ class SourcePrototypeRadiusBank(nn.Module):
         if not math.isfinite(eps) or eps <= 0:
             raise ValueError("eps must be finite and positive")
         self.num_classes, self.feature_dim = int(num_classes), int(feature_dim)
-        if isinstance(source_radius_quantile, bool) or not math.isfinite(source_radius_quantile) or not 0 < source_radius_quantile <= 1:
-            raise ValueError("source_radius_quantile must be finite and in (0, 1]")
-        self.source_radius_quantile = float(source_radius_quantile)
+        if isinstance(source_radius_std_scale, bool) or not math.isfinite(source_radius_std_scale) or source_radius_std_scale < 0:
+            raise ValueError("source_radius_std_scale must be finite and nonnegative")
+        self.source_radius_std_scale = float(source_radius_std_scale)
         self.eps = float(eps)
         self.register_buffer("class_means", torch.zeros(num_classes, feature_dim))
         self.register_buffer("class_radii", torch.zeros(num_classes))
@@ -37,6 +37,8 @@ class SourcePrototypeRadiusBank(nn.Module):
         # Diagnostics are recomputed on refresh; checkpoint buffer keys stay compatible.
         self.class_radius_coverage = [None] * self.num_classes
         self.balanced_radius_coverage = None
+        self.radius_distance_mean = 0.0
+        self.radius_distance_std = 0.0
 
     @torch.no_grad()
     def begin_source_refresh(self):
@@ -79,7 +81,8 @@ class SourcePrototypeRadiusBank(nn.Module):
             torch.cat(chunks).numpy() if chunks else []
             for chunks in class_distances
         ]
-        radius = balanced_radius_quantile(values_by_class, self.source_radius_quantile)
+        radius, self.radius_distance_mean, self.radius_distance_std = balanced_radius_mean_std(
+            values_by_class, self.source_radius_std_scale)
         self.class_radii.fill_(radius)
         # Report the actual strict gate with the radius rounded to buffer dtype.
         stored_radius = self.class_radii[0].item()
@@ -110,5 +113,6 @@ class SourcePrototypeRadiusBank(nn.Module):
         labels = labels.to(device=self.class_means.device, dtype=torch.long)
         # Strict inequality implements the requested rule, including radius=0.
         return self.distribution_distance(features, labels) < self.class_radii[labels.clamp(0, self.num_classes - 1)]
+
 
 

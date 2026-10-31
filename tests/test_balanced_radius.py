@@ -49,7 +49,7 @@ class BalancedRadiusTests(unittest.TestCase):
 class RadiusBankIntegrationTests(unittest.TestCase):
     def test_refresh_strict_gate_missing_class_and_checkpoint(self):
         from source_prototype_radius import SourcePrototypeRadiusBank
-        bank = SourcePrototypeRadiusBank(3, 2, source_radius_quantile=.7)
+        bank = SourcePrototypeRadiusBank(3, 2, source_radius_std_scale=1.0)
         features = torch.tensor([[1., 0.]] * 20 + [[1., 0.], [0., 1.], [-1., 0.]])
         labels = torch.tensor([0] * 20 + [1] * 3)
         bank.begin_source_refresh()
@@ -60,6 +60,12 @@ class RadiusBankIntegrationTests(unittest.TestCase):
         self.assertEqual(bank.distribution_initialized.tolist(), [True, True, False])
         self.assertTrue(torch.all(bank.class_radii == bank.class_radii[0]))
         distances = bank.distribution_distance(features, labels)
+        from balanced_radius import balanced_radius_mean_std
+        expected, mean, std = balanced_radius_mean_std(
+            [distances[labels == c].numpy() for c in (0, 1)], 1.0)
+        self.assertAlmostEqual(bank.class_radii[0].item(), expected, places=6)
+        self.assertAlmostEqual(bank.radius_distance_mean, mean, places=6)
+        self.assertAlmostEqual(bank.radius_distance_std, std, places=6)
         self.assertTrue(torch.equal(bank.in_distribution(features, labels),
                                     distances < bank.class_radii[labels]))
         self.assertFalse(bank.in_distribution(features[:1], torch.tensor([2])).item())
@@ -79,3 +85,4 @@ class RadiusBankIntegrationTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

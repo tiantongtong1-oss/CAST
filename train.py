@@ -98,8 +98,8 @@ def parse_args(argv=None):
 
     parser.add_argument('--radius_rescue_warmup_epochs', type=int, default=3,
                         help='initial target epochs using only global mean/std/EMA confidence acceptance')
-    parser.add_argument('--source_radius_quantile', type=float, default=0.90,
-                        help='class-balanced common quantile of source-to-own-prototype distances; 0 < q <= 1')
+    parser.add_argument('--source_radius_std_scale', type=float, default=1.0,
+                        help='class-balanced common radius = mean + k * population std; k >= 0')
     parser.add_argument('--source_refresh_interval', type=int, default=1,
                         help='refresh source prototypes and radii every N target epochs')
     parser.set_defaults(role_separation=True)
@@ -150,8 +150,8 @@ def parse_args(argv=None):
         parser.error('rescue_prototype_margin must be finite and in [0,2]')
     if not 0 <= args.rescue_vote_margin <= 11:
         parser.error('rescue_vote_margin must be in [0,11]')
-    if not np.isfinite(args.source_radius_quantile) or not 0 < args.source_radius_quantile <= 1:
-        parser.error('source_radius_quantile must be finite and in (0, 1]')
+    if not np.isfinite(args.source_radius_std_scale) or args.source_radius_std_scale < 0:
+        parser.error('source_radius_std_scale must be finite and nonnegative')
     if args.source_refresh_interval < 1:
         parser.error('source_refresh_interval must be positive')
     if args.pre_epochs < 0 or args.epochs < 0 or args.radius_rescue_warmup_epochs < 0:
@@ -470,9 +470,9 @@ def _run_training(args, run_directory):
     print('prototype weight:%s temp:%s momentum:%s source_anchor:%s warmup:%s ramp:%s' %
           (args.proto_weight, args.proto_temperature, args.proto_momentum,
            args.proto_source_anchor, args.proto_warmup_epochs, args.proto_ramp_epochs))
-    print('source_radius_quantile:%.4f source_refresh_interval:%d role_separation:%s '
+    print('source_radius_std_scale:%.4f source_refresh_interval:%d role_separation:%s '
           'promotion_epochs:%d immediate_prototype_update:%s run_name:%s' %
-          (args.source_radius_quantile, args.source_refresh_interval, args.role_separation,
+          (args.source_radius_std_scale, args.source_refresh_interval, args.role_separation,
            args.promotion_epochs, args.immediate_prototype_update, args.run_name))
 
     if args.backbone == 'resnet18':
@@ -660,7 +660,7 @@ def _run_training(args, run_directory):
 
     # Source-only geometric gate: no target neighbors, voting or variance.
     reliability_bank = SourcePrototypeRadiusBank(
-        class_num, model.fc.in_features, source_radius_quantile=args.source_radius_quantile,
+        class_num, model.fc.in_features, source_radius_std_scale=args.source_radius_std_scale,
     ).to(device)
     role_tracker = ReliabilityRoles(len(target_train), args.promotion_epochs).to(device)
 
@@ -726,10 +726,11 @@ def _run_training(args, run_directory):
                    np.array2string(reliability_bank.class_radii.cpu().numpy(), precision=8),
                    reliability_bank.distribution_initialized.cpu().tolist()))
             log_source_prototypes(reliability_bank)
-            print('[Target Epoch %d] Radius_Mode: class_balanced_common '
-                  'Quantile: %.4f Common_Radius: %.8f Class_Coverage_Strict: %s '
+            print('[Target Epoch %d] Radius_Mode: class_balanced_mean_std '
+                  'Std_Scale: %.4f Distance_Mean: %.8f Distance_Std: %.8f Common_Radius: %.8f Class_Coverage_Strict: %s '
                   'Balanced_Coverage_Strict: %s' %
-                  (i, args.source_radius_quantile, reliability_bank.class_radii[0].item(),
+                  (i, args.source_radius_std_scale, reliability_bank.radius_distance_mean,
+                   reliability_bank.radius_distance_std, reliability_bank.class_radii[0].item(),
                    reliability_bank.class_radius_coverage,
                    reliability_bank.balanced_radius_coverage))
         print('[Target Epoch %d] KNN_Vote_K: 11 Minimum_Votes: 6 Ratio_Threshold: %.6f Rescue_Enabled: %s' % (i, 6/11, enable_radius_rescue))
@@ -1080,6 +1081,7 @@ def _run_training(args, run_directory):
 
 if __name__ == '__main__':
     run_training()
+
 
 
 

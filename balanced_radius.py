@@ -33,3 +33,26 @@ def balanced_radius_quantile(class_distances, quantile):
     tolerance = 8 * np.finfo(np.float64).eps * cumulative[-1]
     index = np.searchsorted(cumulative, target - tolerance, side='left')
     return float(values[order[min(int(index), len(order) - 1)]])
+
+
+
+def balanced_radius_mean_std(class_distances, std_scale=1.0):
+    """Return (radius, mean, population std), giving each nonempty class equal mass."""
+    if isinstance(std_scale, (bool, np.bool_)) or not np.isfinite(std_scale) or std_scale < 0:
+        raise ValueError('std_scale must be finite and nonnegative')
+    classes = [np.asarray(values, dtype=np.float64).reshape(-1)
+               for values in class_distances]
+    if any(not np.isfinite(values).all() or (values < 0).any() for values in classes):
+        raise ValueError('distances must be finite and nonnegative')
+    active = [values for values in classes if values.size]
+    if not active:
+        return 0.0, 0.0, 0.0
+    # Center before squaring: includes both within-class and between-class variation.
+    mean = np.mean([values.astype(np.longdouble).mean() for values in active])
+    variance = np.mean([((values.astype(np.longdouble) - mean) ** 2).mean()
+                        for values in active])
+    std = np.sqrt(variance)
+    result = np.asarray([mean + std_scale * std, mean, std], dtype=np.float64)
+    if not np.isfinite(result).all():
+        raise ValueError('radius statistics must be finite')
+    return tuple(float(value) for value in result)

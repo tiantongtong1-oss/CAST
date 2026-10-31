@@ -3,13 +3,14 @@
 This is a PyTorch implementation of the paper:
 
 "Unsupervised Cross-Domain Facial Expression Recognition via Class Adaptive self-Training"
-## Current experiment: original adaptive threshold + minimum dual-view confidence
+## Current experiment: class-balanced mean/std common radius (v30)
 
-See [behavior and training command](AGREEMENT_RADIUS_DS_V18.md).
-This branch restores the original five-parameter adaptive threshold, computed once
-per epoch from target-training predictions. Direct acceptance explicitly compares
-`min(conf1, conf2) >= threshold[pred1]`, with matching predicted classes required.
-Source radius + DS rescue starts after three warmup epochs. Training has no JS.
+See [formula, parameters, and validation](BALANCED_MEAN_STD_RADIUS_V30.md).
+The shared source radius is now `R = mean + k * population_std`, with equal
+weight per nonempty class. Set `--source_radius_std_scale 1.0` (default).
+Replace the previous `--source_radius_quantile 0.90` option in v29 commands.
+The global confidence threshold, KNN rescue, competition checks and stable
+anchor promotion retain their v29 behavior.
 
 ## Environment
 Ubuntu 16.04 LTS, python 3.8, pytorch 1.8.1
@@ -28,3 +29,4 @@ See [implementation changes and training commands](IMPROVEMENTS.md) and the beha
 [Code-audited architecture and figure downloads](docs/ARCHITECTURE.md)
 
 ![MobileNetV2 Dual-View EMA CAST](docs/cast_mobilenetv2_framework.png)
+
