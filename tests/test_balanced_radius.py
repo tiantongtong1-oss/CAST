@@ -49,7 +49,7 @@ class BalancedRadiusTests(unittest.TestCase):
 class RadiusBankIntegrationTests(unittest.TestCase):
     def test_refresh_strict_gate_missing_class_and_checkpoint(self):
         from source_prototype_radius import SourcePrototypeRadiusBank
-        bank = SourcePrototypeRadiusBank(3, 2, source_radius_std_scale=1.0)
+        bank = SourcePrototypeRadiusBank(3, 2, source_radius_quantile=.9)
         features = torch.tensor([[1., 0.]] * 20 + [[1., 0.], [0., 1.], [-1., 0.]])
         labels = torch.tensor([0] * 20 + [1] * 3)
         bank.begin_source_refresh()
@@ -60,12 +60,12 @@ class RadiusBankIntegrationTests(unittest.TestCase):
         self.assertEqual(bank.distribution_initialized.tolist(), [True, True, False])
         self.assertTrue(torch.all(bank.class_radii == bank.class_radii[0]))
         distances = bank.distribution_distance(features, labels)
-        from balanced_radius import balanced_radius_mean_std
-        expected, mean, std = balanced_radius_mean_std(
-            [distances[labels == c].numpy() for c in (0, 1)], 1.0)
-        self.assertAlmostEqual(bank.class_radii[0].item(), expected, places=6)
-        self.assertAlmostEqual(bank.radius_distance_mean, mean, places=6)
-        self.assertAlmostEqual(bank.radius_distance_std, std, places=6)
+        from shared_diagonal_radius import fit_shared_diagonal
+        means, variance, expected, _ = fit_shared_diagonal(
+            [features[labels == c].numpy() for c in range(3)], .9, 1e-4)
+        self.assertAlmostEqual(bank.class_radii[0].item(), expected, places=5)
+        np.testing.assert_allclose(bank.shared_variance.numpy(), variance, atol=1e-7)
+        np.testing.assert_allclose(bank.class_means.numpy(), means, atol=1e-7)
         self.assertTrue(torch.equal(bank.in_distribution(features, labels),
                                     distances < bank.class_radii[labels]))
         self.assertFalse(bank.in_distribution(features[:1], torch.tensor([2])).item())
@@ -76,10 +76,15 @@ class RadiusBankIntegrationTests(unittest.TestCase):
         restored = SourcePrototypeRadiusBank(3, 2)
         restored.load_state_dict(torch.load(payload, weights_only=True), strict=True)
         self.assertTrue(torch.equal(bank.class_radii, restored.class_radii))
+        self.assertTrue(torch.equal(bank.shared_variance, restored.shared_variance))
+        self.assertTrue(torch.equal(bank.variance_regularizer, restored.variance_regularizer))
+        self.assertTrue(torch.equal(bank.distribution_distance(features, labels),
+                                    restored.distribution_distance(features, labels)))
         # All-empty refresh clears radii and keeps every class unavailable.
         bank.begin_source_refresh()
         bank.finalize_source()
         self.assertTrue(torch.all(bank.class_radii == 0))
+        self.assertTrue(torch.all(bank.shared_variance == 0))
         self.assertFalse(bank.distribution_initialized.any())
 
 

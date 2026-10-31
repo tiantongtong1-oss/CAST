@@ -3,14 +3,15 @@
 This is a PyTorch implementation of the paper:
 
 "Unsupervised Cross-Domain Facial Expression Recognition via Class Adaptive self-Training"
-## Current experiment: class-balanced mean/std common radius (v30)
+## Current experiment: shared diagonal Mahalanobis radius (v31)
 
-See [formula, parameters, and validation](BALANCED_MEAN_STD_RADIUS_V30.md).
-The shared source radius is now `R = mean + k * population_std`, with equal
-weight per nonempty class. Set `--source_radius_std_scale 1.0` (default).
-Replace the previous `--source_radius_quantile 0.90` option in v29 commands.
-The global confidence threshold, KNN rescue, competition checks and stable
-anchor promotion retain their v29 behavior.
+See [metric, parameters, checkpoint compatibility and validation](SHARED_DIAGONAL_RADIUS_V31.md).
+Seven class prototypes share one class-balanced within-class variance vector and
+one class-balanced 90% distance quantile threshold. Use
+`--source_radius_quantile 0.90 --source_variance_regularizer 0.0001`.
+The v30 `--source_radius_std_scale` option is no longer accepted.
+Confidence acceptance, Euclidean KNN voting, Euclidean prototype competition,
+and stable anchor promotion retain their previous rules.
 
 ## Environment
 Ubuntu 16.04 LTS, python 3.8, pytorch 1.8.1

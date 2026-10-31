@@ -1,27 +1,29 @@
-"""Source-only prototypes and a class-balanced shared Euclidean radius.
-
-Historical Gaussian experiments live in global_gaussian_knn_reliability.py;
-this bank does not calculate variances or Mahalanobis distances.
-"""
+"""Source-only class prototypes with one shared diagonal Mahalanobis threshold."""
 import math
+import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
-from balanced_radius import balanced_radius_mean_std
+from shared_diagonal_radius import fit_shared_diagonal
 
 
 class SourcePrototypeRadiusBank(nn.Module):
-    def __init__(self, num_classes, feature_dim, source_radius_std_scale=1.0, eps=1e-8):
+    def __init__(self, num_classes, feature_dim, source_radius_quantile=0.90,
+                 source_variance_regularizer=1e-4, eps=1e-8):
         super().__init__()
         for name, value in (("num_classes", num_classes), ("feature_dim", feature_dim)):
             if isinstance(value, bool) or int(value) != value or value < 1:
                 raise ValueError(name + " must be a positive integer")
         if not math.isfinite(eps) or eps <= 0:
             raise ValueError("eps must be finite and positive")
+        if isinstance(source_radius_quantile, bool) or not math.isfinite(source_radius_quantile) or not 0 < source_radius_quantile <= 1:
+            raise ValueError("source_radius_quantile must be finite and in (0, 1]")
+        if isinstance(source_variance_regularizer, bool) or not math.isfinite(source_variance_regularizer) or source_variance_regularizer <= 0:
+            raise ValueError("source_variance_regularizer must be finite and positive")
         self.num_classes, self.feature_dim = int(num_classes), int(feature_dim)
-        if isinstance(source_radius_std_scale, bool) or not math.isfinite(source_radius_std_scale) or source_radius_std_scale < 0:
-            raise ValueError("source_radius_std_scale must be finite and nonnegative")
-        self.source_radius_std_scale = float(source_radius_std_scale)
+        self.source_radius_quantile = float(source_radius_quantile)
+        self.register_buffer("shared_variance", torch.zeros(feature_dim))
+        self.register_buffer("variance_regularizer", torch.tensor(float(source_variance_regularizer), dtype=torch.float64))
         self.eps = float(eps)
         self.register_buffer("class_means", torch.zeros(num_classes, feature_dim))
         self.register_buffer("class_radii", torch.zeros(num_classes))
@@ -34,11 +36,9 @@ class SourcePrototypeRadiusBank(nn.Module):
         # CPU snapshots avoid retaining the whole source dataset on GPU. Distances
         # must be computed after the final class means are known (not batch means).
         self._source_batches = []
-        # Diagnostics are recomputed on refresh; checkpoint buffer keys stay compatible.
+        # Diagnostics are recomputed on refresh; metric buffers are checkpointed.
         self.class_radius_coverage = [None] * self.num_classes
         self.balanced_radius_coverage = None
-        self.radius_distance_mean = 0.0
-        self.radius_distance_std = 0.0
 
     @torch.no_grad()
     def begin_source_refresh(self):
@@ -66,23 +66,17 @@ class SourcePrototypeRadiusBank(nn.Module):
     def finalize_source(self):
         self.class_source_counts.copy_(self._source_count)
         self.source_count.copy_(self._source_count.sum())
-        self.class_means.copy_((self._source_sum / self._source_count.clamp_min(1)[:, None]).to(self.class_means))
-        self.class_radii.zero_()
         self.distribution_initialized.copy_(self._source_count > 0)
-        class_distances = [[] for _ in range(self.num_classes)]
-        for features, labels in self._source_batches:
-            features, labels = features.to(self.class_means), labels.to(self.class_means.device)
-            distances = (features - self.class_means[labels]).norm(dim=1)
-            for c in labels.unique().tolist():
-                class_distances[c].append(distances[labels == c].cpu())
-        # Each present class contributes the same total probability mass,
-        # regardless of its sample count. Keep the seven distinct class means.
-        values_by_class = [
-            torch.cat(chunks).numpy() if chunks else []
-            for chunks in class_distances
-        ]
-        radius, self.radius_distance_mean, self.radius_distance_std = balanced_radius_mean_std(
-            values_by_class, self.source_radius_std_scale)
+        if self._source_batches:
+            features = np.concatenate([x.numpy() for x, _ in self._source_batches])
+            labels = np.concatenate([y.numpy() for _, y in self._source_batches])
+            by_class = [features[labels == c] for c in range(self.num_classes)]
+        else:
+            by_class = [np.empty((0, self.feature_dim)) for _ in range(self.num_classes)]
+        means, variance, radius, values_by_class = fit_shared_diagonal(
+            by_class, self.source_radius_quantile, self.variance_regularizer.item())
+        self.class_means.copy_(torch.as_tensor(means, device=self.class_means.device, dtype=self.class_means.dtype))
+        self.shared_variance.copy_(torch.as_tensor(variance, device=self.shared_variance.device, dtype=self.shared_variance.dtype))
         self.class_radii.fill_(radius)
         # Report the actual strict gate with the radius rounded to buffer dtype.
         stored_radius = self.class_radii[0].item()
@@ -105,7 +99,8 @@ class SourcePrototypeRadiusBank(nn.Module):
         valid = (labels >= 0) & (labels < self.num_classes) & self.distribution_initialized[safe]
         valid &= torch.isfinite(features).all(-1) & (features.norm(dim=-1) > self.eps)
         z = F.normalize(torch.nan_to_num(features), dim=-1)
-        distance = (z - self.class_means[safe]).norm(dim=-1)
+        scale = self.shared_variance + self.variance_regularizer.to(self.shared_variance)
+        distance = ((z - self.class_means[safe]).square() / scale).sum(dim=-1).sqrt()
         return distance.masked_fill(~valid, float("inf"))
 
     @torch.no_grad()

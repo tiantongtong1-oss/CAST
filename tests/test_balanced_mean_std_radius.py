@@ -35,31 +35,5 @@ class BalancedMeanStdTests(unittest.TestCase):
                 balanced_radius_mean_std([values])
 
 
-class RadiusArgumentsTests(unittest.TestCase):
-    def test_live_parser_scale_and_validation(self):
-        import ast
-        import argparse
-        import contextlib
-        import io
-        from pathlib import Path
-        from dual_domain_ds import DSConfig
-        tree = ast.parse(Path('train.py').read_text())
-        nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef)
-                 and n.name in ('parse_args', 'ds_config_from_args')]
-        env = dict(argparse=argparse, np=np, DSConfig=DSConfig)
-        exec(compile(ast.Module(body=nodes, type_ignores=[]), '<args>', 'exec'), env)
-        parse = env['parse_args']
-        self.assertEqual(parse([]).source_radius_std_scale, 1.)
-        for scale in ('0', '0.5', '2'):
-            self.assertEqual(parse(['--source_radius_std_scale', scale]).source_radius_std_scale,
-                             float(scale))
-        for args in (['--source_radius_std_scale', '-1'],
-                     ['--source_radius_std_scale', 'nan'],
-                     ['--source_radius_std_scale', 'inf'],
-                     ['--source_radius_quantile', '.9']):
-            with self.subTest(args=args), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-                parse(args)
-
-
 if __name__ == '__main__':
     unittest.main()
