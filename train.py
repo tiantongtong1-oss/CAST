@@ -20,7 +20,7 @@ from source_prototype_radius import SourcePrototypeRadiusBank
 from reliability_roles import ReliabilityRoles
 from dual_domain_ds import DSConfig
 from neighbor_vote import NeighborVoteBank, audit_vote, rescue_union
-from competition_gate import competition_audit, supervision_mask
+from competition_gate import promotion_eligibility, competition_audit, supervision_mask
 from run_history import RunHistory
 import image_utils as util
 from randaugment import RandAugmentMC
@@ -671,6 +671,7 @@ def _run_training(args, run_directory):
 
     ds_config = ds_config_from_args(args)
     print('Rescue=agreement & low_confidence & (radius OR vote) & competition; rescue learns only after stable promotion; no class quotas; competing SOURCE prototypes; K=11 is neighbor count, not per-class selection quota; KNN_Vote: K=11 Minimum_Votes=6 Vote_Ratio=6/11; full neighborhood required; source true labels; no DS/Otsu/cosine weighting')
+    print('Promotion=agreement & (confidence OR radius OR neighbor_6_of_11); consecutive unchanged labels required; rescue competition and supervision unchanged')
     print('Competition margins: probability=%s prototype=%s vote=%s' %
           (args.rescue_probability_margin, args.rescue_prototype_margin, args.rescue_vote_margin))
     ds_csv_path = os.path.join(run_directory, 'logs', args.run_name + '_ds_diagnostics.csv')
@@ -764,6 +765,7 @@ def _run_training(args, run_directory):
         pseudo_distribution_final = np.zeros(class_num, dtype=np.int64)
         pseudo_distribution_anchors = np.zeros(class_num, dtype=np.int64)
         anchor_num = 0
+        promotion_eligible_num = 0
         supervised_num = pending_rescue_num = competition_pass_num = 0
         pseudo_distribution_supervised = np.zeros(class_num, dtype=np.int64)
         prototype_update_num = immediate_update_num = 0
@@ -814,7 +816,10 @@ def _run_training(args, run_directory):
                 radius_candidates = rescue_candidates & region_ok
                 rescue_mask = torch.zeros_like(agreement_mask)
                 progress.mark("teacher_gate")
-                if enable_radius_rescue and rescue_candidates.any():
+                # Confidence-passing samples need no neighbor query for the OR rule.
+                # Evaluate low-confidence agreeing samples even during rescue warmup.
+                neighbor_pass_mask = torch.zeros_like(agreement_mask)
+                if rescue_candidates.any():
                     query_idx = torch.where(rescue_candidates)[0]
                     queries = teacher_mean_features[query_idx].cpu().numpy()
                     query_ids = sample_ids[query_idx.cpu()].numpy()
@@ -823,6 +828,8 @@ def _run_training(args, run_directory):
                     ds_result = audit_vote(
                         source_ds, query_labels, 6)
                     vote_pass = torch.as_tensor(ds_result['pass_mask'], device=device, dtype=torch.bool)
+                    neighbor_pass_mask[query_idx] = vote_pass
+                if enable_radius_rescue and rescue_candidates.any():
                     radius_pass = region_ok[query_idx]
                     competition = competition_audit(
                         F.softmax(logits1[query_idx], dim=1).cpu().numpy(),
@@ -872,12 +879,15 @@ def _run_training(args, run_directory):
                 progress.mark("rescue_csv")
                 final_mask = confidence_mask | rescue_mask
 
+                promotion_eligible = promotion_eligibility(
+                    agreement_mask, confidence_mask, region_ok, neighbor_pass_mask)
+                promotion_eligible_num += int(promotion_eligible.sum().item())
                 # Learning is distinct from updating shared class knowledge.
                 if role_tracker is not None:
                     conf1 = F.softmax(logits1, dim=1).max(dim=1).values
                     conf2 = F.softmax(logits2, dim=1).max(dim=1).values
                     anchor_mask = role_tracker.observe(
-                        sample_ids, pseudo_targets, final_mask & region_ok,
+                        sample_ids, pseudo_targets, promotion_eligible,
                         torch.minimum(conf1, conf2), epoch=i,
                     )
                 else:
@@ -1031,6 +1041,7 @@ def _run_training(args, run_directory):
         print('[Target Epoch %d] Supervised_Num: %d Pending_Rescue_Num: %d Competition_Pass_Num: %d Supervised_Distribution: %s' %
               (i, supervised_num, pending_rescue_num, competition_pass_num,
                np.array2string(pseudo_distribution_supervised, separator=', ')))
+        print('[Target Epoch %d] Promotion_Eligible_Num: %d' % (i, promotion_eligible_num))
         print('[Target Epoch %d] Anchor_Num: %d Anchor_Distribution: %s' %
               (i, anchor_num, np.array2string(pseudo_distribution_anchors, separator=', ')))
         print('[Target Epoch %d] Prototype_Update_Num: %d Immediate_Update_Num: %d' %

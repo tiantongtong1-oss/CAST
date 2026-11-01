@@ -39,3 +39,9 @@ def competition_audit(prob1, prob2, features, labels, means, ready, votes,
 def supervision_mask(confidence, rescue, anchors):
     """High-confidence labels learn now; rescue labels learn only as anchors."""
     return confidence | (rescue & anchors)
+
+
+
+def promotion_eligibility(agreement, confidence, radius, neighbor):
+    """Any evidence route may sustain a label streak; dual-view agreement is mandatory."""
+    return agreement & (confidence | radius | neighbor)

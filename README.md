@@ -11,7 +11,9 @@ one class-balanced 90% distance quantile threshold. Use
 `--source_radius_quantile 0.90 --source_variance_regularizer 0.0001`.
 The v30 `--source_radius_std_scale` option is no longer accepted.
 Confidence acceptance, Euclidean KNN voting, Euclidean prototype competition,
-and stable anchor promotion retain their previous rules.
+retain their previous rules. Stable anchor eligibility is now
+`agreement & (confidence | radius | neighbor_6_of_11)`, with three consecutive
+epochs of unchanged labels still required.
 
 ## Environment
 Ubuntu 16.04 LTS, python 3.8, pytorch 1.8.1

@@ -59,3 +59,21 @@ python -m py_compile shared_diagonal_radius.py source_prototype_radius.py train.
 当前开发环境没有 PyTorch，银行刷新/查询/保存集成测试跳过；已验证实际
 银行所调用的 NumPy 拟合核心，未执行GPU训练。历史 test_agreement_radius_ds.py
 在v29/v30已有的失败不属于本次变更。
+
+
+## OR 晋升更新
+
+晋升资格改为 `agreement & (confidence | radius | neighbor)`。
+neighbor 是完整11个源域邻居中至少6票支持当前伪标签，不要求竞争检查通过。
+高置信样本已经满足OR，无需额外查询邻居；其余双视图一致样本每轮查询一次，
+供晋升和救援复用，包括救援尚未开启的前3轮。
+连续3个epoch有资格且伪标签不变才成为anchor；资格失效清零，标签变化重新累计。
+各轮可以通过不同证据路径维持连续计数。
+
+救援仍受warmup和competition约束，实际分类/原型一致性监督仍为
+`confidence | (rescue & anchor)`。不通过最终接纳的样本即使晋升，也不会
+因此直接进入这些监督损失；但anchor本身可参与目标原型更新及anchor相关损失。
+这是放宽晋升资格的预期效果，并非将竞争检查改成OR。
+
+日志新增 Promotion_Eligible_Num，并打印完整晋升公式。
+验证：`python -m unittest discover -s tests -p test_promotion_or.py -v`。
