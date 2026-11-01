@@ -77,3 +77,12 @@ neighbor 是完整11个源域邻居中至少6票支持当前伪标签，不要�
 
 日志新增 Promotion_Eligible_Num，并打印完整晋升公式。
 验证：`python -m unittest discover -s tests -p test_promotion_or.py -v`。
+
+
+## 限制目标原型写入
+
+目标原型更新条件收紧为 `prototype_update_mask = anchor_mask & final_mask`。
+晋升后但本轮未最终接纳的样本不再写入目标原型。OR晋升资格、监督掩码及其他
+anchor相关操作不变。比较时使用同一源域checkpoint，设置promotion_epochs=2、
+threshold_base=threshold_min=0.875，其余参数保持一致。
+新增测试 test_accepted_anchor_updates.py 验证实际训练掩码及更新调用。

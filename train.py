@@ -894,8 +894,8 @@ def _run_training(args, run_directory):
                     raise RuntimeError('stable role tracking is required')
                 # Binary mask required by Networks.forward(idx == 1).
                 anchor_idx = anchor_mask.float()
-                # Target prototype writes are restricted to promoted stable anchors.
-                prototype_update_mask = anchor_mask.clone()
+                # Only currently accepted stable anchors may write target prototypes.
+                prototype_update_mask = anchor_mask & final_mask
                 learn_mask = supervision_mask(confidence_mask, rescue_mask, anchor_mask)
                 con_idx = learn_mask.float()
                 supervised_num += int(learn_mask.sum().item())
