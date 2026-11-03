@@ -86,7 +86,10 @@ def parse_args(argv=None):
     parser.add_argument('--proto_ramp_epochs', type=int, default=5,
                         help='epochs used to linearly ramp prototype loss to full weight')
 
+    parser.add_argument('--rescue_warmup_epochs', type=int, default=3)
     args = parser.parse_args(argv)
+    if args.rescue_warmup_epochs < 0:
+        parser.error('rescue_warmup_epochs must be nonnegative')
     if args.pre_epochs < 0 or args.epochs < 0:
         parser.error('epoch counts must be nonnegative')
     if args.pre_epochs == 0 and not args.checkpoint:
@@ -268,14 +271,21 @@ def initialize_source_prototypes(teacher, feature_hook, loader, prototype_bank):
 
 
 @torch.no_grad()
-def initialize_source_radii(teacher, feature_hook, loader, radius_bank):
-    """One deterministic source scan against the fixed source prototypes."""
+def refresh_source_rescue(teacher, feature_hook, loader, radius_bank, prototype_bank):
+    """Rebuild all source references in the current teacher feature space."""
     teacher.eval()
     device = next(teacher.parameters()).device
+    features, labels = [], []
     for imgs, targets in loader:
         teacher(imgs.to(device), None, None, mode='test', task='source')
-        radius_bank.accumulate_source(feature_hook.output, targets.to(device))
-    radius_bank.finalize_source()
+        features.append(feature_hook.output.detach().cpu())
+        labels.append(targets.cpu())
+    if not features:
+        raise RuntimeError('Source loader is empty')
+    radius_bank.set_source_memory(torch.cat(features), torch.cat(labels))
+    prototype_bank.source_prototypes.copy_(radius_bank.prototypes)
+    prototype_bank.source_initialized.copy_(radius_bank.initialized)
+    prototype_bank.source_counts.copy_(radius_bank.counts)
 
 
 def run_training():
@@ -286,12 +296,12 @@ def run_training():
     source_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_prototype_radius_top7_07_source_best.pth'
+        + '_prototype_radius_top7_07_or_source_best.pth'
     )
     target_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_prototype_radius_top7_07_target_best.pth'
+        + '_prototype_radius_top7_07_or_target_best.pth'
     )
 
     print('---------------------------------------------------------------------------------------')
@@ -306,7 +316,7 @@ def run_training():
     print('prototype weight:%s temp:%s momentum:%s source_anchor:%s warmup:%s ramp:%s' %
           (args.proto_weight, args.proto_temperature, args.proto_momentum,
            args.proto_source_anchor, args.proto_warmup_epochs, args.proto_ramp_epochs))
-    print('Mandatory prototype radius: top_k=7 scale=0.7; fixed at initialization')
+    print('OR rescue: top_k=7 scale=0.7; refresh each epoch; source KNN k=11 strict majority')
     print('---------------------------------------------------------------------------------------')
 
     if args.backbone == 'resnet18':
@@ -479,12 +489,6 @@ def run_training():
     reliability_bank = PrototypeRadiusBank(
         prototype_bank.source_prototypes, prototype_bank.source_initialized
     ).cuda()
-    initialize_source_radii(
-        teacher, teacher_feature_hook, prototype_loader_source, reliability_bank
-    )
-    print('Fixed source radii (top 7 mean):', reliability_bank.radii.cpu().tolist())
-    print('Radius ready:', reliability_bank.ready.cpu().tolist())
-
     best_target_val_acc = -1.0
     global_step = 0
 
@@ -502,7 +506,13 @@ def run_training():
         current_proto_weight = prototype_weight_for_epoch(
             i, args.proto_weight, args.proto_warmup_epochs, args.proto_ramp_epochs
         )
-        enable_knn_rescue = False  # Radius is mandatory from the first target epoch.
+        refresh_source_rescue(
+            teacher, teacher_feature_hook, prototype_loader_source,
+            reliability_bank, prototype_bank,
+        )
+        print('[Target Epoch %d] Source radii: %s Source memory: %d' %
+              (i, reliability_bank.radii.cpu().tolist(), reliability_bank.memory_labels.numel()))
+        enable_knn_rescue = i >= args.rescue_warmup_epochs
 
         print('[Target Epoch %d] class mean confidence: %s global_mean: %.4f '
               'threshold_center: %.4f' %
@@ -510,7 +520,7 @@ def run_training():
                global_mean, threshold_center))
         print('[Target Epoch %d] class-adaptive thresholds: %s' %
               (i, np.array2string(thresholds.numpy(), precision=4)))
-        print('[Target Epoch %d] KNN OR rescue enabled: %s' %
+        print('[Target Epoch %d] Radius/KNN OR rescue enabled: %s' %
               (i, enable_knn_rescue))
 
         model.train()
@@ -522,13 +532,11 @@ def run_training():
         batch_count = 0
         agreement_num = 0
         confidence_accept_num = 0
-        knn_pass_num = 0
+        radius_rescue_num = 0
+        neighbor_rescue_num = 0
         knn_rescue_num = 0
         final_accept_num = 0
-        score_sum = 0.0
-        density_sum = 0.0
         knn_checked_num = 0
-        dense_num = 0
         prototype_agree_num = 0
         prototype_checked_num = 0
         prototype_similarity_sum = 0.0
@@ -571,12 +579,13 @@ def run_training():
                 agreement_mask = torch.argmax(logits1, dim=1).eq(
                     torch.argmax(logits2, dim=1)
                 )
-                knn_result = None  # Legacy diagnostic fields remain zero.
-                reliability_mask = reliability_bank.accepts(
-                    teacher_mean_features, pseudo_targets
+                final_mask, radius_rescue_mask, neighbor_rescue_mask, neighbor_checked = (
+                    reliability_bank.select(
+                        teacher_mean_features, pseudo_targets, confidence_mask,
+                        agreement_mask, enable_knn_rescue,
+                    )
                 )
-                final_mask = confidence_mask & agreement_mask & reliability_mask
-                rescue_mask = torch.zeros_like(final_mask)
+                rescue_mask = radius_rescue_mask | neighbor_rescue_mask
                 # Networks.forward selects idx == 1: retain a binary mask here.
                 con_idx = final_mask.float()
 
@@ -589,16 +598,12 @@ def run_training():
             # 统计当前epoch中不同阶段一共接纳了多少目标样本
             agreement_num += agree_count
             confidence_accept_num += int(confidence_mask.sum().item())
-            knn_pass_num += int(reliability_mask.sum().item())
+            radius_rescue_num += int(radius_rescue_mask.sum().item())
+            neighbor_rescue_num += int(neighbor_rescue_mask.sum().item())
+            knn_checked_num += int(neighbor_checked.sum().item())
             knn_rescue_num += int(rescue_mask.sum().item())
             final_accept_num += int(final_mask.sum().item())
 
-            if knn_result is not None:
-                checked = knn_result['checked_mask']
-                score_sum += float(knn_result['score'][checked].sum().item())
-                density_sum += float(knn_result['density'][checked].sum().item())
-                knn_checked_num += int(checked.sum().item())
-                dense_num += int(knn_result['dense_mask'].sum().item())
             # 累计prototype诊断指标
             prototype_agree_num += proto_agree
             prototype_checked_num += proto_checked
@@ -686,16 +691,11 @@ def run_training():
             prototype_similarity_sum / float(prototype_checked_num)
             if prototype_checked_num > 0 else 0.0
         )
-        mean_score = score_sum / max(knn_checked_num, 1)
-        mean_density = density_sum / max(knn_checked_num, 1)
-
         print('[Target Epoch %d] Agreement_Num: %d Confidence_Accept_Num: %d '
-              'Radius_Pass_Num: %d Legacy_Rescue_Num: %d Final_Accept_Num: %d '
-              'Mean_Reliability: %.4f Mean_Density: %.4f '
-              'KNN_Checked_Num: %d Dense_Num: %d Sparse_Num: %d' %
-              (i, agreement_num, confidence_accept_num, knn_pass_num,
-               knn_rescue_num, final_accept_num, mean_score, mean_density,
-               knn_checked_num, dense_num, knn_checked_num - dense_num))
+              'Radius_Rescue_Num: %d Neighbor_Rescue_Num: %d Rescue_Num: %d '
+              'Neighbor_Checked_Num: %d Final_Accept_Num: %d' %
+              (i, agreement_num, confidence_accept_num, radius_rescue_num,
+               neighbor_rescue_num, knn_rescue_num, knn_checked_num, final_accept_num))
         print('[Target Epoch %d] Pseudo_Distribution_Confidence: %s' %
               (i, np.array2string(pseudo_distribution_confidence, separator=', ')))
         print('[Target Epoch %d] Pseudo_Distribution_Rescued: %s' %
@@ -757,5 +757,6 @@ if __name__ == '__main__':
     from training_log import training_log
     with training_log():
         run_training()
+
 
 
