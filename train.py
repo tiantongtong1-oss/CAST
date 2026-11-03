@@ -754,6 +754,8 @@ def run_training():
 
 
 if __name__ == '__main__':
-    run_training()
+    from training_log import training_log
+    with training_log():
+        run_training()
 
 
