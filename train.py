@@ -12,7 +12,8 @@ import Networks
 from dataset import RafDataSet, FER
 from ema_utils import create_ema_teacher, select_dual_view_pseudo_labels, update_ema_teacher
 from prototype_utils import FeatureHook, PrototypeBank, prototype_weight_for_epoch
-from raw_medoid_quantile import RawMedoidQuantileBank, scaled_class_thresholds
+from raw_medoid_quantile import RawMedoidQuantileBank
+from global_threshold import lambda_for_epoch, GlobalConfidenceMean
 import image_utils as util
 from randaugment import RandAugmentMC
 # 总训练入口与调度器。串起数据、Source 预训练、EMA Teacher、
@@ -61,8 +62,12 @@ def parse_args(argv=None):
                              'not used by the stable relative threshold')
     parser.add_argument('--ema_decay', type=float, default=0.999,
                         help='fixed EMA decay for teacher parameters and floating buffers')
-    parser.add_argument('--threshold_lambda', type=float, default=1.0,
-                        help='tau[c] = lambda * class mean original-view confidence')
+    parser.add_argument('--threshold_lambda', type=float, default=None,
+                        help='optional fixed lambda; overrides dynamic schedule')
+    parser.add_argument('--lambda_start', type=float, default=0.9)
+    parser.add_argument('--lambda_end', type=float, default=1.0)
+    parser.add_argument('--lambda_ramp_epochs', type=int, default=None,
+                        help='default: total target epochs; ramp is zero-based')
 
     # Prototype-consistency regularizer retained from v1/v2.
     parser.add_argument('--proto_weight', type=float, default=0.10,
@@ -80,8 +85,13 @@ def parse_args(argv=None):
 
     parser.add_argument('--rescue_warmup_epochs', type=int, default=3)
     args = parser.parse_args(argv)
-    if not np.isfinite(args.threshold_lambda) or args.threshold_lambda <= 0:
-        parser.error("threshold_lambda must be finite and positive")
+    if args.lambda_ramp_epochs is None:
+        args.lambda_ramp_epochs = max(args.epochs, 1)
+    try:
+        lambda_for_epoch(0, args.lambda_ramp_epochs, args.lambda_start,
+                         args.lambda_end, args.threshold_lambda)
+    except ValueError as error:
+        parser.error(str(error))
     if args.rescue_warmup_epochs < 0:
         parser.error('rescue_warmup_epochs must be nonnegative')
     if args.pre_epochs < 0 or args.epochs < 0:
@@ -140,21 +150,24 @@ def classifier_modulation_loss(model):
 
 
 def calculate_target_thresholds(model, loader, class_num, threshold_lambda):
-    """Mean confidence per predicted class on deterministic original views."""
-    class_sum = torch.zeros(class_num, dtype=torch.float64)
-    class_count = torch.zeros(class_num, dtype=torch.float64)
+    """One shared tau from ALL target train samples, no agreement filtering."""
+    stats = GlobalConfidenceMean()
     model.eval()
     with torch.no_grad():
-        for batch in loader:
-            logits, _ = model(batch[0].cuda(non_blocking=True), None, None,
-                              mode='test', task='target')
-            confidence, predictions = F.softmax(logits, dim=1).cpu().max(dim=1)
-            class_sum.scatter_add_(0, predictions, confidence.double())
-            class_count.scatter_add_(0, predictions, torch.ones_like(confidence, dtype=torch.float64))
-    thresholds, means = scaled_class_thresholds(class_sum, class_count, threshold_lambda)
-    valid = class_count > 0
-    global_mean = means[valid].mean().item() if valid.any() else 0.0
-    return thresholds, means, global_mean
+        for original, augmented, _ in loader:
+            logits1, _ = model(original.cuda(non_blocking=True), None, None,
+                               mode='test', task='target')
+            logits2, _ = model(augmented.cuda(non_blocking=True), None, None,
+                               mode='test', task='target')
+            conf1 = F.softmax(logits1, dim=1).max(dim=1).values
+            conf2 = F.softmax(logits2, dim=1).max(dim=1).values
+            scores = torch.minimum(conf1, conf2)
+            if not torch.isfinite(scores).all():
+                raise RuntimeError('Nonfinite target confidence during threshold scan')
+            stats.add_batch(scores.double().sum().item(), scores.numel())
+    threshold, mean = stats.threshold(threshold_lambda)
+    # The existing selector indexes by class, so broadcast the SAME scalar.
+    return torch.full((class_num,), threshold), mean, stats.count
 
 
 def evaluate(model, loader, criterion, num_samples, epoch, split_name):
@@ -248,20 +261,21 @@ def run_training():
     source_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_raw_medoid_q90_07_or_source_best.pth'
+        + '_globaltau_dynlambda_rawmedoid_q90_07_or_source_best.pth'
     )
     target_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_raw_medoid_q90_07_or_target_best.pth'
+        + '_globaltau_dynlambda_rawmedoid_q90_07_or_target_best.pth'
     )
 
     print('---------------------------------------------------------------------------------------')
-    print('EMA + Original/Augmented + Lambda Mean + Raw Medoid Q90: '
+    print('EMA + Original/Augmented + Global Min Mean + Dynamic Lambda + Raw Medoid Q90: '
           '%s with source %s and target %s' %
           (args.backbone, args.data1, args.data2))
-    print('alpha:%s beta:%s gamma:%s ema:%s threshold_lambda:%s' %
-          (args.w1, args.w2, args.w3, args.ema_decay, args.threshold_lambda))
+    print('alpha:%s beta:%s gamma:%s ema:%s fixed_lambda:%s dynamic_lambda:[%s -> %s] ramp_epochs:%s' %
+          (args.w1, args.w2, args.w3, args.ema_decay, args.threshold_lambda,
+           args.lambda_start, args.lambda_end, args.lambda_ramp_epochs))
     print('prototype weight:%s temp:%s momentum:%s source_anchor:%s warmup:%s ramp:%s' %
           (args.proto_weight, args.proto_temperature, args.proto_momentum,
            args.proto_source_anchor, args.proto_warmup_epochs, args.proto_ramp_epochs))
@@ -298,7 +312,7 @@ def run_training():
     )
     target_threshold = FER(
         args.target_path, phase='train', transform=test_transform,
-        strong_transform=None, basic_aug=False
+        weak2_transform=weak_transform, strong_transform=None, basic_aug=False
     )
     target_val = FER(
         args.target_path, phase='val', transform=test_transform,
@@ -442,8 +456,12 @@ def run_training():
     global_step = 0
 
     for i in range(args.epochs):
-        thresholds, class_mean, global_mean = calculate_target_thresholds(
-            teacher, threshold_loader_target, class_num, args.threshold_lambda,
+        current_lambda = lambda_for_epoch(
+            i, args.lambda_ramp_epochs, args.lambda_start,
+            args.lambda_end, args.threshold_lambda,
+        )
+        thresholds, global_mean, threshold_sample_count = calculate_target_thresholds(
+            teacher, threshold_loader_target, class_num, current_lambda,
         )
         current_proto_weight = prototype_weight_for_epoch(
             i, args.proto_weight, args.proto_warmup_epochs, args.proto_ramp_epochs
@@ -458,10 +476,9 @@ def run_training():
                reliability_bank.memory_labels.numel()))
         enable_knn_rescue = i >= args.rescue_warmup_epochs
 
-        print('[Target Epoch %d] class mean confidence: %s global_mean: %.4f lambda: %.4f' %
-              (i, np.array2string(class_mean.numpy(), precision=4), global_mean, args.threshold_lambda))
-        print('[Target Epoch %d] class-adaptive thresholds: %s' %
-              (i, np.array2string(thresholds.numpy(), precision=4)))
+        print('[Target Epoch %d] Global_Min_Confidence_Mean: %.6f Lambda: %.6f '
+              'Global_Threshold: %.6f Threshold_Sample_Count: %d' %
+              (i, global_mean, current_lambda, thresholds[0].item(), threshold_sample_count))
         print('[Target Epoch %d] Radius/KNN OR rescue enabled: %s' %
               (i, enable_knn_rescue))
 
@@ -696,6 +713,7 @@ if __name__ == '__main__':
     from training_log import training_log
     with training_log():
         run_training()
+
 
 
 
