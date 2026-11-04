@@ -32,7 +32,7 @@ def training_log():
     directory = Path(__file__).resolve().parent / 'logs'
     directory.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().astimezone().strftime('%Y%m%d_%H%M%S_%f')
-    path = directory / ('prototype_radius_%s_%s.log' % (stamp, os.getpid()))
+    path = directory / ('global_medoid_%s_%s.log' % (stamp, os.getpid()))
     stdout, stderr = sys.stdout, sys.stderr
     with path.open('x', encoding='utf-8', buffering=1) as logfile:
         sys.stdout, sys.stderr = Tee(stdout, logfile), Tee(stderr, logfile)
@@ -49,3 +49,4 @@ def training_log():
             sys.stdout.flush()
             sys.stderr.flush()
             sys.stdout, sys.stderr = stdout, stderr
+

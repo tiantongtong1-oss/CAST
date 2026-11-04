@@ -12,7 +12,7 @@ import Networks
 from dataset import RafDataSet, FER
 from ema_utils import create_ema_teacher, select_dual_view_pseudo_labels, update_ema_teacher
 from prototype_utils import FeatureHook, PrototypeBank, prototype_weight_for_epoch
-from prototype_radius import PrototypeRadiusBank
+from global_medoid_radius import GlobalMedoidRadiusBank
 import image_utils as util
 from randaugment import RandAugmentMC
 # 总训练入口与调度器。串起数据、Source 预训练、EMA Teacher、
@@ -296,12 +296,12 @@ def run_training():
     source_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_prototype_radius_top7_07_or_source_best.pth'
+        + '_global_medoid_top7_07_or_source_best.pth'
     )
     target_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_prototype_radius_top7_07_or_target_best.pth'
+        + '_global_medoid_top7_07_or_target_best.pth'
     )
 
     print('---------------------------------------------------------------------------------------')
@@ -316,7 +316,7 @@ def run_training():
     print('prototype weight:%s temp:%s momentum:%s source_anchor:%s warmup:%s ramp:%s' %
           (args.proto_weight, args.proto_temperature, args.proto_momentum,
            args.proto_source_anchor, args.proto_warmup_epochs, args.proto_ramp_epochs))
-    print('OR rescue: top_k=7 scale=0.7; refresh each epoch; source KNN k=11 strict majority')
+    print('OR rescue: one global source medoid; top_k=7 scale=0.7; refresh each epoch; source KNN k=11 strict majority')
     print('---------------------------------------------------------------------------------------')
 
     if args.backbone == 'resnet18':
@@ -486,7 +486,7 @@ def run_training():
     print('source prototype counts: %s' %
           np.array2string(prototype_bank.source_counts.cpu().numpy(), separator=', '))
 
-    reliability_bank = PrototypeRadiusBank(
+    reliability_bank = GlobalMedoidRadiusBank(
         prototype_bank.source_prototypes, prototype_bank.source_initialized
     ).cuda()
     best_target_val_acc = -1.0
@@ -510,8 +510,10 @@ def run_training():
             teacher, teacher_feature_hook, prototype_loader_source,
             reliability_bank, prototype_bank,
         )
-        print('[Target Epoch %d] Source radii: %s Source memory: %d' %
-              (i, reliability_bank.radii.cpu().tolist(), reliability_bank.memory_labels.numel()))
+        print('[Target Epoch %d] Global_R: %.8f Cutoff_07R: %.8f Medoid_Memory_Row: %d Ready: %s Source_Memory: %d' %
+              (i, reliability_bank.global_radius.item(), 0.7 * reliability_bank.global_radius.item(),
+               reliability_bank.medoid_memory_index.item(), reliability_bank.global_ready.item(),
+               reliability_bank.memory_labels.numel()))
         enable_knn_rescue = i >= args.rescue_warmup_epochs
 
         print('[Target Epoch %d] class mean confidence: %s global_mean: %.4f '
@@ -757,6 +759,7 @@ if __name__ == '__main__':
     from training_log import training_log
     with training_log():
         run_training()
+
 
 
 
