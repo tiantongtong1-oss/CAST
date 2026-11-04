@@ -12,7 +12,7 @@ import Networks
 from dataset import RafDataSet, FER
 from ema_utils import create_ema_teacher, select_dual_view_pseudo_labels, update_ema_teacher
 from prototype_utils import FeatureHook, PrototypeBank, prototype_weight_for_epoch
-from global_medoid_radius import GlobalMedoidRadiusBank
+from raw_medoid_quantile import RawMedoidQuantileBank, scaled_class_thresholds
 import image_utils as util
 from randaugment import RandAugmentMC
 # 总训练入口与调度器。串起数据、Source 预训练、EMA Teacher、
@@ -61,16 +61,8 @@ def parse_args(argv=None):
                              'not used by the stable relative threshold')
     parser.add_argument('--ema_decay', type=float, default=0.999,
                         help='fixed EMA decay for teacher parameters and floating buffers')
-    parser.add_argument('--threshold_base', type=float, default=0.85,
-                        help='minimum global center of the adaptive threshold')
-    parser.add_argument('--threshold_beta', type=float, default=0.5,
-                        help='strength of per-class confidence deviation')
-    parser.add_argument('--threshold_margin', type=float, default=0.02,
-                        help='margin added above teacher global mean confidence')
-    parser.add_argument('--threshold_min', type=float, default=0.80,
-                        help='minimum class-adaptive threshold')
-    parser.add_argument('--threshold_max', type=float, default=0.95,
-                        help='maximum class-adaptive threshold')
+    parser.add_argument('--threshold_lambda', type=float, default=1.0,
+                        help='tau[c] = lambda * class mean original-view confidence')
 
     # Prototype-consistency regularizer retained from v1/v2.
     parser.add_argument('--proto_weight', type=float, default=0.10,
@@ -88,6 +80,8 @@ def parse_args(argv=None):
 
     parser.add_argument('--rescue_warmup_epochs', type=int, default=3)
     args = parser.parse_args(argv)
+    if not np.isfinite(args.threshold_lambda) or args.threshold_lambda <= 0:
+        parser.error("threshold_lambda must be finite and positive")
     if args.rescue_warmup_epochs < 0:
         parser.error('rescue_warmup_epochs must be nonnegative')
     if args.pre_epochs < 0 or args.epochs < 0:
@@ -145,64 +139,22 @@ def classifier_modulation_loss(model):
     return torch.mean((matrix + 1.0) / 2.0)
 
 
-def calculate_target_thresholds(model, loader, class_num, threshold_base,
-                                threshold_beta, threshold_margin,
-                                threshold_min, threshold_max):
-
-    # EMA Teacher 扫描整个target train，根据各预测类别平均confidence 生成类别自适应置信度阈值
-
+def calculate_target_thresholds(model, loader, class_num, threshold_lambda):
+    """Mean confidence per predicted class on deterministic original views."""
     class_sum = torch.zeros(class_num, dtype=torch.float64)
-    # 记录每个预测类别包含的样本数量
     class_count = torch.zeros(class_num, dtype=torch.float64)
-    # 切换到评估模式，关闭 Dropout、固定 BatchNorm 等
     model.eval()
-
-    # 这里只进行推理，不计算梯度，减少显存和计算开销
     with torch.no_grad():
         for batch in loader:
-            imgs = batch[0].cuda(non_blocking=True)
-
-            # 使用模型对目标域图像进行预测
-            # logits：分类输出
-            # _：其他不需要使用的输出
-            logits, _ = model(imgs, None, None, mode='test', task='target')
-
-            #转化成类别概率
-            probs = F.softmax(logits, dim=1).cpu()
-            # 获取每个样本的最大预测概率和对应预测类别
-            # max_prob：模型预测的最高置信度
-            # pred_label：最高置信度对应的类别
-            max_prob, pred_label = torch.max(probs, dim=1)
-
-            class_sum.scatter_add_(0, pred_label, max_prob.double())
-            class_count.scatter_add_(
-                0, pred_label, torch.ones_like(max_prob, dtype=torch.float64)
-            )
-
+            logits, _ = model(batch[0].cuda(non_blocking=True), None, None,
+                              mode='test', task='target')
+            confidence, predictions = F.softmax(logits, dim=1).cpu().max(dim=1)
+            class_sum.scatter_add_(0, predictions, confidence.double())
+            class_count.scatter_add_(0, predictions, torch.ones_like(confidence, dtype=torch.float64))
+    thresholds, means = scaled_class_thresholds(class_sum, class_count, threshold_lambda)
     valid = class_count > 0
-    class_mean = class_sum / class_count.clamp_min(1.0)
-    if torch.any(valid):
-        global_mean = class_mean[valid].mean()
-    else:
-        global_mean = class_mean.new_tensor(float(threshold_base))
-
-    threshold_center = max(
-        float(threshold_base),
-        float(global_mean.item()) + float(threshold_margin),
-    )
-    threshold_center = min(threshold_center, float(threshold_max))
-
-    thresholds = threshold_center + threshold_beta * (class_mean - global_mean)
-    thresholds = torch.clamp(
-        thresholds, min=threshold_min, max=threshold_max
-    ).float()
-    thresholds[~valid] = float(threshold_max)
-    return (
-        thresholds,
-        class_mean.float(),
-        float(global_mean.item()),
-        float(threshold_center),
-    )
+    global_mean = means[valid].mean().item() if valid.any() else 0.0
+    return thresholds, means, global_mean
 
 
 def evaluate(model, loader, criterion, num_samples, epoch, split_name):
@@ -296,27 +248,24 @@ def run_training():
     source_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_global_medoid_top7_07_or_source_best.pth'
+        + '_raw_medoid_q90_07_or_source_best.pth'
     )
     target_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_global_medoid_top7_07_or_target_best.pth'
+        + '_raw_medoid_q90_07_or_target_best.pth'
     )
 
     print('---------------------------------------------------------------------------------------')
-    print('EMA + Dual View + Stable CAT + Class Prototype Radius: '
+    print('EMA + Original/Augmented + Lambda Mean + Raw Medoid Q90: '
           '%s with source %s and target %s' %
           (args.backbone, args.data1, args.data2))
-    print('alpha(w1):%s beta(w2):%s gamma(w3):%s ema:%s '
-          'tau0:%s threshold_beta:%s margin:%s threshold_range:[%s,%s]' %
-          (args.w1, args.w2, args.w3, args.ema_decay,
-           args.threshold_base, args.threshold_beta, args.threshold_margin,
-           args.threshold_min, args.threshold_max))
+    print('alpha:%s beta:%s gamma:%s ema:%s threshold_lambda:%s' %
+          (args.w1, args.w2, args.w3, args.ema_decay, args.threshold_lambda))
     print('prototype weight:%s temp:%s momentum:%s source_anchor:%s warmup:%s ramp:%s' %
           (args.proto_weight, args.proto_temperature, args.proto_momentum,
            args.proto_source_anchor, args.proto_warmup_epochs, args.proto_ramp_epochs))
-    print('OR rescue: one global source medoid; top_k=7 scale=0.7; refresh each epoch; source KNN k=11 strict majority')
+    print('OR rescue: one raw-feature source medoid; quantile=0.90 scale=0.7; refresh each epoch; source KNN k=11 strict majority')
     print('---------------------------------------------------------------------------------------')
 
     if args.backbone == 'resnet18':
@@ -343,12 +292,12 @@ def run_training():
     )
 
     target_train = FER(
-        args.target_path, phase='train', transform=weak_transform,
+        args.target_path, phase='train', transform=test_transform,
         weak2_transform=weak_transform, strong_transform=strong_transform,
         basic_aug=False, return_index=True
     )
     target_threshold = FER(
-        args.target_path, phase='train', transform=weak_transform,
+        args.target_path, phase='train', transform=test_transform,
         strong_transform=None, basic_aug=False
     )
     target_val = FER(
@@ -486,22 +435,15 @@ def run_training():
     print('source prototype counts: %s' %
           np.array2string(prototype_bank.source_counts.cpu().numpy(), separator=', '))
 
-    reliability_bank = GlobalMedoidRadiusBank(
+    reliability_bank = RawMedoidQuantileBank(
         prototype_bank.source_prototypes, prototype_bank.source_initialized
     ).cuda()
     best_target_val_acc = -1.0
     global_step = 0
 
     for i in range(args.epochs):
-        thresholds, class_mean, global_mean, threshold_center = calculate_target_thresholds(
-            teacher,
-            threshold_loader_target,
-            class_num,
-            args.threshold_base,
-            args.threshold_beta,
-            args.threshold_margin,
-            args.threshold_min,
-            args.threshold_max,
+        thresholds, class_mean, global_mean = calculate_target_thresholds(
+            teacher, threshold_loader_target, class_num, args.threshold_lambda,
         )
         current_proto_weight = prototype_weight_for_epoch(
             i, args.proto_weight, args.proto_warmup_epochs, args.proto_ramp_epochs
@@ -516,10 +458,8 @@ def run_training():
                reliability_bank.memory_labels.numel()))
         enable_knn_rescue = i >= args.rescue_warmup_epochs
 
-        print('[Target Epoch %d] class mean confidence: %s global_mean: %.4f '
-              'threshold_center: %.4f' %
-              (i, np.array2string(class_mean.numpy(), precision=4),
-               global_mean, threshold_center))
+        print('[Target Epoch %d] class mean confidence: %s global_mean: %.4f lambda: %.4f' %
+              (i, np.array2string(class_mean.numpy(), precision=4), global_mean, args.threshold_lambda))
         print('[Target Epoch %d] class-adaptive thresholds: %s' %
               (i, np.array2string(thresholds.numpy(), precision=4)))
         print('[Target Epoch %d] Radius/KNN OR rescue enabled: %s' %
@@ -546,33 +486,30 @@ def run_training():
         pseudo_distribution_rescued = np.zeros(class_num, dtype=np.int64)
         pseudo_distribution_final = np.zeros(class_num, dtype=np.int64)
 
-        for weak1, weak2, strong, _, sample_ids in train_loader_target:
+        for original, augmented, strong, _, sample_ids in train_loader_target:
             try:
                 source_imgs, source_targets = next(source_train_iter)
             except StopIteration:
                 source_train_iter = iter(train_loader_source)
                 source_imgs, source_targets = next(source_train_iter)
 
-            weak1 = weak1.cuda(non_blocking=True)
-            weak2 = weak2.cuda(non_blocking=True)
+            original = original.cuda(non_blocking=True)
+            augmented = augmented.cuda(non_blocking=True)
             strong = strong.cuda(non_blocking=True)
 
             teacher.eval()
-            # 用EMA Teacher对目标域样本的两个弱增强视图进行预测，生成伪标签，并提取一个融合后的teacher 特征，供后面的
+            # Teacher predicts deterministic original + weak augmentation; original raw features serve
             # kNN可靠性判断和prototype更新使用
             with torch.no_grad():
-                logits1, _ = teacher(weak1, None, None, 'test', 'target')
+                logits1, _ = teacher(original, None, None, 'test', 'target')
                 teacher_features1 = teacher_feature_hook.output.detach()
-                logits2, _ = teacher(weak2, None, None, 'test', 'target')
+                logits2, _ = teacher(augmented, None, None, 'test', 'target')
                 teacher_features2 = teacher_feature_hook.output.detach()
                 pseudo_targets, confidence_idx, agree_count = select_dual_view_pseudo_labels(
                     logits1, logits2, thresholds
                 )
-                teacher_mean_features = F.normalize(
-                    F.normalize(teacher_features1, dim=1)
-                    + F.normalize(teacher_features2, dim=1),
-                    dim=1,
-                )
+                # Original-view RAW features only. No view sum or L2 normalization.
+                teacher_reference_features = teacher_features1
 
                 # 传统的高置信度伪标签
                 confidence_mask = confidence_idx.bool()
@@ -583,7 +520,7 @@ def run_training():
                 )
                 final_mask, radius_rescue_mask, neighbor_rescue_mask, neighbor_checked = (
                     reliability_bank.select(
-                        teacher_mean_features, pseudo_targets, confidence_mask,
+                        teacher_reference_features, pseudo_targets, confidence_mask,
                         agreement_mask, enable_knn_rescue,
                     )
                 )
@@ -594,7 +531,7 @@ def run_training():
                 # 评估函数，用来统计在“可靠样本”上，模型特征与原型之间的预测一致性和相似度，会只检查 con_idx=1 的最终可靠目标样本
                 proto_agree, proto_checked, proto_similarity = (
                     prototype_bank.agreement_stats(
-                        teacher_mean_features, pseudo_targets, con_idx
+                        teacher_reference_features, pseudo_targets, con_idx
                     )
                 )
             # 统计当前epoch中不同阶段一共接纳了多少目标样本
@@ -674,7 +611,7 @@ def run_training():
             update_ema_teacher(teacher, model, args.ema_decay, global_step)
             # 这是更新目标域prototype
             prototype_bank.update_target(
-                teacher_mean_features, pseudo_targets, con_idx
+                teacher_reference_features, pseudo_targets, con_idx
             )
 
             train_loss1 += cls_loss.item()
@@ -759,6 +696,7 @@ if __name__ == '__main__':
     from training_log import training_log
     with training_log():
         run_training()
+
 
 
 
