@@ -76,6 +76,24 @@ class RawMedoidQuantileBank(GlobalMedoidRadiusBank):
         return passed, checked
 
 
+    @torch.no_grad()
+    def select(self, features, labels, confidence_mask, agreement_mask, enabled):
+        """Require kNN after confidence OR radius; enabled controls radius warmup only.
+
+        Returns final acceptance, accepted radius rescues, kNN passes and checks.
+        kNN is mandatory from epoch zero, including for high-confidence samples.
+        """
+        direct = confidence_mask.bool() & agreement_mask.bool()
+        radius = torch.zeros_like(direct)
+        if enabled:
+            candidates = agreement_mask.bool() & ~direct
+            radius = candidates & self.accepts(features, labels)
+        eligible = direct | radius
+        neighbor, checked = self.neighbor_accepts(features, labels, eligible)
+        final = eligible & neighbor & checked
+        return final, radius & final, final, checked
+
+
 def scaled_class_thresholds(class_sum, class_count, threshold_lambda):
     """tau[c] = lambda * mean original-view max confidence for predicted class c.
 

@@ -261,12 +261,12 @@ def run_training():
     source_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_globaltau_dynlambda_normmedoid_q90_r_or_source_best.pth'
+        + '_globaltau_dynlambda_normmedoid_q90_r_thenknn_source_best.pth'
     )
     target_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_globaltau_dynlambda_normmedoid_q90_r_or_target_best.pth'
+        + '_globaltau_dynlambda_normmedoid_q90_r_thenknn_target_best.pth'
     )
 
     print('---------------------------------------------------------------------------------------')
@@ -279,7 +279,7 @@ def run_training():
     print('prototype weight:%s temp:%s momentum:%s source_anchor:%s warmup:%s ramp:%s' %
           (args.proto_weight, args.proto_temperature, args.proto_momentum,
            args.proto_source_anchor, args.proto_warmup_epochs, args.proto_ramp_epochs))
-    print('OR rescue: L2-normalized source/target radius gate; quantile=0.90 scale=1.0; refresh each epoch; raw source KNN k=11 strict majority')
+    print('Confidence OR normalized radius, THEN mandatory raw KNN k=11 strict majority; radius Q90 scale=1.0; refresh each epoch; KNN active from epoch 0')
     print('---------------------------------------------------------------------------------------')
 
     if args.backbone == 'resnet18':
@@ -480,15 +480,15 @@ def run_training():
               (i, reliability_bank.global_radius.item(), reliability_bank.global_radius.item(),
                reliability_bank.medoid_memory_index.item(), reliability_bank.global_ready.item(),
                reliability_bank.memory_labels.numel()))
-        enable_knn_rescue = i >= args.rescue_warmup_epochs
+        enable_radius_rescue = i >= args.rescue_warmup_epochs
 
         print('[Target Epoch %d] Global_Min_Confidence_Mean: %.6f Lambda: %.6f '
               'Raw_Global_Threshold: %.6f EMA_Momentum: 0.8 '
               'Global_Threshold: %.6f Threshold_Sample_Count: %d' %
               (i, global_mean, current_lambda, raw_global_threshold,
                thresholds[0].item(), threshold_sample_count))
-        print('[Target Epoch %d] Radius/KNN OR rescue enabled: %s' %
-              (i, enable_knn_rescue))
+        print('[Target Epoch %d] Radius fallback enabled (KNN always required): %s' %
+              (i, enable_radius_rescue))
 
         model.train()
         source_train_iter = iter(train_loader_source)
@@ -500,7 +500,7 @@ def run_training():
         agreement_num = 0
         confidence_accept_num = 0
         radius_rescue_num = 0
-        neighbor_rescue_num = 0
+        knn_pass_num = 0
         knn_rescue_num = 0
         final_accept_num = 0
         knn_checked_num = 0
@@ -543,13 +543,13 @@ def run_training():
                 agreement_mask = torch.argmax(logits1, dim=1).eq(
                     torch.argmax(logits2, dim=1)
                 )
-                final_mask, radius_rescue_mask, neighbor_rescue_mask, neighbor_checked = (
+                final_mask, radius_rescue_mask, knn_pass_mask, neighbor_checked = (
                     reliability_bank.select(
                         teacher_reference_features, pseudo_targets, confidence_mask,
-                        agreement_mask, enable_knn_rescue,
+                        agreement_mask, enable_radius_rescue,
                     )
                 )
-                rescue_mask = radius_rescue_mask | neighbor_rescue_mask
+                rescue_mask = radius_rescue_mask
                 # Networks.forward selects idx == 1: retain a binary mask here.
                 con_idx = final_mask.float()
 
@@ -563,7 +563,7 @@ def run_training():
             agreement_num += agree_count
             confidence_accept_num += int(confidence_mask.sum().item())
             radius_rescue_num += int(radius_rescue_mask.sum().item())
-            neighbor_rescue_num += int(neighbor_rescue_mask.sum().item())
+            knn_pass_num += int(knn_pass_mask.sum().item())
             knn_checked_num += int(neighbor_checked.sum().item())
             knn_rescue_num += int(rescue_mask.sum().item())
             final_accept_num += int(final_mask.sum().item())
@@ -655,12 +655,12 @@ def run_training():
             prototype_similarity_sum / float(prototype_checked_num)
             if prototype_checked_num > 0 else 0.0
         )
-        print('[Target Epoch %d] Agreement_Num: %d Confidence_Accept_Num: %d '
-              'Radius_Rescue_Num: %d Neighbor_Rescue_Num: %d Rescue_Num: %d '
+        print('[Target Epoch %d] Agreement_Num: %d Confidence_Candidate_Num: %d '
+              'Radius_Rescue_Num: %d KNN_Pass_Num: %d Rescue_Num: %d '
               'Neighbor_Checked_Num: %d Final_Accept_Num: %d' %
               (i, agreement_num, confidence_accept_num, radius_rescue_num,
-               neighbor_rescue_num, knn_rescue_num, knn_checked_num, final_accept_num))
-        print('[Target Epoch %d] Pseudo_Distribution_Confidence: %s' %
+               knn_pass_num, knn_rescue_num, knn_checked_num, final_accept_num))
+        print('[Target Epoch %d] Pseudo_Distribution_Confidence_Candidates: %s' %
               (i, np.array2string(pseudo_distribution_confidence, separator=', ')))
         print('[Target Epoch %d] Pseudo_Distribution_Rescued: %s' %
               (i, np.array2string(pseudo_distribution_rescued, separator=', ')))
