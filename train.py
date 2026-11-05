@@ -12,7 +12,7 @@ import Networks
 from dataset import RafDataSet, FER
 from ema_utils import create_ema_teacher, select_dual_view_pseudo_labels, update_ema_teacher
 from prototype_utils import FeatureHook, PrototypeBank, prototype_weight_for_epoch
-from raw_medoid_quantile import RawMedoidQuantileBank
+from target_knn import TargetKNNBank
 from global_threshold import lambda_for_epoch, GlobalConfidenceMean, smooth_global_threshold
 import image_utils as util
 from randaugment import RandAugmentMC
@@ -83,7 +83,8 @@ def parse_args(argv=None):
     parser.add_argument('--proto_ramp_epochs', type=int, default=5,
                         help='epochs used to linearly ramp prototype loss to full weight')
 
-    parser.add_argument('--rescue_warmup_epochs', type=int, default=3)
+    parser.add_argument('--rescue_warmup_epochs', type=int, default=30,
+                        help='legacy compatibility only; R is always disabled in this branch')
     args = parser.parse_args(argv)
     if args.lambda_ramp_epochs is None:
         args.lambda_ramp_epochs = max(args.epochs, 1)
@@ -149,16 +150,21 @@ def classifier_modulation_loss(model):
     return torch.mean((matrix + 1.0) / 2.0)
 
 
-def calculate_target_thresholds(model, loader, class_num, threshold_lambda):
+def calculate_target_thresholds(model, loader, class_num, threshold_lambda, feature_hook):
     """One shared tau from ALL target train samples, no agreement filtering."""
     stats = GlobalConfidenceMean()
+    memory_features, memory_predictions, memory_ids = [], [], []
     model.eval()
     with torch.no_grad():
-        for original, augmented, _ in loader:
+        for original, augmented, _, sample_ids in loader:
             logits1, _ = model(original.cuda(non_blocking=True), None, None,
                                mode='test', task='target')
+            original_features = feature_hook.output.detach().cpu()
             logits2, _ = model(augmented.cuda(non_blocking=True), None, None,
                                mode='test', task='target')
+            memory_features.append(original_features)
+            memory_predictions.append(logits1.argmax(dim=1).cpu())
+            memory_ids.append(sample_ids.cpu())
             conf1 = F.softmax(logits1, dim=1).max(dim=1).values
             conf2 = F.softmax(logits2, dim=1).max(dim=1).values
             scores = torch.minimum(conf1, conf2)
@@ -167,7 +173,8 @@ def calculate_target_thresholds(model, loader, class_num, threshold_lambda):
             stats.add_batch(scores.double().sum().item(), scores.numel())
     threshold, mean = stats.threshold(threshold_lambda)
     # The existing selector indexes by class, so broadcast the SAME scalar.
-    return torch.full((class_num,), threshold), mean, stats.count
+    return (torch.full((class_num,), threshold), mean, stats.count,
+            (torch.cat(memory_features), torch.cat(memory_predictions), torch.cat(memory_ids)))
 
 
 def evaluate(model, loader, criterion, num_samples, epoch, split_name):
@@ -236,21 +243,22 @@ def initialize_source_prototypes(teacher, feature_hook, loader, prototype_bank):
 
 
 @torch.no_grad()
-def refresh_source_rescue(teacher, feature_hook, loader, radius_bank, prototype_bank):
-    """Rebuild all source references in the current teacher feature space."""
+def refresh_source_prototypes(teacher, feature_hook, loader, prototype_bank):
+    """Refresh source angular prototypes only; no medoid or radius computation."""
     teacher.eval()
     device = next(teacher.parameters()).device
-    features, labels = [], []
+    prototype_bank.source_feature_sums.zero_()
+    prototype_bank.source_counts.zero_()
+    prototype_bank.source_initialized.zero_()
+    prototype_bank.source_prototypes.zero_()
     for imgs, targets in loader:
         teacher(imgs.to(device), None, None, mode='test', task='source')
-        features.append(feature_hook.output.detach().cpu())
-        labels.append(targets.cpu())
-    if not features:
-        raise RuntimeError('Source loader is empty')
-    radius_bank.set_source_memory(torch.cat(features), torch.cat(labels))
-    prototype_bank.source_prototypes.copy_(radius_bank.prototypes)
-    prototype_bank.source_initialized.copy_(radius_bank.initialized)
-    prototype_bank.source_counts.copy_(radius_bank.counts)
+        features = feature_hook.output.detach()
+        targets = targets.to(device)
+        valid = torch.isfinite(features).all(dim=1) & (features.norm(dim=1) > 1e-8)
+        valid &= (targets >= 0) & (targets < prototype_bank.num_classes)
+        prototype_bank.accumulate_source(features[valid], targets[valid])
+    prototype_bank.finalize_source()
 
 
 def run_training():
@@ -261,16 +269,16 @@ def run_training():
     source_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_globaltau_dynlambda_normmedoid_q90_r_thenknn_source_best.pth'
+        + '_globaltau_targetknn_nor_source_best.pth'
     )
     target_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_globaltau_dynlambda_normmedoid_q90_r_thenknn_target_best.pth'
+        + '_globaltau_targetknn_nor_target_best.pth'
     )
 
     print('---------------------------------------------------------------------------------------')
-    print('EMA + Original/Augmented + Global Min Mean + Dynamic Lambda + L2-Normalized Medoid Q90: '
+    print('EMA + Original/Augmented + Global Min Mean + Target-only KNN + No R: '
           '%s with source %s and target %s' %
           (args.backbone, args.data1, args.data2))
     print('alpha:%s beta:%s gamma:%s ema:%s fixed_lambda:%s dynamic_lambda:[%s -> %s] ramp_epochs:%s' %
@@ -279,7 +287,7 @@ def run_training():
     print('prototype weight:%s temp:%s momentum:%s source_anchor:%s warmup:%s ramp:%s' %
           (args.proto_weight, args.proto_temperature, args.proto_momentum,
            args.proto_source_anchor, args.proto_warmup_epochs, args.proto_ramp_epochs))
-    print('Confidence OR normalized radius, THEN mandatory raw KNN k=11 strict majority; radius Q90 scale=1.0; refresh each epoch; KNN active from epoch 0')
+    print('Target-only raw Euclidean KNN k=11 strict majority; exclude self by ID; refresh each epoch; R disabled')
     print('---------------------------------------------------------------------------------------')
 
     if args.backbone == 'resnet18':
@@ -312,7 +320,7 @@ def run_training():
     )
     target_threshold = FER(
         args.target_path, phase='train', transform=test_transform,
-        weak2_transform=weak_transform, strong_transform=None, basic_aug=False
+        weak2_transform=weak_transform, strong_transform=None, basic_aug=False, return_index=True
     )
     target_val = FER(
         args.target_path, phase='val', transform=test_transform,
@@ -322,6 +330,9 @@ def run_training():
         args.target_path, phase='test', transform=test_transform,
         strong_transform=None
     )
+
+    if target_train.file_paths != target_threshold.file_paths:
+        raise RuntimeError('Target memory and training IDs must have identical path ordering')
 
     class_num = 7
 
@@ -449,9 +460,7 @@ def run_training():
     print('source prototype counts: %s' %
           np.array2string(prototype_bank.source_counts.cpu().numpy(), separator=', '))
 
-    reliability_bank = RawMedoidQuantileBank(
-        prototype_bank.source_prototypes, prototype_bank.source_initialized
-    ).cuda()
+    reliability_bank = TargetKNNBank(model.fc.in_features, class_num).cuda()
     best_target_val_acc = -1.0
     global_step = 0
     previous_global_threshold = None
@@ -461,8 +470,8 @@ def run_training():
             i, args.lambda_ramp_epochs, args.lambda_start,
             args.lambda_end, args.threshold_lambda,
         )
-        thresholds, global_mean, threshold_sample_count = calculate_target_thresholds(
-            teacher, threshold_loader_target, class_num, current_lambda,
+        thresholds, global_mean, threshold_sample_count, target_memory = calculate_target_thresholds(
+            teacher, threshold_loader_target, class_num, current_lambda, teacher_feature_hook,
         )
         raw_global_threshold = current_lambda * global_mean
         previous_global_threshold = smooth_global_threshold(
@@ -472,23 +481,20 @@ def run_training():
         current_proto_weight = prototype_weight_for_epoch(
             i, args.proto_weight, args.proto_warmup_epochs, args.proto_ramp_epochs
         )
-        refresh_source_rescue(
-            teacher, teacher_feature_hook, prototype_loader_source,
-            reliability_bank, prototype_bank,
+        refresh_source_prototypes(
+            teacher, teacher_feature_hook, prototype_loader_source, prototype_bank,
         )
-        print('[Target Epoch %d] Global_R: %.8f Cutoff_R: %.8f Medoid_Memory_Row: %d Ready: %s Source_Memory: %d' %
-              (i, reliability_bank.global_radius.item(), reliability_bank.global_radius.item(),
-               reliability_bank.medoid_memory_index.item(), reliability_bank.global_ready.item(),
-               reliability_bank.memory_labels.numel()))
-        enable_radius_rescue = i >= args.rescue_warmup_epochs
+        reliability_bank.set_target_memory(*target_memory)
+        del target_memory
+        print('[Target Epoch %d] Target_KNN_Memory: %d R_Disabled: True' %
+              (i, reliability_bank.memory_ids.numel()))
 
         print('[Target Epoch %d] Global_Min_Confidence_Mean: %.6f Lambda: %.6f '
               'Raw_Global_Threshold: %.6f EMA_Momentum: 0.8 '
               'Global_Threshold: %.6f Threshold_Sample_Count: %d' %
               (i, global_mean, current_lambda, raw_global_threshold,
                thresholds[0].item(), threshold_sample_count))
-        print('[Target Epoch %d] Radius fallback enabled (KNN always required): %s' %
-              (i, enable_radius_rescue))
+        print('Target KNN mandatory from epoch 0; --rescue_warmup_epochs ignored (no R)')
 
         model.train()
         source_train_iter = iter(train_loader_source)
@@ -533,7 +539,7 @@ def run_training():
                 pseudo_targets, confidence_idx, agree_count = select_dual_view_pseudo_labels(
                     logits1, logits2, thresholds
                 )
-                # Keep original-view raw features here; the radius gate normalizes its own copy.
+                # Original-view RAW features for target-only Euclidean kNN.
                 teacher_reference_features = teacher_features1
 
                 # 传统的高置信度伪标签
@@ -543,12 +549,14 @@ def run_training():
                 agreement_mask = torch.argmax(logits1, dim=1).eq(
                     torch.argmax(logits2, dim=1)
                 )
-                final_mask, radius_rescue_mask, knn_pass_mask, neighbor_checked = (
+                final_mask, neighbor_checked = (
                     reliability_bank.select(
                         teacher_reference_features, pseudo_targets, confidence_mask,
-                        agreement_mask, enable_radius_rescue,
+                        agreement_mask, sample_ids,
                     )
                 )
+                radius_rescue_mask = torch.zeros_like(final_mask)
+                knn_pass_mask = final_mask
                 rescue_mask = radius_rescue_mask
                 # Networks.forward selects idx == 1: retain a binary mask here.
                 con_idx = final_mask.float()
