@@ -13,7 +13,7 @@ from dataset import RafDataSet, FER
 from ema_utils import create_ema_teacher, select_dual_view_pseudo_labels, update_ema_teacher
 from prototype_utils import FeatureHook, PrototypeBank, prototype_weight_for_epoch
 from raw_medoid_quantile import RawMedoidQuantileBank
-from global_threshold import lambda_for_epoch, GlobalConfidenceMean
+from global_threshold import lambda_for_epoch, GlobalConfidenceMean, smooth_global_threshold
 import image_utils as util
 from randaugment import RandAugmentMC
 # 总训练入口与调度器。串起数据、Source 预训练、EMA Teacher、
@@ -454,6 +454,7 @@ def run_training():
     ).cuda()
     best_target_val_acc = -1.0
     global_step = 0
+    previous_global_threshold = None
 
     for i in range(args.epochs):
         current_lambda = lambda_for_epoch(
@@ -463,6 +464,11 @@ def run_training():
         thresholds, global_mean, threshold_sample_count = calculate_target_thresholds(
             teacher, threshold_loader_target, class_num, current_lambda,
         )
+        raw_global_threshold = current_lambda * global_mean
+        previous_global_threshold = smooth_global_threshold(
+            raw_global_threshold, previous_global_threshold, momentum=0.8,
+        )
+        thresholds.fill_(previous_global_threshold)
         current_proto_weight = prototype_weight_for_epoch(
             i, args.proto_weight, args.proto_warmup_epochs, args.proto_ramp_epochs
         )
@@ -477,8 +483,10 @@ def run_training():
         enable_knn_rescue = i >= args.rescue_warmup_epochs
 
         print('[Target Epoch %d] Global_Min_Confidence_Mean: %.6f Lambda: %.6f '
+              'Raw_Global_Threshold: %.6f EMA_Momentum: 0.8 '
               'Global_Threshold: %.6f Threshold_Sample_Count: %d' %
-              (i, global_mean, current_lambda, thresholds[0].item(), threshold_sample_count))
+              (i, global_mean, current_lambda, raw_global_threshold,
+               thresholds[0].item(), threshold_sample_count))
         print('[Target Epoch %d] Radius/KNN OR rescue enabled: %s' %
               (i, enable_knn_rescue))
 
@@ -713,6 +721,7 @@ if __name__ == '__main__':
     from training_log import training_log
     with training_log():
         run_training()
+
 
 
 

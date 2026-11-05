@@ -1,5 +1,5 @@
 import unittest
-from global_threshold import lambda_for_epoch, GlobalConfidenceMean
+from global_threshold import lambda_for_epoch, GlobalConfidenceMean, smooth_global_threshold
 
 
 class GlobalThresholdTests(unittest.TestCase):
@@ -29,5 +29,24 @@ class GlobalThresholdTests(unittest.TestCase):
                 lambda_for_epoch(**config)
 
 
+class ThresholdEMATests(unittest.TestCase):
+    def test_first_epoch_has_no_zero_initialization_bias(self):
+        self.assertEqual(smooth_global_threshold(.7), .7)
+
+    def test_previous_smoothed_threshold_is_reused(self):
+        first = smooth_global_threshold(.6)
+        second = smooth_global_threshold(.8, first)
+        third = smooth_global_threshold(.5, second)
+        self.assertAlmostEqual(second, .64)
+        self.assertAlmostEqual(third, .612)
+
+    def test_constant_threshold_and_invalid_inputs(self):
+        self.assertAlmostEqual(smooth_global_threshold(.7, .7), .7)
+        for raw, previous, momentum in ((float('nan'),None,.8),(.7,float('inf'),.8),(.7,.6,1.)):
+            with self.assertRaises(ValueError):
+                smooth_global_threshold(raw, previous, momentum)
+
+
 if __name__ == '__main__':
     unittest.main()
+

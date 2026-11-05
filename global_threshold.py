@@ -36,3 +36,17 @@ class GlobalConfidenceMean:
             raise ValueError('target threshold loader is empty')
         mean = self.total / self.count
         return float(scale) * mean, mean
+
+
+
+def smooth_global_threshold(raw_threshold, previous=None, momentum=0.8):
+    """EMA of thresholds across epochs; first epoch uses its raw value directly."""
+    if not math.isfinite(raw_threshold) or raw_threshold < 0:
+        raise ValueError('raw threshold must be finite and nonnegative')
+    if not math.isfinite(momentum) or not 0 <= momentum < 1:
+        raise ValueError('momentum must be in [0,1)')
+    if previous is None:
+        return float(raw_threshold)
+    if not math.isfinite(previous) or previous < 0:
+        raise ValueError('previous threshold must be finite and nonnegative')
+    return float(momentum * previous + (1.0 - momentum) * raw_threshold)
