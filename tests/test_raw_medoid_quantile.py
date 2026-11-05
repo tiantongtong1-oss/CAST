@@ -19,17 +19,45 @@ class RawQuantileTests(unittest.TestCase):
         bank.set_source_memory(features, torch.tensor([0, 0, 1, 1, 1]))
         return bank, features
 
-    def test_raw_medoid_and_q90(self):
-        bank, features = self.bank()
-        torch.testing.assert_close(bank.memory_features, features)
-        torch.testing.assert_close(bank.medoid, features[2])
-        distances = torch.tensor([2., 1., 0., 1., 5.], dtype=torch.float64)
+    def test_normalized_medoid_and_q90_preserve_raw_memory(self):
+        bank, _ = self.bank()
+        angles = torch.tensor([-60., -20., 0., 30., 100.], dtype=torch.float64)
+        angles = angles * (torch.pi / 180)
+        unit = torch.stack((angles.cos(), angles.sin()), dim=1)
+        features = unit * torch.tensor([1., 2., 3., 4., 8.])[:, None]
+        bank.set_source_memory(features, torch.tensor([0, 0, 1, 1, 1]))
+        torch.testing.assert_close(bank.memory_features, features.float())
+        self.assertEqual(bank.medoid_memory_index.item(), 2)
+        torch.testing.assert_close(bank.medoid, torch.tensor([1., 0.]))
+        normalized = torch.nn.functional.normalize(features.float(), dim=1).double()
+        distances = (normalized - normalized[2]).norm(dim=1)
         torch.testing.assert_close(bank.global_radius, torch.quantile(distances, .9).float())
-        self.assertTrue(bank.accepts(torch.tensor([[3., 0.]]), torch.tensor([0])).item())
-        self.assertFalse(bank.accepts(torch.tensor([[8., 0.]]), torch.tensor([0])).item())
-        # Same direction, different length: angular normalization would collapse these.
+        # Changing source magnitudes must not alter the radius or center.
+        other, _ = self.bank()
+        other.set_source_memory(features * torch.tensor([8., 3., 2., 5., 1.])[:, None],
+                                torch.tensor([0, 0, 1, 1, 1]))
+        torch.testing.assert_close(other.medoid, bank.medoid)
+        torch.testing.assert_close(other.global_radius, bank.global_radius)
+
+    def test_target_normalization_full_radius_and_strict_boundary(self):
+        bank, _ = self.bank()
+        bank.medoid.copy_(torch.tensor([1., 0.]))
+        bank.global_radius.fill_(1.)
+        # Unit-vector distance is 0.8: passes R but would fail 0.7R.
+        query = torch.tensor([[.68, (1. - .68 ** 2) ** .5]])
+        self.assertTrue(bank.accepts(query, torch.tensor([0])).item())
+        self.assertTrue(bank.accepts(query * 10, torch.tensor([0])).item())
+        self.assertFalse(bank.accepts(torch.tensor([[-2., 0.]]), torch.tensor([0])).item())
         bank.global_radius.zero_()
-        self.assertFalse(bank.accepts(features[2:3], torch.tensor([0])).item())
+        self.assertFalse(bank.accepts(torch.tensor([[3., 0.]]), torch.tensor([0])).item())
+
+    def test_invalid_features_and_insufficient_memory(self):
+        bank, _ = self.bank()
+        queries = torch.tensor([[0., 0.], [float('nan'), 1.], [float('inf'), 1.]])
+        self.assertFalse(bank.accepts(queries, torch.zeros(3, dtype=torch.long)).any().item())
+        bank.set_source_memory(torch.tensor([[1., 0.]]), torch.tensor([0]))
+        self.assertFalse(bank.global_ready.item())
+        self.assertFalse(bank.accepts(torch.tensor([[1., 0.]]), torch.tensor([0])).item())
 
     def test_knn_uses_raw_euclidean_not_cosine(self):
         bank, _ = self.bank()

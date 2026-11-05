@@ -261,16 +261,16 @@ def run_training():
     source_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_globaltau_dynlambda_rawmedoid_q90_07_or_source_best.pth'
+        + '_globaltau_dynlambda_normmedoid_q90_r_or_source_best.pth'
     )
     target_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_globaltau_dynlambda_rawmedoid_q90_07_or_target_best.pth'
+        + '_globaltau_dynlambda_normmedoid_q90_r_or_target_best.pth'
     )
 
     print('---------------------------------------------------------------------------------------')
-    print('EMA + Original/Augmented + Global Min Mean + Dynamic Lambda + Raw Medoid Q90: '
+    print('EMA + Original/Augmented + Global Min Mean + Dynamic Lambda + L2-Normalized Medoid Q90: '
           '%s with source %s and target %s' %
           (args.backbone, args.data1, args.data2))
     print('alpha:%s beta:%s gamma:%s ema:%s fixed_lambda:%s dynamic_lambda:[%s -> %s] ramp_epochs:%s' %
@@ -279,7 +279,7 @@ def run_training():
     print('prototype weight:%s temp:%s momentum:%s source_anchor:%s warmup:%s ramp:%s' %
           (args.proto_weight, args.proto_temperature, args.proto_momentum,
            args.proto_source_anchor, args.proto_warmup_epochs, args.proto_ramp_epochs))
-    print('OR rescue: one raw-feature source medoid; quantile=0.90 scale=0.7; refresh each epoch; source KNN k=11 strict majority')
+    print('OR rescue: L2-normalized source/target radius gate; quantile=0.90 scale=1.0; refresh each epoch; raw source KNN k=11 strict majority')
     print('---------------------------------------------------------------------------------------')
 
     if args.backbone == 'resnet18':
@@ -476,8 +476,8 @@ def run_training():
             teacher, teacher_feature_hook, prototype_loader_source,
             reliability_bank, prototype_bank,
         )
-        print('[Target Epoch %d] Global_R: %.8f Cutoff_07R: %.8f Medoid_Memory_Row: %d Ready: %s Source_Memory: %d' %
-              (i, reliability_bank.global_radius.item(), 0.7 * reliability_bank.global_radius.item(),
+        print('[Target Epoch %d] Global_R: %.8f Cutoff_R: %.8f Medoid_Memory_Row: %d Ready: %s Source_Memory: %d' %
+              (i, reliability_bank.global_radius.item(), reliability_bank.global_radius.item(),
                reliability_bank.medoid_memory_index.item(), reliability_bank.global_ready.item(),
                reliability_bank.memory_labels.numel()))
         enable_knn_rescue = i >= args.rescue_warmup_epochs
@@ -533,7 +533,7 @@ def run_training():
                 pseudo_targets, confidence_idx, agree_count = select_dual_view_pseudo_labels(
                     logits1, logits2, thresholds
                 )
-                # Original-view RAW features only. No view sum or L2 normalization.
+                # Keep original-view raw features here; the radius gate normalizes its own copy.
                 teacher_reference_features = teacher_features1
 
                 # 传统的高置信度伪标签

@@ -1,4 +1,4 @@
-"""Unnormalized original-view Euclidean distances to one global source medoid."""
+"""L2-normalized medoid/Q90 radius gate, with a separate raw-feature kNN path."""
 import torch
 import torch.nn.functional as F
 from global_medoid_radius import GlobalMedoidRadiusBank, exact_medoid_index
@@ -11,7 +11,7 @@ class RawMedoidQuantileBank(GlobalMedoidRadiusBank):
         labels = labels.detach().to(device=features.device, dtype=torch.long)
         valid = torch.isfinite(features).all(dim=1) & (features.norm(dim=1) > 1e-8)
         valid &= (labels >= 0) & (labels < self.prototypes.size(0))
-        # Raw features throughout medoid, radius, query distances and kNN.
+        # Preserve raw source memory for kNN; normalize a separate copy for the radius gate.
         self.memory_features = features[valid].contiguous()
         self.memory_labels = labels[valid].clone()
         self.prototypes.zero_()
@@ -25,7 +25,7 @@ class RawMedoidQuantileBank(GlobalMedoidRadiusBank):
             self.counts[c] = rows.sum()
             if rows.any():
                 # Separate angular prototypes only for inherited consistency loss;
-                # never used by the raw-distance selector.
+                # never used as the radius center.
                 total = F.normalize(self.memory_features[rows], dim=1).sum(dim=0)
                 if total.norm() > 1e-8:
                     self.prototypes[c] = F.normalize(total, dim=0)
@@ -36,10 +36,11 @@ class RawMedoidQuantileBank(GlobalMedoidRadiusBank):
         self.medoid_memory_index.fill_(-1)
         if self.memory_features.size(0) < 2:
             return
-        index = exact_medoid_index(self.memory_features)
+        radius_features = F.normalize(self.memory_features, dim=1)
+        index = exact_medoid_index(radius_features)
         self.medoid_memory_index.copy_(index)
-        self.medoid.copy_(self.memory_features[index])
-        distances = (self.memory_features.double() - self.medoid.double()).norm(dim=1)
+        self.medoid.copy_(radius_features[index])
+        distances = (radius_features.double() - self.medoid.double()).norm(dim=1)
         # Exact empirical 90th percentile, with linear interpolation.
         self.global_radius.copy_(torch.quantile(distances, 0.90, interpolation='linear'))
         self.global_ready.fill_(True)
@@ -50,8 +51,9 @@ class RawMedoidQuantileBank(GlobalMedoidRadiusBank):
         labels = labels.to(device=features.device, dtype=torch.long)
         valid = torch.isfinite(features).all(dim=1) & (features.norm(dim=1) > 1e-8)
         valid &= (labels >= 0) & (labels < self.prototypes.size(0))
-        distances = (features.double() - self.medoid.double()).norm(dim=1)
-        return valid & self.global_ready & (distances < 0.7 * self.global_radius.double())
+        radius_features = F.normalize(torch.nan_to_num(features), dim=1)
+        distances = (radius_features.double() - self.medoid.double()).norm(dim=1)
+        return valid & self.global_ready & (distances < self.global_radius.double())
 
     @torch.no_grad()
     def neighbor_accepts(self, features, labels, candidates, k=11, min_neighbors=3):
