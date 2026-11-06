@@ -22,7 +22,7 @@ class TargetKNNTests(unittest.TestCase):
                            torch.tensor([sample_id]))
 
     def test_exclude_self_by_id_and_vote(self):
-        bank = self.bank([[1., 0.], [2., 0.], [3., 0.], [4., 0.]],
+        bank = self.bank([[1., 0.], [2., .2], [3., .6], [4., 1.2]],
                          [0, 1, 1, 1], [10, 11, 12, 13], k=3)
         passed, checked = self.query(bank)
         self.assertTrue(checked.item())
@@ -31,30 +31,45 @@ class TargetKNNTests(unittest.TestCase):
         self.assertTrue(passed.item())
 
     def test_tie_rejected_with_self_excluded(self):
-        bank = self.bank([[1., 0.], [2., 0.], [3., 0.], [4., 0.], [5., 0.]],
+        bank = self.bank([[1., 0.], [2., .2], [3., .6], [4., 1.2], [5., 2.]],
                          [0, 0, 0, 1, 1], [10, 11, 12, 13, 14])
         passed, checked = self.query(bank)
         self.assertTrue(checked.item())
         self.assertFalse(passed.item())
 
     def test_insufficient_other_neighbors_and_candidates(self):
-        bank = self.bank([[1., 0.], [2., 0.], [3., 0.]], [0, 0, 0], [10, 11, 12])
+        bank = self.bank([[1., 0.], [2., .2], [3., .6]], [0, 0, 0], [10, 11, 12])
         passed, checked = self.query(bank)
         self.assertFalse(passed.item())
         self.assertFalse(checked.item())
-        bank = self.bank([[1., 0.], [2., 0.], [3., 0.], [4., 0.]],
+        bank = self.bank([[1., 0.], [2., .2], [3., .6], [4., 1.2]],
                          [0, 0, 0, 0], [10, 11, 12, 13])
         for confidence, agreement in [(False, True), (True, False)]:
             passed, checked = self.query(bank, confidence=confidence, agreement=agreement)
             self.assertFalse(passed.item())
             self.assertFalse(checked.item())
 
+    def test_source_and_query_scale_invariance(self):
+        features = torch.tensor([[1., .1], [2., .4], [3., .9],
+                                 [0., 1.], [.1, 2.], [.2, 3.]])
+        labels = torch.tensor([0, 0, 0, 1, 1, 1])
+        ids = torch.arange(6)
+        bank = TargetKNNBank(2, 2, k=3)
+        bank.set_target_memory(features, labels, ids)
+        torch.testing.assert_close(bank.memory_features.norm(dim=1), torch.ones(6))
+        args = (torch.tensor([0]), torch.tensor([True]), torch.tensor([True]), torch.tensor([99]))
+        first, _ = bank.select(torch.tensor([[100., 0.]]), *args)
+        bank.set_target_memory(features * torch.tensor([50., 2., 8., 1., 7., 3.])[:, None], labels, ids)
+        second, _ = bank.select(torch.tensor([[1., 0.]]), *args)
+        self.assertTrue(first.item())
+        torch.testing.assert_close(first, second)
+
     def test_invalid_memory_and_duplicate_ids(self):
         bank = self.bank([[0., 0.], [float('nan'), 1.], [1., 0.]],
                          [0, 0, 1], [10, 11, 12])
         self.assertEqual(bank.memory_ids.tolist(), [12])
         with self.assertRaises(ValueError):
-            self.bank([[1., 0.], [2., 0.]], [0, 1], [10, 10])
+            self.bank([[1., 0.], [2., .2]], [0, 1], [10, 10])
 
 
 class TargetIntegrationTests(unittest.TestCase):

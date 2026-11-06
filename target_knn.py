@@ -1,6 +1,7 @@
-"""Target-only raw Euclidean kNN, refreshed once per epoch; no radius gate."""
+"""Target-only L2-normalized Euclidean kNN, refreshed once per epoch; no radius gate."""
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 
 class TargetKNNBank(nn.Module):
@@ -24,7 +25,7 @@ class TargetKNNBank(nn.Module):
             raise ValueError('target sample IDs must be unique')
         valid = torch.isfinite(features).all(dim=1) & (features.norm(dim=1) > 1e-8)
         valid &= (predictions >= 0) & (predictions < self.num_classes)
-        self.memory_features = features[valid].contiguous()
+        self.memory_features = F.normalize(features[valid], dim=1).contiguous()
         self.memory_labels = predictions[valid].clone()
         self.memory_ids = sample_ids[valid].clone()
 
@@ -41,8 +42,9 @@ class TargetKNNBank(nn.Module):
         take = min(self.k, self.memory_ids.numel())
         if take < self.min_neighbors:
             return passed, checked
+        queries = F.normalize(torch.nan_to_num(features), dim=1)
         for rows in eligible.nonzero(as_tuple=False).flatten().split(128):
-            distances = torch.cdist(features[rows].double(), self.memory_features.double())
+            distances = torch.cdist(queries[rows].double(), self.memory_features.double())
             # Exclude by ID, even if the stored feature differs after teacher updates.
             distances.masked_fill_(sample_ids[rows, None].eq(self.memory_ids[None, :]), float('inf'))
             values, indices = distances.topk(take, dim=1, largest=False)

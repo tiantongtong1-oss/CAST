@@ -269,12 +269,12 @@ def run_training():
     source_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_globaltau_targetknn_nor_source_best.pth'
+        + '_globaltau_targetknn_l2_nor_source_best.pth'
     )
     target_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_globaltau_targetknn_nor_target_best.pth'
+        + '_globaltau_targetknn_l2_nor_target_best.pth'
     )
 
     print('---------------------------------------------------------------------------------------')
@@ -287,7 +287,7 @@ def run_training():
     print('prototype weight:%s temp:%s momentum:%s source_anchor:%s warmup:%s ramp:%s' %
           (args.proto_weight, args.proto_temperature, args.proto_momentum,
            args.proto_source_anchor, args.proto_warmup_epochs, args.proto_ramp_epochs))
-    print('Target-only raw Euclidean KNN k=11 strict majority; exclude self by ID; refresh each epoch; R disabled')
+    print('Target-only L2-normalized Euclidean KNN k=11 strict majority; exclude self by ID; refresh each epoch; R disabled')
     print('---------------------------------------------------------------------------------------')
 
     if args.backbone == 'resnet18':
