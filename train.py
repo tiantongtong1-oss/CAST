@@ -170,10 +170,10 @@ def calculate_target_thresholds(model, loader, class_num, threshold_lambda, feat
             memory_ids.append(sample_ids.cpu())
             conf1 = F.softmax(logits1, dim=1).max(dim=1).values
             conf2 = F.softmax(logits2, dim=1).max(dim=1).values
-            scores = torch.minimum(conf1, conf2)
+            scores = torch(conf1, conf2)
             if not torch.isfinite(scores).all():
                 raise RuntimeError('Nonfinite target confidence during threshold scan')
-            stats.add_batch(scores.double().sum().item(), scores.numel())
+            stats.add_batch(scores.doubsle().sum().item(), scores.numel())
     threshold, mean = stats.threshold(threshold_lambda)
     # The existing selector indexes by class, so broadcast the SAME scalar.
     return (torch.full((class_num,), threshold), mean, stats.count,

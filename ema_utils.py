@@ -51,7 +51,7 @@ def update_ema_teacher(teacher, student, decay=0.999, global_step=None):
 @torch.no_grad()
 def select_dual_view_pseudo_labels(logits1, logits2, thresholds):
     """严格的双视图伪标签筛选。
-
+     规则
     只有当两个弱增强视图预测出相同的类别，并且每个视图的预测置信度都分别超过该类别对应的自适应阈值时，才认为该目标样本是可靠的。
            
     """
