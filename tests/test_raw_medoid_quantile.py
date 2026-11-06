@@ -59,12 +59,21 @@ class RawQuantileTests(unittest.TestCase):
         self.assertFalse(bank.global_ready.item())
         self.assertFalse(bank.accepts(torch.tensor([[1., 0.]]), torch.tensor([0])).item())
 
-    def test_knn_uses_raw_euclidean_not_cosine(self):
+    def test_knn_normalizes_source_and_query(self):
         bank, _ = self.bank()
-        passed, checked = bank.neighbor_accepts(torch.tensor([[8., 0.]]), torch.tensor([1]),
+        features = torch.tensor([[1., .1], [2., .4], [3., .9],
+                                 [0., 1.], [.1, 2.], [.2, 3.]])
+        labels = torch.tensor([0, 0, 0, 1, 1, 1])
+        bank.set_source_memory(features, labels)
+        query = torch.tensor([[100., 0.]])
+        passed, checked = bank.neighbor_accepts(query, torch.tensor([0]),
                                                 torch.tensor([True]), k=3)
         self.assertTrue(passed.item())
         self.assertTrue(checked.item())
+        bank.set_source_memory(features * torch.tensor([50., 2., 8., 1., 7., 3.])[:, None], labels)
+        scaled, _ = bank.neighbor_accepts(query * .01, torch.tensor([0]),
+                                         torch.tensor([True]), k=3)
+        torch.testing.assert_close(scaled, passed)
 
     def test_both_original_and_augmented_must_pass(self):
         confident = torch.tensor([[3., 0.]])

@@ -261,12 +261,12 @@ def run_training():
     source_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_globaltau_dynlambda_normmedoid_q90_r_thenknn_source_best.pth'
+        + '_globaltau_dynlambda_normmedoid_q90_r_thenknn_l2_source_best.pth'
     )
     target_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_globaltau_dynlambda_normmedoid_q90_r_thenknn_target_best.pth'
+        + '_globaltau_dynlambda_normmedoid_q90_r_thenknn_l2_target_best.pth'
     )
 
     print('---------------------------------------------------------------------------------------')
@@ -279,7 +279,7 @@ def run_training():
     print('prototype weight:%s temp:%s momentum:%s source_anchor:%s warmup:%s ramp:%s' %
           (args.proto_weight, args.proto_temperature, args.proto_momentum,
            args.proto_source_anchor, args.proto_warmup_epochs, args.proto_ramp_epochs))
-    print('Confidence OR normalized radius, THEN mandatory raw KNN k=11 strict majority; radius Q90 scale=1.0; refresh each epoch; KNN active from epoch 0')
+    print('Confidence OR normalized radius, THEN mandatory L2-normalized KNN k=11 strict majority; radius Q90 scale=1.0; refresh each epoch; KNN active from epoch 0')
     print('---------------------------------------------------------------------------------------')
 
     if args.backbone == 'resnet18':

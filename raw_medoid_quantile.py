@@ -1,4 +1,4 @@
-"""L2-normalized medoid/Q90 radius gate, with a separate raw-feature kNN path."""
+"""L2-normalized medoid/Q90 radius gate, and L2-normalized source kNN."""
 import torch
 import torch.nn.functional as F
 from global_medoid_radius import GlobalMedoidRadiusBank, exact_medoid_index
@@ -11,7 +11,7 @@ class RawMedoidQuantileBank(GlobalMedoidRadiusBank):
         labels = labels.detach().to(device=features.device, dtype=torch.long)
         valid = torch.isfinite(features).all(dim=1) & (features.norm(dim=1) > 1e-8)
         valid &= (labels >= 0) & (labels < self.prototypes.size(0))
-        # Preserve raw source memory for kNN; normalize a separate copy for the radius gate.
+        # Keep raw memory for prototype/radius compatibility; kNN normalizes separate copies.
         self.memory_features = features[valid].contiguous()
         self.memory_labels = labels[valid].clone()
         self.prototypes.zero_()
@@ -67,8 +67,10 @@ class RawMedoidQuantileBank(GlobalMedoidRadiusBank):
         valid = candidates.bool() & torch.isfinite(features).all(dim=1)
         valid &= features.norm(dim=1) > 1e-8
         valid &= (labels >= 0) & (labels < self.prototypes.size(0))
+        queries = F.normalize(torch.nan_to_num(features), dim=1)
+        neighbors = F.normalize(self.memory_features, dim=1)
         for rows in valid.nonzero(as_tuple=False).flatten().split(128):
-            distances = torch.cdist(features[rows].double(), self.memory_features.double())
+            distances = torch.cdist(queries[rows].double(), neighbors.double())
             indices = distances.topk(take, dim=1, largest=False).indices
             votes = self.memory_labels[indices].eq(labels[rows, None]).sum(dim=1)
             passed[rows] = votes > take / 2
