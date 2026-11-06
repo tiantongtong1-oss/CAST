@@ -539,7 +539,18 @@ def run_training():
         pseudo_distribution_confidence = np.zeros(class_num, dtype=np.int64)
         pseudo_distribution_rescued = np.zeros(class_num, dtype=np.int64)
         pseudo_distribution_final = np.zeros(class_num, dtype=np.int64)
+        # 每轮重新统计，按 Teacher 伪标签类别分组
+        class_stats = {
+            name: np.zeros(class_num, dtype=np.int64)
+            for name in [
+                'agree', 'confidence', 'low_conf',
+                'radius_pass', 'radius_final', 'final'
+            ]
+        }
 
+        class_names = [
+            '惊讶', '恐惧', '厌恶', '开心', '悲伤', '愤怒', '中性'
+        ]
         for original, augmented, strong, _, sample_ids in train_loader_target:
             try:
                 source_imgs, source_targets = next(source_train_iter)
@@ -595,6 +606,27 @@ def run_training():
                     prototype_bank.agreement_stats(
                         teacher_reference_features, pseudo_targets, con_idx
                     )
+                )
+
+            # 按伪标签类别统计各阶段的目标样本数量
+            stage_masks = {
+                'agree': agreement_mask,
+                'confidence': confidence_mask,
+                'low_conf': agreement_mask & ~confidence_mask,
+                'radius_pass': radius_candidates,
+                'radius_final': radius_rescue_mask,
+                'final': final_mask,
+            }
+
+            # 标签只转到 CPU 一次，避免反复传输
+            batch_labels = pseudo_targets.detach().cpu().numpy()
+
+            for name, mask in stage_masks.items():
+                selected_labels = batch_labels[
+                    mask.detach().cpu().numpy()
+                ]
+                class_stats[name] += np.bincount(
+                    selected_labels, minlength=class_num
                 )
             # 统计当前epoch中不同阶段一共接纳了多少目标样本
             fusion_checked += int(neighbor_checked.sum().item())
@@ -686,6 +718,37 @@ def run_training():
             train_loss3 += weight_loss.item()
             train_proto_loss += proto_loss.item()
             batch_count += 1
+        # 本轮结束后输出，每个类别一行
+        for c in range(class_num):
+            low = int(class_stats['low_conf'][c])
+            radius_pass = int(class_stats['radius_pass'][c])
+            radius_final = int(class_stats['radius_final'][c])
+
+            if not enable_radius:
+                radius_rate = '未启用'
+                fusion_rate = '未启用'
+            else:
+                radius_rate = (
+                    f'{radius_pass / low:.2%}'
+                    if low > 0 else '无低置信度候选'
+                )
+                fusion_rate = (
+                    f'{radius_final / radius_pass:.2%}'
+                    if radius_pass > 0 else '无R放行样本'
+                )
+
+            print(
+                f'【目标域统计，第{i + 1}轮，'
+                f'伪标签类别：{class_names[c]}（{c}）】'
+                f'双视图一致数：{class_stats["agree"][c]}，'
+                f'高置信度候选数：{class_stats["confidence"][c]}，'
+                f'低置信度一致数：{low}，'
+                f'R放行数（融合前）：{radius_pass}，'
+                f'R最终救援数（融合后）：{radius_final}，'
+                f'最终接纳数：{class_stats["final"][c]}，'
+                f'低置信度候选的R放行率：{radius_rate}，'
+                f'R放行样本的融合通过率：{fusion_rate}'
+            )
         # 更新学习率
         scheduler.step()
         # 求均值

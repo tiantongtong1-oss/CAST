@@ -60,7 +60,49 @@ class FusedKNNBank(nn.Module):
             index = index.clamp_max(sorted_distances.numel() - 1)
             # Weighted empirical inverse CDF; no interpolation.
             self.global_radius.copy_(sorted_distances[index])
+            print(f'当前半径R为：{self.global_radius.item():.6f}')
             self.radius_ready.fill_(True)
+
+            # 统计每类源域样本到本类 medoid 的距离。
+            # 仅输出诊断信息，不改变 R 或筛选规则。
+            R = self.global_radius.double()
+
+            for c in range(self.num_classes):
+                count = int(self.class_counts[c].item())
+
+                if not self.class_center_ready[c].item():
+                    print(
+                        f'[Source Class {c}] N={count} '
+                        f'CenterReady=False Coverage_R=N/A'
+                    )
+                    continue
+
+                z = self.source_features[self.source_labels.eq(c)]
+                class_distances = (
+                        z.double() - self.class_medoids[c].double()
+                ).norm(dim=1)
+
+                # 使用线性插值计算距离分位数，仅用于日志。
+                quantiles = torch.quantile(
+                    class_distances,
+                    class_distances.new_tensor([0.50, 0.90, 0.95]),
+                    interpolation='linear',
+                )
+
+                # 与实际筛选一致，使用严格小于 R。
+                inside = int((class_distances < R).sum().item())
+                coverage = inside / count
+
+                print(
+                    f'【源域类别 Source Class {c}】'
+                    f'有效样本数 N={count}，'
+                    f'距离中位数 D50={quantiles[0].item():.6f}，'
+                    f'距离90%分位数 D90={quantiles[1].item():.6f}，'
+                    f'距离95%分位数 D95={quantiles[2].item():.6f}，'
+                    f'共享半径 R={self.global_radius.item():.6f}，'
+                    f'半径内样本数 Inside_R={inside}，'
+                    f'半径覆盖率 Coverage_R={coverage:.2%}'
+                )
 
     @torch.no_grad()
     def set_target_memory(self, features, probabilities, sample_ids):
