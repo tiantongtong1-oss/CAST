@@ -83,8 +83,8 @@ def parse_args(argv=None):
     parser.add_argument('--proto_ramp_epochs', type=int, default=5,
                         help='epochs used to linearly ramp prototype loss to full weight')
 
-    parser.add_argument('--rescue_warmup_epochs', type=int, default=30,
-                        help='legacy compatibility only; R is always disabled in this branch')
+    parser.add_argument('--rescue_warmup_epochs', type=int, default=3,
+                        help='epoch index to enable normalized Q90 radius fallback')
     parser.add_argument('--knn_support_threshold', type=float, default=0.7)
     args = parser.parse_args(argv)
     if not 0 <= args.knn_support_threshold <= 1:
@@ -247,7 +247,7 @@ def initialize_source_prototypes(teacher, feature_hook, loader, prototype_bank):
 
 @torch.no_grad()
 def refresh_source_prototypes(teacher, feature_hook, loader, prototype_bank, reliability_bank):
-    """Refresh source angular prototypes only; no medoid or radius computation."""
+    """Refresh source prototypes and normalized medoid/Q90 radius."""
     teacher.eval()
     device = next(teacher.parameters()).device
     source_features, source_labels = [], []
@@ -278,16 +278,16 @@ def run_training():
     source_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_globaltau_fusedknn_l2_nor_source_best.pth'
+        + '_globaltau_fusedknn_l2_q90r_source_best.pth'
     )
     target_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_globaltau_fusedknn_l2_nor_target_best.pth'
+        + '_globaltau_fusedknn_l2_q90r_target_best.pth'
     )
 
     print('---------------------------------------------------------------------------------------')
-    print('EMA + Original/Augmented + Global Min Mean + Source/Target Soft Fusion KNN + No R: '
+    print('EMA + Original/Augmented + Global Min Mean + Source/Target Soft Fusion KNN + Q90 R: '
           '%s with source %s and target %s' %
           (args.backbone, args.data1, args.data2))
     print('alpha:%s beta:%s gamma:%s ema:%s fixed_lambda:%s dynamic_lambda:[%s -> %s] ramp_epochs:%s' %
@@ -296,7 +296,7 @@ def run_training():
     print('prototype weight:%s temp:%s momentum:%s source_anchor:%s warmup:%s ramp:%s' %
           (args.proto_weight, args.proto_temperature, args.proto_momentum,
            args.proto_source_anchor, args.proto_warmup_epochs, args.proto_ramp_epochs))
-    print('Fusion: source true-label distribution + target teacher soft probabilities; weights=0.5/0.5; L2; k=11 per domain; R disabled')
+    print('Fusion: source true-label distribution + target teacher soft probabilities; weights=0.5/0.5; L2; k=11 per domain; normalized Q90 R fallback')
     print('KNN fusion support threshold: %s' % args.knn_support_threshold)
     print('---------------------------------------------------------------------------------------')
 
@@ -498,7 +498,7 @@ def run_training():
         )
         reliability_bank.set_target_memory(*target_memory)
         del target_memory
-        print('[Target Epoch %d] Target_KNN_Memory: %d R_Disabled: True' %
+        print('[Target Epoch %d] Target_KNN_Memory: %d' %
               (i, reliability_bank.memory_ids.numel()))
 
         print('[Target Epoch %d] Global_Min_Confidence_Mean: %.6f Lambda: %.6f '
@@ -506,7 +506,9 @@ def run_training():
               'Global_Threshold: %.6f Threshold_Sample_Count: %d' %
               (i, global_mean, current_lambda, raw_global_threshold,
                thresholds[0].item(), threshold_sample_count))
-        print('Target KNN mandatory from epoch 0; --rescue_warmup_epochs ignored (no R)')
+        enable_radius = i >= args.rescue_warmup_epochs
+        print('[Target Epoch %d] Radius_Enabled: %s Global_R: %.8f' %
+              (i, enable_radius, reliability_bank.global_radius.item()))
 
         model.train()
         source_train_iter = iter(train_loader_source)
@@ -566,14 +568,19 @@ def run_training():
                 agreement_mask = torch.argmax(logits1, dim=1).eq(
                     torch.argmax(logits2, dim=1)
                 )
+                radius_candidates = torch.zeros_like(confidence_mask)
+                if enable_radius:
+                    radius_candidates = (agreement_mask & ~confidence_mask
+                                         & reliability_bank.radius_accepts(teacher_reference_features))
+                fusion_candidates = confidence_mask | radius_candidates
                 (final_mask, neighbor_checked, fusion_support,
                  source_support, target_support, domain_disagreement) = (
                     reliability_bank.select(
-                        teacher_reference_features, pseudo_targets, confidence_mask,
+                        teacher_reference_features, pseudo_targets, fusion_candidates,
                         agreement_mask, sample_ids,
                     )
                 )
-                radius_rescue_mask = torch.zeros_like(final_mask)
+                radius_rescue_mask = radius_candidates & final_mask
                 knn_pass_mask = final_mask
                 rescue_mask = radius_rescue_mask
                 # Networks.forward selects idx == 1: retain a binary mask here.

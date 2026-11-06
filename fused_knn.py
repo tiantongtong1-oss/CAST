@@ -1,5 +1,6 @@
 """Equal-weight source true-label and target teacher-probability kNN fusion."""
 import torch
+from global_medoid_radius import exact_medoid_index
 from torch import nn
 import torch.nn.functional as F
 
@@ -9,6 +10,9 @@ class FusedKNNBank(nn.Module):
         super().__init__()
         if not 0 <= support_threshold <= 1 or k < 1:
             raise ValueError('support threshold must be in [0,1] and k positive')
+        self.register_buffer('medoid', torch.zeros(feature_dim))
+        self.register_buffer('global_radius', torch.zeros(()))
+        self.register_buffer('radius_ready', torch.tensor(False))
         self.num_classes = num_classes
         self.k = k
         self.support_threshold = float(support_threshold)
@@ -26,6 +30,15 @@ class FusedKNNBank(nn.Module):
         valid &= (labels >= 0) & (labels < self.num_classes)
         self.source_features = F.normalize(features[valid], dim=1).contiguous()
         self.source_labels = labels[valid].clone()
+        self.radius_ready.fill_(False)
+        self.global_radius.zero_()
+        self.medoid.zero_()
+        if self.source_labels.numel() >= 2:
+            index = exact_medoid_index(self.source_features)
+            self.medoid.copy_(self.source_features[index])
+            distances = (self.source_features.double() - self.medoid.double()).norm(dim=1)
+            self.global_radius.copy_(torch.quantile(distances, .9, interpolation='linear'))
+            self.radius_ready.fill_(True)
 
     @torch.no_grad()
     def set_target_memory(self, features, probabilities, sample_ids):
@@ -43,6 +56,14 @@ class FusedKNNBank(nn.Module):
         probs = probabilities[valid]
         self.memory_probs = probs / probs.sum(dim=1, keepdim=True)
         self.memory_ids = sample_ids[valid].clone()
+
+    @torch.no_grad()
+    def radius_accepts(self, features):
+        features = features.detach().to(self.medoid)
+        valid = torch.isfinite(features).all(dim=1) & (features.norm(dim=1) > 1e-8)
+        z = F.normalize(torch.nan_to_num(features), dim=1)
+        distances = (z.double() - self.medoid.double()).norm(dim=1)
+        return valid & self.radius_ready & (distances < self.global_radius.double())
 
     @torch.no_grad()
     def select(self, features, labels, confidence_mask, agreement_mask, sample_ids):
