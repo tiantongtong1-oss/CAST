@@ -12,7 +12,7 @@ import Networks
 from dataset import RafDataSet, FER
 from ema_utils import create_ema_teacher, select_dual_view_pseudo_labels, update_ema_teacher
 from prototype_utils import FeatureHook, PrototypeBank, prototype_weight_for_epoch
-from target_knn import TargetKNNBank
+from fused_knn import FusedKNNBank
 from global_threshold import lambda_for_epoch, GlobalConfidenceMean, smooth_global_threshold
 import image_utils as util
 from randaugment import RandAugmentMC
@@ -85,7 +85,10 @@ def parse_args(argv=None):
 
     parser.add_argument('--rescue_warmup_epochs', type=int, default=30,
                         help='legacy compatibility only; R is always disabled in this branch')
+    parser.add_argument('--knn_support_threshold', type=float, default=0.7)
     args = parser.parse_args(argv)
+    if not 0 <= args.knn_support_threshold <= 1:
+        parser.error('knn_support_threshold must be in [0,1]')
     if args.lambda_ramp_epochs is None:
         args.lambda_ramp_epochs = max(args.epochs, 1)
     try:
@@ -163,7 +166,7 @@ def calculate_target_thresholds(model, loader, class_num, threshold_lambda, feat
             logits2, _ = model(augmented.cuda(non_blocking=True), None, None,
                                mode='test', task='target')
             memory_features.append(original_features)
-            memory_predictions.append(logits1.argmax(dim=1).cpu())
+            memory_predictions.append(F.softmax(logits1, dim=1).cpu())
             memory_ids.append(sample_ids.cpu())
             conf1 = F.softmax(logits1, dim=1).max(dim=1).values
             conf2 = F.softmax(logits2, dim=1).max(dim=1).values
@@ -243,10 +246,11 @@ def initialize_source_prototypes(teacher, feature_hook, loader, prototype_bank):
 
 
 @torch.no_grad()
-def refresh_source_prototypes(teacher, feature_hook, loader, prototype_bank):
+def refresh_source_prototypes(teacher, feature_hook, loader, prototype_bank, reliability_bank):
     """Refresh source angular prototypes only; no medoid or radius computation."""
     teacher.eval()
     device = next(teacher.parameters()).device
+    source_features, source_labels = [], []
     prototype_bank.source_feature_sums.zero_()
     prototype_bank.source_counts.zero_()
     prototype_bank.source_initialized.zero_()
@@ -258,7 +262,12 @@ def refresh_source_prototypes(teacher, feature_hook, loader, prototype_bank):
         valid = torch.isfinite(features).all(dim=1) & (features.norm(dim=1) > 1e-8)
         valid &= (targets >= 0) & (targets < prototype_bank.num_classes)
         prototype_bank.accumulate_source(features[valid], targets[valid])
+        source_features.append(features[valid].cpu())
+        source_labels.append(targets[valid].cpu())
     prototype_bank.finalize_source()
+    if not source_features:
+        raise RuntimeError('Source memory loader is empty')
+    reliability_bank.set_source_memory(torch.cat(source_features), torch.cat(source_labels))
 
 
 def run_training():
@@ -269,16 +278,16 @@ def run_training():
     source_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_globaltau_targetknn_l2_nor_source_best.pth'
+        + '_globaltau_fusedknn_l2_nor_source_best.pth'
     )
     target_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_globaltau_targetknn_l2_nor_target_best.pth'
+        + '_globaltau_fusedknn_l2_nor_target_best.pth'
     )
 
     print('---------------------------------------------------------------------------------------')
-    print('EMA + Original/Augmented + Global Min Mean + Target-only KNN + No R: '
+    print('EMA + Original/Augmented + Global Min Mean + Source/Target Soft Fusion KNN + No R: '
           '%s with source %s and target %s' %
           (args.backbone, args.data1, args.data2))
     print('alpha:%s beta:%s gamma:%s ema:%s fixed_lambda:%s dynamic_lambda:[%s -> %s] ramp_epochs:%s' %
@@ -287,7 +296,8 @@ def run_training():
     print('prototype weight:%s temp:%s momentum:%s source_anchor:%s warmup:%s ramp:%s' %
           (args.proto_weight, args.proto_temperature, args.proto_momentum,
            args.proto_source_anchor, args.proto_warmup_epochs, args.proto_ramp_epochs))
-    print('Target-only L2-normalized Euclidean KNN k=11 strict majority; exclude self by ID; refresh each epoch; R disabled')
+    print('Fusion: source true-label distribution + target teacher soft probabilities; weights=0.5/0.5; L2; k=11 per domain; R disabled')
+    print('KNN fusion support threshold: %s' % args.knn_support_threshold)
     print('---------------------------------------------------------------------------------------')
 
     if args.backbone == 'resnet18':
@@ -460,7 +470,9 @@ def run_training():
     print('source prototype counts: %s' %
           np.array2string(prototype_bank.source_counts.cpu().numpy(), separator=', '))
 
-    reliability_bank = TargetKNNBank(model.fc.in_features, class_num).cuda()
+    reliability_bank = FusedKNNBank(
+        model.fc.in_features, class_num, args.knn_support_threshold,
+    ).cuda()
     best_target_val_acc = -1.0
     global_step = 0
     previous_global_threshold = None
@@ -482,7 +494,7 @@ def run_training():
             i, args.proto_weight, args.proto_warmup_epochs, args.proto_ramp_epochs
         )
         refresh_source_prototypes(
-            teacher, teacher_feature_hook, prototype_loader_source, prototype_bank,
+            teacher, teacher_feature_hook, prototype_loader_source, prototype_bank, reliability_bank,
         )
         reliability_bank.set_target_memory(*target_memory)
         del target_memory
@@ -503,6 +515,11 @@ def run_training():
         train_loss3 = 0.0
         train_proto_loss = 0.0
         batch_count = 0
+        fusion_checked = 0
+        fusion_support_sum = 0.0
+        fusion_source_sum = 0.0
+        fusion_target_sum = 0.0
+        fusion_disagreement = 0
         agreement_num = 0
         confidence_accept_num = 0
         radius_rescue_num = 0
@@ -549,7 +566,8 @@ def run_training():
                 agreement_mask = torch.argmax(logits1, dim=1).eq(
                     torch.argmax(logits2, dim=1)
                 )
-                final_mask, neighbor_checked = (
+                (final_mask, neighbor_checked, fusion_support,
+                 source_support, target_support, domain_disagreement) = (
                     reliability_bank.select(
                         teacher_reference_features, pseudo_targets, confidence_mask,
                         agreement_mask, sample_ids,
@@ -568,6 +586,11 @@ def run_training():
                     )
                 )
             # 统计当前epoch中不同阶段一共接纳了多少目标样本
+            fusion_checked += int(neighbor_checked.sum().item())
+            fusion_support_sum += fusion_support[neighbor_checked].sum().item()
+            fusion_source_sum += source_support[neighbor_checked].sum().item()
+            fusion_target_sum += target_support[neighbor_checked].sum().item()
+            fusion_disagreement += int(domain_disagreement.sum().item())
             agreement_num += agree_count
             confidence_accept_num += int(confidence_mask.sum().item())
             radius_rescue_num += int(radius_rescue_mask.sum().item())
@@ -663,6 +686,12 @@ def run_training():
             prototype_similarity_sum / float(prototype_checked_num)
             if prototype_checked_num > 0 else 0.0
         )
+        print('[Target Epoch %d] Fusion_Checked: %d Domain_Disagreement: %d '
+              'Mean_Source_Support: %.4f Mean_Target_Support: %.4f Mean_Fused_Support: %.4f' %
+              (i, fusion_checked, fusion_disagreement,
+               fusion_source_sum / max(fusion_checked, 1),
+               fusion_target_sum / max(fusion_checked, 1),
+               fusion_support_sum / max(fusion_checked, 1)))
         print('[Target Epoch %d] Agreement_Num: %d Confidence_Candidate_Num: %d '
               'Radius_Rescue_Num: %d KNN_Pass_Num: %d Rescue_Num: %d '
               'Neighbor_Checked_Num: %d Final_Accept_Num: %d' %

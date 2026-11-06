@@ -85,7 +85,7 @@ class TargetIntegrationTests(unittest.TestCase):
         scan = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
                     and n.name == 'calculate_target_thresholds')
         code = ast.get_source_segment(source, scan)
-        self.assertIn('logits1.argmax(dim=1).cpu()', code)
+        self.assertIn('F.softmax(logits1, dim=1).cpu()', code)
         self.assertIn('for original, augmented, _, sample_ids in loader', code)
         self.assertIn('feature_hook.output.detach().cpu()', code)
 
