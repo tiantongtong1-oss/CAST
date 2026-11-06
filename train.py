@@ -170,10 +170,10 @@ def calculate_target_thresholds(model, loader, class_num, threshold_lambda, feat
             memory_ids.append(sample_ids.cpu())
             conf1 = F.softmax(logits1, dim=1).max(dim=1).values
             conf2 = F.softmax(logits2, dim=1).max(dim=1).values
-            scores = torch(conf1, conf2)
+            scores = torch.cat((conf1, conf2), dim=0)
             if not torch.isfinite(scores).all():
                 raise RuntimeError('Nonfinite target confidence during threshold scan')
-            stats.add_batch(scores.doubsle().sum().item(), scores.numel())
+            stats.add_batch(scores.double().sum().item(), scores.numel())
     threshold, mean = stats.threshold(threshold_lambda)
     # The existing selector indexes by class, so broadcast the SAME scalar.
     return (torch.full((class_num,), threshold), mean, stats.count,
@@ -247,7 +247,7 @@ def initialize_source_prototypes(teacher, feature_hook, loader, prototype_bank):
 
 @torch.no_grad()
 def refresh_source_prototypes(teacher, feature_hook, loader, prototype_bank, reliability_bank):
-    """Refresh source prototypes and normalized medoid/Q90 radius."""
+    """Refresh source prototypes and class medoids and balanced shared Q90 radius."""
     teacher.eval()
     device = next(teacher.parameters()).device
     source_features, source_labels = [], []
@@ -278,16 +278,16 @@ def run_training():
     source_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_globaltau_fusedknn_l2_q90r_source_best.pth'
+        + '_globaltau_fusedknn_l2_classmedoid_sharedr_source_best.pth'
     )
     target_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_globaltau_fusedknn_l2_q90r_target_best.pth'
+        + '_globaltau_fusedknn_l2_classmedoid_sharedr_target_best.pth'
     )
 
     print('---------------------------------------------------------------------------------------')
-    print('EMA + Original/Augmented + Global Min Mean + Source/Target Soft Fusion KNN + Q90 R: '
+    print('EMA + Original/Augmented + Global Two-View Mean + Source/Target Soft Fusion KNN + Class Medoids / Shared Q90 R: '
           '%s with source %s and target %s' %
           (args.backbone, args.data1, args.data2))
     print('alpha:%s beta:%s gamma:%s ema:%s fixed_lambda:%s dynamic_lambda:[%s -> %s] ramp_epochs:%s' %
@@ -296,7 +296,7 @@ def run_training():
     print('prototype weight:%s temp:%s momentum:%s source_anchor:%s warmup:%s ramp:%s' %
           (args.proto_weight, args.proto_temperature, args.proto_momentum,
            args.proto_source_anchor, args.proto_warmup_epochs, args.proto_ramp_epochs))
-    print('Fusion: source true-label distribution + target teacher soft probabilities; weights=0.5/0.5; L2; k=11 per domain; normalized Q90 R fallback')
+    print('Fusion: source true-label distribution + target teacher soft probabilities; weights=0.5/0.5; L2; k=11 per domain; class medoids + class-balanced shared Q90 R fallback')
     print('KNN fusion support threshold: %s' % args.knn_support_threshold)
     print('---------------------------------------------------------------------------------------')
 
@@ -501,14 +501,18 @@ def run_training():
         print('[Target Epoch %d] Target_KNN_Memory: %d' %
               (i, reliability_bank.memory_ids.numel()))
 
-        print('[Target Epoch %d] Global_Min_Confidence_Mean: %.6f Lambda: %.6f '
+        print('[Target Epoch %d] Global_TwoView_Confidence_Mean: %.6f Lambda: %.6f '
               'Raw_Global_Threshold: %.6f EMA_Momentum: 0.8 '
-              'Global_Threshold: %.6f Threshold_Sample_Count: %d' %
+              'Global_Threshold: %.6f Threshold_View_Count: %d' %
               (i, global_mean, current_lambda, raw_global_threshold,
                thresholds[0].item(), threshold_sample_count))
         enable_radius = i >= args.rescue_warmup_epochs
         print('[Target Epoch %d] Radius_Enabled: %s Global_R: %.8f' %
               (i, enable_radius, reliability_bank.global_radius.item()))
+
+        print('[Target Epoch %d] Radius_Class_Counts: %s Center_Ready: %s' %
+              (i, reliability_bank.class_counts.cpu().tolist(),
+               reliability_bank.class_center_ready.cpu().tolist()))
 
         model.train()
         source_train_iter = iter(train_loader_source)
@@ -571,7 +575,7 @@ def run_training():
                 radius_candidates = torch.zeros_like(confidence_mask)
                 if enable_radius:
                     radius_candidates = (agreement_mask & ~confidence_mask
-                                         & reliability_bank.radius_accepts(teacher_reference_features))
+                                         & reliability_bank.radius_accepts(teacher_reference_features, pseudo_targets))
                 fusion_candidates = confidence_mask | radius_candidates
                 (final_mask, neighbor_checked, fusion_support,
                  source_support, target_support, domain_disagreement) = (

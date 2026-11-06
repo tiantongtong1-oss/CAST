@@ -10,7 +10,9 @@ class FusedKNNBank(nn.Module):
         super().__init__()
         if not 0 <= support_threshold <= 1 or k < 1:
             raise ValueError('support threshold must be in [0,1] and k positive')
-        self.register_buffer('medoid', torch.zeros(feature_dim))
+        self.register_buffer('class_medoids', torch.zeros(num_classes, feature_dim))
+        self.register_buffer('class_center_ready', torch.zeros(num_classes, dtype=torch.bool))
+        self.register_buffer('class_counts', torch.zeros(num_classes, dtype=torch.long))
         self.register_buffer('global_radius', torch.zeros(()))
         self.register_buffer('radius_ready', torch.tensor(False))
         self.num_classes = num_classes
@@ -32,12 +34,32 @@ class FusedKNNBank(nn.Module):
         self.source_labels = labels[valid].clone()
         self.radius_ready.fill_(False)
         self.global_radius.zero_()
-        self.medoid.zero_()
-        if self.source_labels.numel() >= 2:
-            index = exact_medoid_index(self.source_features)
-            self.medoid.copy_(self.source_features[index])
-            distances = (self.source_features.double() - self.medoid.double()).norm(dim=1)
-            self.global_radius.copy_(torch.quantile(distances, .9, interpolation='linear'))
+        self.class_medoids.zero_()
+        self.class_center_ready.zero_()
+        self.class_counts.zero_()
+        distance_parts, weight_parts = [], []
+        for c in range(self.num_classes):
+            z = self.source_features[self.source_labels.eq(c)]
+            self.class_counts[c] = z.size(0)
+            if z.size(0) < 2:
+                continue
+            center = z[exact_medoid_index(z)]
+            self.class_medoids[c].copy_(center)
+            self.class_center_ready[c] = True
+            distances = (z.double() - center.double()).norm(dim=1)
+            distance_parts.append(distances)
+            # Equal total weight per ready class, irrespective of sample count.
+            weight_parts.append(torch.full_like(distances, 1.0 / z.size(0)))
+        if distance_parts:
+            distances = torch.cat(distance_parts)
+            weights = torch.cat(weight_parts)
+            sorted_distances, order = distances.sort()
+            cumulative = weights[order].cumsum(dim=0)
+            cumulative = cumulative / cumulative[-1]
+            index = torch.searchsorted(cumulative, cumulative.new_tensor(.90))
+            index = index.clamp_max(sorted_distances.numel() - 1)
+            # Weighted empirical inverse CDF; no interpolation.
+            self.global_radius.copy_(sorted_distances[index])
             self.radius_ready.fill_(True)
 
     @torch.no_grad()
@@ -58,12 +80,16 @@ class FusedKNNBank(nn.Module):
         self.memory_ids = sample_ids[valid].clone()
 
     @torch.no_grad()
-    def radius_accepts(self, features):
-        features = features.detach().to(self.medoid)
+    def radius_accepts(self, features, labels):
+        features = features.detach().to(self.class_medoids)
+        labels = labels.to(device=features.device, dtype=torch.long)
         valid = torch.isfinite(features).all(dim=1) & (features.norm(dim=1) > 1e-8)
+        valid &= (labels >= 0) & (labels < self.num_classes)
+        safe = labels.clamp(0, self.num_classes - 1)
         z = F.normalize(torch.nan_to_num(features), dim=1)
-        distances = (z.double() - self.medoid.double()).norm(dim=1)
-        return valid & self.radius_ready & (distances < self.global_radius.double())
+        distances = (z.double() - self.class_medoids[safe].double()).norm(dim=1)
+        return (valid & self.radius_ready & self.class_center_ready[safe]
+                & (distances < self.global_radius.double()))
 
     @torch.no_grad()
     def select(self, features, labels, confidence_mask, agreement_mask, sample_ids):
