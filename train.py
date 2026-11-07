@@ -13,6 +13,7 @@ from dataset import RafDataSet, FER
 from ema_utils import create_ema_teacher, select_dual_view_pseudo_labels, update_ema_teacher
 from prototype_utils import FeatureHook, PrototypeBank, prototype_weight_for_epoch
 from fused_knn import FusedKNNBank
+from radius_gate import uniform_radius_candidates
 from global_threshold import lambda_for_epoch, GlobalConfidenceMean, smooth_global_threshold
 import image_utils as util
 from randaugment import RandAugmentMC
@@ -278,12 +279,12 @@ def run_training():
     source_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_globaltau_fusedknn_l2_classmedoid_sharedr_source_best.pth'
+        + '_globaltau_fusedknn_l2_classmedoid_sharedr_uniformgate_source_best.pth'
     )
     target_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_globaltau_fusedknn_l2_classmedoid_sharedr_target_best.pth'
+        + '_globaltau_fusedknn_l2_classmedoid_sharedr_uniformgate_target_best.pth'
     )
 
     print('---------------------------------------------------------------------------------------')
@@ -298,6 +299,7 @@ def run_training():
            args.proto_source_anchor, args.proto_warmup_epochs, args.proto_ramp_epochs))
     print('Fusion: source true-label distribution + target teacher soft probabilities; weights=0.5/0.5; L2; k=11 per domain; class medoids + class-balanced shared Q90 R fallback')
     print('KNN fusion support threshold: %s' % args.knn_support_threshold)
+    print('实验：共享Q90统一半径门控；Student输入：strong；R启用后高置信度也须d<R；低置信度R救援保留')
     print('---------------------------------------------------------------------------------------')
 
     if args.backbone == 'resnet18':
@@ -507,7 +509,7 @@ def run_training():
               (i, global_mean, current_lambda, raw_global_threshold,
                thresholds[0].item(), threshold_sample_count))
         enable_radius = i >= args.rescue_warmup_epochs
-        print('[Target Epoch %d] Radius_Enabled: %s Global_R: %.8f' %
+        print('[Target Epoch %d] Uniform_Radius_Gate_Enabled: %s Global_R: %.8f' %
               (i, enable_radius, reliability_bank.global_radius.item()))
 
         print('[Target Epoch %d] Radius_Class_Counts: %s Center_Ready: %s' %
@@ -544,7 +546,8 @@ def run_training():
             name: np.zeros(class_num, dtype=np.int64)
             for name in [
                 'agree', 'confidence', 'low_conf',
-                'radius_pass', 'radius_final', 'final'
+                'radius_pass', 'radius_final', 'final',
+                'confidence_radius_pass', 'confidence_radius_rejected'
             ]
         }
 
@@ -583,11 +586,16 @@ def run_training():
                 agreement_mask = torch.argmax(logits1, dim=1).eq(
                     torch.argmax(logits2, dim=1)
                 )
-                radius_candidates = torch.zeros_like(confidence_mask)
+                radius_pass_mask = torch.zeros_like(confidence_mask)
                 if enable_radius:
-                    radius_candidates = (agreement_mask & ~confidence_mask
-                                         & reliability_bank.radius_accepts(teacher_reference_features, pseudo_targets))
-                fusion_candidates = confidence_mask | radius_candidates
+                    radius_pass_mask = reliability_bank.radius_accepts(
+                        teacher_reference_features, pseudo_targets
+                    )
+                (confidence_candidates, radius_candidates,
+                 confidence_radius_rejected) = uniform_radius_candidates(
+                    confidence_mask, agreement_mask, radius_pass_mask, enable_radius
+                )
+                fusion_candidates = confidence_candidates | radius_candidates
                 (final_mask, neighbor_checked, fusion_support,
                  source_support, target_support, domain_disagreement) = (
                     reliability_bank.select(
@@ -614,6 +622,8 @@ def run_training():
                 'confidence': confidence_mask,
                 'low_conf': agreement_mask & ~confidence_mask,
                 'radius_pass': radius_candidates,
+                'confidence_radius_pass': confidence_candidates,
+                'confidence_radius_rejected': confidence_radius_rejected,
                 'radius_final': radius_rescue_mask,
                 'final': final_mask,
             }
@@ -741,7 +751,9 @@ def run_training():
                 f'【目标域统计，第{i + 1}轮，'
                 f'伪标签类别：{class_names[c]}（{c}）】'
                 f'双视图一致数：{class_stats["agree"][c]}，'
-                f'高置信度候选数：{class_stats["confidence"][c]}，'
+                f'高置信度原始候选数：{class_stats["confidence"][c]}，'
+                f'高置信度门控后候选数：{class_stats["confidence_radius_pass"][c]}，'
+                f'高置信度被R拒绝数：{class_stats["confidence_radius_rejected"][c]}，'
                 f'低置信度一致数：{low}，'
                 f'R放行数（融合前）：{radius_pass}，'
                 f'R最终救援数（融合后）：{radius_final}，'

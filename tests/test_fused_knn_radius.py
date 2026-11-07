@@ -53,10 +53,10 @@ class SharedRadiusTests(unittest.TestCase):
 class SharedIntegrationTests(unittest.TestCase):
     def test_training_wiring_and_typo_fixes(self):
         source = (Path(__file__).resolve().parents[1] / 'train.py').read_text()
-        self.assertIn('radius_accepts(teacher_reference_features, pseudo_targets)', source)
+        self.assertIn('radius_pass_mask = reliability_bank.radius_accepts(', source)
         self.assertIn('scores = torch.cat((conf1, conf2), dim=0)', source)
         self.assertNotIn('doubsle', source)
-        self.assertIn('fusion_candidates = confidence_mask | radius_candidates', source)
+        self.assertIn('fusion_candidates = confidence_candidates | radius_candidates', source)
 
 
 if __name__ == '__main__':
