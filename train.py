@@ -3,6 +3,8 @@ warnings.filterwarnings('ignore')
 import argparse
 import os
 import random
+import math
+import tempfile
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -86,7 +88,7 @@ def parse_args(argv=None):
     parser.add_argument('--rescue_warmup_epochs', type=int, default=3,
                         help='epoch index to enable normalized Q90 radius fallback')
     parser.add_argument('--knn_support_threshold', type=float, default=0.7)
-    parser.add_argument('--outside_radius_cls_weight', type=float, default=0.5,
+    parser.add_argument('--outside_radius_cls_weight', type=float, default=1.0,
                         help='accepted high-confidence targets outside R: classification weight')
     args = parser.parse_args(argv)
     if not np.isfinite(args.outside_radius_cls_weight) or not 0 <= args.outside_radius_cls_weight <= 1:
@@ -274,22 +276,40 @@ def refresh_source_prototypes(teacher, feature_hook, loader, prototype_bank, rel
     reliability_bank.set_source_memory(torch.cat(source_features), torch.cat(source_labels))
 
 
+def source_sqrt_class_weights(counts):
+    """源域真实类别的平方根倒数权重；按训练样本频率归一化至均值1。"""
+    counts = [float(n) for n in counts]
+    if not counts or any(not math.isfinite(n) or n < 0 for n in counts):
+        raise ValueError('source counts must be finite and nonnegative')
+    total = sum(counts)
+    if total <= 0:
+        raise ValueError('source training set is empty')
+    raw = [n ** -0.5 if n > 0 else 0.0 for n in counts]
+    normalizer = sum(n * w for n, w in zip(counts, raw)) / total
+    return [w / normalizer for w in raw]
+
+
 def run_training():
     args = parse_args()
     model_path = os.path.join('./models', args.data1 + '_' + args.data2)
     os.makedirs(model_path, exist_ok=True)
+    # 原子创建独立实验目录：重复运行也不会覆盖其他实验或之前的模型。
+    model_path = tempfile.mkdtemp(prefix='source_sqrtbalance_', dir=model_path)
 
     source_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_globaltau_fusedknn_l2_classmedoid_sharedr_softweight_source_best.pth'
+        + '_globaltau_fusedknn_l2_classmedoid_sharedr_source_sqrtbalance_source_best.pth'
     )
     target_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_globaltau_fusedknn_l2_classmedoid_sharedr_softweight_target_best.pth'
+        + '_globaltau_fusedknn_l2_classmedoid_sharedr_source_sqrtbalance_target_best.pth'
     )
 
+    print('源域类别平衡：仅目标自训练阶段的源域分类项，平方根倒数，样本平均权重=1')
+    print('源域最佳模型路径：%s' % os.path.abspath(source_best_path))
+    print('目标域最佳模型路径：%s' % os.path.abspath(target_best_path))
     print('---------------------------------------------------------------------------------------')
     print('EMA + Original/Augmented + Global Two-View Mean + Source/Target Soft Fusion KNN + Class Medoids / Shared Q90 R: '
           '%s with source %s and target %s' %
@@ -452,6 +472,23 @@ def run_training():
         best_source_val_acc = evaluate(
             model, val_loader_target, criterion, len(target_val), -1, 'Validation'
         )
+
+    # 仅用于下面的目标自训练分类项，不改变源域预训练、采样和其他损失。
+    source_counts = np.bincount(
+        np.asarray(source_train.label, dtype=np.int64), minlength=class_num,
+    )
+    if len(source_counts) != class_num:
+        raise ValueError('source labels exceed class_num')
+    balance_weights = source_sqrt_class_weights(source_counts)
+    source_class_weights = torch.tensor(
+        balance_weights, device=next(model.parameters()).device, dtype=torch.float32,
+    )
+    class_names_for_balance = ['惊讶', '恐惧', '厌恶', '开心', '悲伤', '愤怒', '中性']
+    for c, name in enumerate(class_names_for_balance):
+        print(f'【源域分类平衡：{name}（{c}）】'
+              f'训练样本数={source_counts[c]}，分类权重={balance_weights[c]:.6f}')
+    print('源域按训练样本频率加权的平均分类权重：%.6f' %
+          (sum(n * w for n, w in zip(source_counts, balance_weights)) / source_counts.sum()))
 
     # 构建 EMA 教师模型
     teacher = create_ema_teacher(model).cuda()
@@ -695,9 +732,10 @@ def run_training():
                 source_count=source_imgs.shape[0],
             )
             # 分类损失
-            source_cls_weights = torch.ones(
-                source_imgs.shape[0], device=output[0].device, dtype=output[0].dtype,
-            )
+            # 只按源域真实标签赋权；目标域样本不使用这些类别权重。
+            source_cls_weights = source_class_weights.index_select(
+                0, train_targets[:source_imgs.shape[0]],
+            ).to(dtype=output[0].dtype)
             cls_weights = torch.cat((
                 source_cls_weights,
                 target_cls_weights.to(device=output[0].device, dtype=output[0].dtype),
