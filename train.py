@@ -86,7 +86,11 @@ def parse_args(argv=None):
     parser.add_argument('--rescue_warmup_epochs', type=int, default=3,
                         help='epoch index to enable normalized Q90 radius fallback')
     parser.add_argument('--knn_support_threshold', type=float, default=0.7)
+    parser.add_argument('--outside_radius_cls_weight', type=float, default=0.5,
+                        help='accepted high-confidence targets outside R: classification weight')
     args = parser.parse_args(argv)
+    if not np.isfinite(args.outside_radius_cls_weight) or not 0 <= args.outside_radius_cls_weight <= 1:
+        parser.error('outside_radius_cls_weight must be finite and in [0,1]')
     if not 0 <= args.knn_support_threshold <= 1:
         parser.error('knn_support_threshold must be in [0,1]')
     if args.lambda_ramp_epochs is None:
@@ -278,12 +282,12 @@ def run_training():
     source_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_globaltau_fusedknn_l2_classmedoid_sharedr_source_best.pth'
+        + '_globaltau_fusedknn_l2_classmedoid_sharedr_softweight_source_best.pth'
     )
     target_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_globaltau_fusedknn_l2_classmedoid_sharedr_target_best.pth'
+        + '_globaltau_fusedknn_l2_classmedoid_sharedr_softweight_target_best.pth'
     )
 
     print('---------------------------------------------------------------------------------------')
@@ -298,6 +302,8 @@ def run_training():
            args.proto_source_anchor, args.proto_warmup_epochs, args.proto_ramp_epochs))
     print('Fusion: source true-label distribution + target teacher soft probabilities; weights=0.5/0.5; L2; k=11 per domain; class medoids + class-balanced shared Q90 R fallback')
     print('KNN fusion support threshold: %s' % args.knn_support_threshold)
+    print('Student输入：strong；共享半径：Q90；R外高置信度目标分类权重：%s' %
+          args.outside_radius_cls_weight)
     print('---------------------------------------------------------------------------------------')
 
     if args.backbone == 'resnet18':
@@ -521,6 +527,7 @@ def run_training():
         train_loss3 = 0.0
         train_proto_loss = 0.0
         batch_count = 0
+        downweighted_num = 0
         fusion_checked = 0
         fusion_support_sum = 0.0
         fusion_source_sum = 0.0
@@ -583,10 +590,12 @@ def run_training():
                 agreement_mask = torch.argmax(logits1, dim=1).eq(
                     torch.argmax(logits2, dim=1)
                 )
-                radius_candidates = torch.zeros_like(confidence_mask)
+                radius_pass_mask = torch.zeros_like(confidence_mask)
                 if enable_radius:
-                    radius_candidates = (agreement_mask & ~confidence_mask
-                                         & reliability_bank.radius_accepts(teacher_reference_features, pseudo_targets))
+                    radius_pass_mask = reliability_bank.radius_accepts(
+                        teacher_reference_features, pseudo_targets
+                    )
+                radius_candidates = agreement_mask & ~confidence_mask & radius_pass_mask
                 fusion_candidates = confidence_mask | radius_candidates
                 (final_mask, neighbor_checked, fusion_support,
                  source_support, target_support, domain_disagreement) = (
@@ -600,6 +609,12 @@ def run_training():
                 rescue_mask = radius_rescue_mask
                 # Networks.forward selects idx == 1: retain a binary mask here.
                 con_idx = final_mask.float()
+                # Separate weights: keep network/prototype masks strictly binary.
+                target_cls_weights = torch.ones_like(con_idx)
+                outside_high_confidence = torch.zeros_like(final_mask)
+                if enable_radius:
+                    outside_high_confidence = final_mask & confidence_mask & ~radius_pass_mask
+                    target_cls_weights[outside_high_confidence] = args.outside_radius_cls_weight
 
                 # 评估函数，用来统计在“可靠样本”上，模型特征与原型之间的预测一致性和相似度，会只检查 con_idx=1 的最终可靠目标样本
                 proto_agree, proto_checked, proto_similarity = (
@@ -641,6 +656,7 @@ def run_training():
             knn_checked_num += int(neighbor_checked.sum().item())
             knn_rescue_num += int(rescue_mask.sum().item())
             final_accept_num += int(final_mask.sum().item())
+            downweighted_num += int(outside_high_confidence.sum().item())
 
             # 累计prototype诊断指标
             prototype_agree_num += proto_agree
@@ -679,7 +695,17 @@ def run_training():
                 source_count=source_imgs.shape[0],
             )
             # 分类损失
-            per_sample_loss = criterion(output[0], train_targets) * train_con_idx
+            source_cls_weights = torch.ones(
+                source_imgs.shape[0], device=output[0].device, dtype=output[0].dtype,
+            )
+            cls_weights = torch.cat((
+                source_cls_weights,
+                target_cls_weights.to(device=output[0].device, dtype=output[0].dtype),
+            ))
+            per_sample_loss = (
+                criterion(output[0], train_targets) * train_con_idx * cls_weights
+            )
+            # Keep the baseline binary-count denominator; do not renormalize weights.
             # 对真正有效的源域和目标域样本求平均分类损失
             cls_loss = per_sample_loss.sum() / train_con_idx.sum().clamp_min(1.0)
             aff_loss = output[1]
@@ -760,6 +786,8 @@ def run_training():
             prototype_similarity_sum / float(prototype_checked_num)
             if prototype_checked_num > 0 else 0.0
         )
+        print(f'【第{i + 1}轮】R外高置信度接纳样本数：{downweighted_num}，'
+              f'分类权重：{args.outside_radius_cls_weight}，R启用：{enable_radius}')
         print('[Target Epoch %d] Fusion_Checked: %d Domain_Disagreement: %d '
               'Mean_Source_Support: %.4f Mean_Target_Support: %.4f Mean_Fused_Support: %.4f' %
               (i, fusion_checked, fusion_disagreement,
