@@ -1,6 +1,7 @@
 import warnings
 warnings.filterwarnings('ignore')
 import argparse
+from outside_radius_diagnostics import record_outside_radius
 import os
 import random
 import numpy as np
@@ -86,6 +87,10 @@ def parse_args(argv=None):
     parser.add_argument('--rescue_warmup_epochs', type=int, default=3,
                         help='epoch index to enable normalized Q90 radius fallback')
     parser.add_argument('--knn_support_threshold', type=float, default=0.7)
+    parser.add_argument("--outside_diag_dir", default=None,
+                        help="new directory for read-only low-confidence CSV diagnostics")
+    parser.add_argument("--outside_diag_labels", action="store_true",
+                        help="export target train labels for offline diagnostics only")
     args = parser.parse_args(argv)
     if not 0 <= args.knn_support_threshold <= 1:
         parser.error('knn_support_threshold must be in [0,1]')
@@ -272,6 +277,8 @@ def refresh_source_prototypes(teacher, feature_hook, loader, prototype_bank, rel
 
 def run_training():
     args = parse_args()
+    if args.outside_diag_dir:
+        os.makedirs(args.outside_diag_dir, exist_ok=False)
     model_path = os.path.join('./models', args.data1 + '_' + args.data2)
     os.makedirs(model_path, exist_ok=True)
 
@@ -551,7 +558,7 @@ def run_training():
         class_names = [
             '惊讶', '恐惧', '厌恶', '开心', '悲伤', '愤怒', '中性'
         ]
-        for original, augmented, strong, _, sample_ids in train_loader_target:
+        for original, augmented, strong, diagnostic_truth, sample_ids in train_loader_target:
             try:
                 source_imgs, source_targets = next(source_train_iter)
             except StopIteration:
@@ -595,6 +602,14 @@ def run_training():
                         agreement_mask, sample_ids,
                     )
                 )
+                # Read-only branch: no diagnostic result enters training or banks.
+                if args.outside_diag_dir and enable_radius:
+                    record_outside_radius(
+                        reliability_bank, teacher_reference_features, pseudo_targets,
+                        confidence_mask, agreement_mask, sample_ids, logits1, logits2,
+                        i + 1, args.outside_diag_dir,
+                        truth=diagnostic_truth if args.outside_diag_labels else None,
+                    )
                 radius_rescue_mask = radius_candidates & final_mask
                 knn_pass_mask = final_mask
                 rescue_mask = radius_rescue_mask
@@ -832,6 +847,7 @@ if __name__ == '__main__':
     from training_log import training_log
     with training_log():
         run_training()
+
 
 
 
