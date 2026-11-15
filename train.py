@@ -587,12 +587,12 @@ def run_training():
                 if enable_radius:
                     radius_candidates = (agreement_mask & ~confidence_mask
                                          & reliability_bank.radius_accepts(teacher_reference_features, pseudo_targets))
-                fusion_candidates = confidence_mask | radius_candidates
                 (final_mask, neighbor_checked, fusion_support,
                  source_support, target_support, domain_disagreement) = (
                     reliability_bank.select(
-                        teacher_reference_features, pseudo_targets, fusion_candidates,
+                        teacher_reference_features, pseudo_targets, confidence_mask,
                         agreement_mask, sample_ids,
+                        radius_candidates=radius_candidates,
                     )
                 )
                 radius_rescue_mask = radius_candidates & final_mask

@@ -190,7 +190,7 @@ def main():
                                    config.get('lambda_start', .9), config.get('lambda_end', 1.),
                                    config.get('threshold_lambda'))
             tau = lam * mean
-        masks = {name: [] for name in ['before', 'agreement', 'confidence', 'radius_candidates', 'final', 'rejected']}
+        masks = {name: [] for name in ['before', 'agreement', 'confidence', 'radius_candidates', 'radius_final', 'final', 'rejected']}
         predictions = []
         radius_enabled = epoch >= config.get('rescue_warmup_epochs', 3)
         for start in range(0, len(paths), args.batch_size):
@@ -200,11 +200,11 @@ def main():
             agree = aa.argmax(1).eq(bb.argmax(1))
             confidence = confidence.bool()
             radius = agree & ~confidence & bank.radius_accepts(ff, pred) if radius_enabled else torch.zeros_like(agree)
-            final = bank.select(ff, pred, confidence | radius, agree, ids[sl].to(device))[0]
+            final = bank.select(ff, pred, confidence, agree, ids[sl].to(device), radius_candidates=radius)[0]
             predictions.extend(pred.cpu().tolist())
             for name, mask in [('before', torch.ones_like(agree)), ('agreement', agree),
                                ('confidence', confidence), ('radius_candidates', radius),
-                               ('final', final), ('rejected', ~final)]:
+                               ('radius_final', radius & final), ('final', final), ('rejected', ~final)]:
                 masks[name].extend(mask.cpu().tolist())
 
     # Boundary: all predictions/masks are now fixed. Read target truth ONLY here.
@@ -216,6 +216,7 @@ def main():
                     two_view_mean=mean, radius_enabled=radius_enabled,
                     checkpoint_sha256=digest(args.checkpoint), seed=args.seed,
                     support_threshold=bank.support_threshold, k=bank.k,
+                    rescue_rule='both source and target kNN argmax agree; shared support threshold',
                     cross_split_byte_and_path_overlap_check='validation-only; target duplicates allowed',
                     validation_split=validation_split, validation_overlap_images=overlap_count,
                     test_accessed=False, heldout_count=len(heldout),

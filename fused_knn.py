@@ -134,7 +134,12 @@ class FusedKNNBank(nn.Module):
                 & (distances < self.global_radius.double()))
 
     @torch.no_grad()
-    def select(self, features, labels, confidence_mask, agreement_mask, sample_ids):
+    def select(self, features, labels, confidence_mask, agreement_mask, sample_ids,
+               radius_candidates=None):
+        """Shared support threshold; radius-only candidates require both domains to agree.
+
+        Omitted radius_candidates preserves the legacy confidence-only call API.
+        """
         features = features.detach().to(self.memory_features)
         labels = labels.to(device=features.device, dtype=torch.long)
         sample_ids = sample_ids.to(device=features.device, dtype=torch.long)
@@ -146,7 +151,12 @@ class FusedKNNBank(nn.Module):
         disagreement = torch.zeros_like(passed)
         if self.source_labels.numel() < self.k or self.memory_ids.numel() < self.k:
             return passed, checked, support, source_support, target_support, disagreement
-        eligible = confidence_mask.bool() & agreement_mask.bool()
+        confidence_mask = confidence_mask.to(device=features.device, dtype=torch.bool)
+        radius_candidates = (torch.zeros_like(confidence_mask) if radius_candidates is None
+                             else radius_candidates.to(device=features.device, dtype=torch.bool))
+        # Confidence path wins on overlap; rescue is restricted to low confidence.
+        radius_candidates = radius_candidates & ~confidence_mask
+        eligible = (confidence_mask | radius_candidates) & agreement_mask.bool()
         eligible &= torch.isfinite(features).all(dim=1) & (features.norm(dim=1) > 1e-8)
         eligible &= (labels >= 0) & (labels < self.num_classes)
         queries = F.normalize(torch.nan_to_num(features), dim=1)
@@ -167,5 +177,10 @@ class FusedKNNBank(nn.Module):
             source_support[rows] = ps.gather(1, assigned).squeeze(1)
             target_support[rows] = pt.gather(1, assigned).squeeze(1)
             disagreement[rows] = ready & ps.argmax(dim=1).ne(pt.argmax(dim=1))
-            passed[rows] = ready & mixed.argmax(dim=1).eq(labels[rows]) & (s >= self.support_threshold)
+            fusion_pass = ready & mixed.argmax(dim=1).eq(labels[rows]) & (s >= self.support_threshold)
+            both_domains_agree = (ps.argmax(dim=1).eq(labels[rows])
+                                  & pt.argmax(dim=1).eq(labels[rows]))
+            high_pass = confidence_mask[rows] & fusion_pass
+            rescue_pass = radius_candidates[rows] & fusion_pass & both_domains_agree
+            passed[rows] = high_pass | rescue_pass
         return passed, checked, support, source_support, target_support, disagreement
