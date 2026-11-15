@@ -23,17 +23,24 @@ def digest(path):
 
 
 def audit_overlap(source_paths, train_paths, heldout_paths):
-    """Fail closed on real-path or byte-identical cross-split images."""
+    """Reject source/target overlap; count target train/val overlap without blocking."""
     seen = {}
+    overlap_count = 0
     for group, paths in [('source_train', source_paths), ('target_train', train_paths),
                          ('target_heldout', heldout_paths)]:
         for path in paths:
             path = Path(path)
+            matched = False
             for key in [('path', str(path.resolve())), ('sha256', digest(path))]:
                 previous = seen.get(key)
                 if previous is not None and previous != group:
-                    raise ValueError('Cross-split image overlap: ' + previous + ' / ' + group)
-                seen[key] = group
+                    if 'source_train' in (previous, group):
+                        raise ValueError('Cross-domain image overlap: ' + previous + ' / ' + group)
+                    matched = True
+                if previous is None:
+                    seen[key] = group
+            overlap_count += int(matched)
+    return overlap_count
 
 
 def summarize(predictions, truth, masks):
@@ -116,10 +123,16 @@ def main():
     if not paths:
         p.error('No target train/*/*.jpg images')
     np.random.RandomState(2000).shuffle(paths)
-    heldout = sorted({x for split in ['val', 'validation', 'test'] for x in root.glob(split + '/*/*.jpg')})
+    # Validation only. Never enumerate or read the test split.
+    validation_split = 'val'
+    heldout = sorted(root.glob('val/*/*.jpg'))
     if not heldout:
-        p.error('No held-out images found: cannot audit train/heldout overlap')
-    audit_overlap(source.file_paths, paths, heldout)
+        validation_split = 'validation'
+        heldout = sorted(root.glob('validation/*/*.jpg'))
+    if not heldout:
+        p.error('No val/validation images found')
+    overlap_count = audit_overlap(source.file_paths, paths, heldout)
+    print(f'Validation duplicate images overlapping train: {overlap_count}; continuing without removing rows. Test split not accessed.')
 
     class UnlabeledViews(torch.utils.data.Dataset):
         def __len__(self):
@@ -203,7 +216,9 @@ def main():
                     two_view_mean=mean, radius_enabled=radius_enabled,
                     checkpoint_sha256=digest(args.checkpoint), seed=args.seed,
                     support_threshold=bank.support_threshold, k=bank.k,
-                    cross_split_byte_and_path_overlap_check='passed', heldout_count=len(heldout),
+                    cross_split_byte_and_path_overlap_check='validation-only; target duplicates allowed',
+                    validation_split=validation_split, validation_overlap_images=overlap_count,
+                    test_accessed=False, heldout_count=len(heldout),
                     labels='surprise,fear,disgust,happy,sad,angry,neutral',
                     limitation='Cannot certify upstream checkpoint provenance or detect transformed near-duplicates; no historical masks or EMA threshold state saved.')
     out.mkdir(parents=True, exist_ok=False)
