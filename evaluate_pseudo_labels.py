@@ -1,4 +1,4 @@
-"""Read-only pseudo-label audit for experiment/class-medoids-shared-radius.
+"""Read-only pseudo-label audit for experiment/emotion-group-radius.
 
 Run from repository root; see --help. No training/optimizer/checkpoint writes.
 Target labels are read ONLY after every prediction and selection is frozen.
@@ -261,6 +261,10 @@ def main():
                     two_view_mean=mean, radius_enabled=radius_enabled,
                     checkpoint_sha256=digest(args.checkpoint), seed=args.seed,
                     support_threshold=bank.support_threshold, k=bank.k,
+                    radius_groups={'positive': [0, 3, 6], 'negative': [1, 2, 4, 5]},
+                    radius_rule='positive=balancedQ90; negative=max(globalQ90, balancedQ95)',
+                    group_radii=bank.group_radii.cpu().tolist(),
+                    group_radius_ready=bank.group_radius_ready.cpu().tolist(),
                     rescue_rule='both source and target kNN argmax agree; shared support threshold',
                     cross_split_byte_and_path_overlap_check='validation-only; target duplicates allowed',
                     validation_split=validation_split, validation_overlap_images=overlap_count,

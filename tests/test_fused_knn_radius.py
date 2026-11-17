@@ -18,7 +18,7 @@ class SharedRadiusTests(unittest.TestCase):
         torch.testing.assert_close(bank.global_radius, expected.float())
         self.assertEqual(bank.class_counts.tolist(), [30, 3, 0])
         self.assertEqual(bank.class_center_ready.tolist(), [True, True, False])
-        bank.global_radius.fill_(.1)
+        bank.group_radii.fill_(.1)
         query = torch.tensor([[5., 0.]] * 5)
         self.assertEqual(bank.radius_accepts(query, torch.tensor([0, 1, 2, -1, 3])).tolist(),
                          [True, False, False, False, False])
@@ -56,7 +56,8 @@ class SharedIntegrationTests(unittest.TestCase):
         self.assertIn('radius_accepts(teacher_reference_features, pseudo_targets)', source)
         self.assertIn('scores = torch.cat((conf1, conf2), dim=0)', source)
         self.assertNotIn('doubsle', source)
-        self.assertIn('fusion_candidates = confidence_mask | radius_candidates', source)
+        self.assertIn('radius_candidates=radius_candidates', source)
+        self.assertIn('Positive_R', source)
 
 
 if __name__ == '__main__':

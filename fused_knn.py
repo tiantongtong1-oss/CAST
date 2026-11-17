@@ -1,5 +1,6 @@
 """Equal-weight source true-label and target teacher-probability kNN fusion."""
 import torch
+from emotion_radius import grouped_radii
 from global_medoid_radius import exact_medoid_index
 from torch import nn
 import torch.nn.functional as F
@@ -15,6 +16,11 @@ class FusedKNNBank(nn.Module):
         self.register_buffer('class_counts', torch.zeros(num_classes, dtype=torch.long))
         self.register_buffer('global_radius', torch.zeros(()))
         self.register_buffer('radius_ready', torch.tensor(False))
+        self.register_buffer('group_radii', torch.zeros(2))
+        self.register_buffer('group_radius_ready', torch.zeros(2, dtype=torch.bool))
+        # 0: surprise/happy/neutral; 1: fear/disgust/sad/angry.
+        self.register_buffer('class_radius_group', torch.tensor(
+            [0 if c in (0, 3, 6) else 1 for c in range(num_classes)], dtype=torch.long))
         self.num_classes = num_classes
         self.k = k
         self.support_threshold = float(support_threshold)
@@ -34,10 +40,13 @@ class FusedKNNBank(nn.Module):
         self.source_labels = labels[valid].clone()
         self.radius_ready.fill_(False)
         self.global_radius.zero_()
+        self.group_radii.zero_()
+        self.group_radius_ready.zero_()
         self.class_medoids.zero_()
         self.class_center_ready.zero_()
         self.class_counts.zero_()
         distance_parts, weight_parts = [], []
+        class_distances_for_groups = {}
         for c in range(self.num_classes):
             z = self.source_features[self.source_labels.eq(c)]
             self.class_counts[c] = z.size(0)
@@ -47,6 +56,7 @@ class FusedKNNBank(nn.Module):
             self.class_medoids[c].copy_(center)
             self.class_center_ready[c] = True
             distances = (z.double() - center.double()).norm(dim=1)
+            class_distances_for_groups[c] = distances.cpu().tolist()
             distance_parts.append(distances)
             # Equal total weight per ready class, irrespective of sample count.
             weight_parts.append(torch.full_like(distances, 1.0 / z.size(0)))
@@ -62,10 +72,15 @@ class FusedKNNBank(nn.Module):
             self.global_radius.copy_(sorted_distances[index])
             print(f'当前半径R为：{self.global_radius.item():.6f}')
             self.radius_ready.fill_(True)
+            radii = grouped_radii(class_distances_for_groups, self.global_radius.item())
+            for group, radius in enumerate(radii):
+                if radius is not None:
+                    self.group_radii[group] = radius
+                    self.group_radius_ready[group] = True
+            print('Emotion radii: positive[0,3,6] Q90=%.6f; negative[1,2,4,5] max(globalQ90, groupQ95)=%.6f' % tuple(self.group_radii.tolist()))
 
             # 统计每类源域样本到本类 medoid 的距离。
             # 仅输出诊断信息，不改变 R 或筛选规则。
-            R = self.global_radius.double()
 
             for c in range(self.num_classes):
                 count = int(self.class_counts[c].item())
@@ -89,7 +104,8 @@ class FusedKNNBank(nn.Module):
                     interpolation='linear',
                 )
 
-                # 与实际筛选一致，使用严格小于 R。
+                R = self.group_radii[self.class_radius_group[c]].double()
+                # 与实际筛选一致，使用严格小于组半径 R。
                 inside = int((class_distances < R).sum().item())
                 coverage = inside / count
 
@@ -99,7 +115,7 @@ class FusedKNNBank(nn.Module):
                     f'距离中位数 D50={quantiles[0].item():.6f}，'
                     f'距离90%分位数 D90={quantiles[1].item():.6f}，'
                     f'距离95%分位数 D95={quantiles[2].item():.6f}，'
-                    f'共享半径 R={self.global_radius.item():.6f}，'
+                    f'分组半径 R={self.global_radius.item():.6f}，'
                     f'半径内样本数 Inside_R={inside}，'
                     f'半径覆盖率 Coverage_R={coverage:.2%}'
                 )
@@ -130,8 +146,9 @@ class FusedKNNBank(nn.Module):
         safe = labels.clamp(0, self.num_classes - 1)
         z = F.normalize(torch.nan_to_num(features), dim=1)
         distances = (z.double() - self.class_medoids[safe].double()).norm(dim=1)
-        return (valid & self.radius_ready & self.class_center_ready[safe]
-                & (distances < self.global_radius.double()))
+        groups = self.class_radius_group[safe]
+        return (valid & self.group_radius_ready[groups] & self.class_center_ready[safe]
+                & (distances < self.group_radii[groups].double()))
 
     @torch.no_grad()
     def select(self, features, labels, confidence_mask, agreement_mask, sample_ids,
