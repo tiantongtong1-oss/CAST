@@ -60,6 +60,47 @@ def summarize(predictions, truth, masks):
     return result
 
 
+
+STAGE_DESCRIPTIONS = {
+    'before': '全部目标训练样本',
+    'agreement': '双视图预测一致',
+    'confidence': '通过高置信度筛选（含双视图一致条件）',
+    'confidence_rejected': '未通过高置信度筛选（含双视图不一致）',
+    'low_conf_agreement': '双视图一致但未通过高置信度筛选',
+    'radius_candidates': '低置信度一致样本中通过半径筛选（KNN前）',
+    'radius_rejected': '低置信度一致样本中未通过半径筛选（半径启用时）',
+    'neither_candidate': '高置信度与半径两条候选路径均未通过（KNN前）',
+    'confidence_knn': '高置信度路径通过KNN',
+    'confidence_knn_rejected': '高置信度候选未通过KNN',
+    'radius_final': '半径救援路径通过严格双域KNN',
+    'radius_knn_rejected': '半径候选未通过严格双域KNN',
+    'final': '两条路径经过KNN后的最终接纳并集',
+    'rejected': '最终未接纳：两条完整筛选路径均未通过',
+}
+
+
+def build_stage_masks(confidence, agree, radius, final, radius_enabled):
+    """Label-free, disjoint path statistics; radius failures exclude ineligible rows."""
+    zero = confidence & ~confidence
+    low = agree & ~confidence
+    return {
+        'before': confidence | ~confidence,
+        'agreement': agree,
+        'confidence': confidence,
+        'confidence_rejected': ~confidence,
+        'low_conf_agreement': low,
+        'radius_candidates': radius,
+        'radius_rejected': low & ~radius if radius_enabled else zero,
+        'neither_candidate': ~(confidence | radius),
+        'confidence_knn': confidence & final,
+        'confidence_knn_rejected': confidence & ~final,
+        'radius_final': radius & final,
+        'radius_knn_rejected': radius & ~final,
+        'final': final,
+        'rejected': ~final,
+    }
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--checkpoint', required=True, help='Trusted local checkpoint')
@@ -190,7 +231,7 @@ def main():
                                    config.get('lambda_start', .9), config.get('lambda_end', 1.),
                                    config.get('threshold_lambda'))
             tau = lam * mean
-        masks = {name: [] for name in ['before', 'agreement', 'confidence', 'radius_candidates', 'radius_final', 'final', 'rejected']}
+        masks = {name: [] for name in STAGE_DESCRIPTIONS}
         predictions = []
         radius_enabled = epoch >= config.get('rescue_warmup_epochs', 3)
         for start in range(0, len(paths), args.batch_size):
@@ -202,16 +243,20 @@ def main():
             radius = agree & ~confidence & bank.radius_accepts(ff, pred) if radius_enabled else torch.zeros_like(agree)
             final = bank.select(ff, pred, confidence, agree, ids[sl].to(device), radius_candidates=radius)[0]
             predictions.extend(pred.cpu().tolist())
-            for name, mask in [('before', torch.ones_like(agree)), ('agreement', agree),
-                               ('confidence', confidence), ('radius_candidates', radius),
-                               ('radius_final', radius & final), ('final', final), ('rejected', ~final)]:
+            for name, mask in build_stage_masks(confidence, agree, radius, final, radius_enabled).items():
                 masks[name].extend(mask.cpu().tolist())
 
     # Boundary: all predictions/masks are now fixed. Read target truth ONLY here.
     truth = [FER.FER_TO_CAST[int(path.parent.name)] for path in paths]
     report = summarize(predictions, truth, masks)
+    for name, values in report.items():
+        values['description'] = STAGE_DESCRIPTIONS[name]
+    assert report['confidence_knn']['count'] + report['radius_final']['count'] == report['final']['count']
+    assert report['confidence_knn']['correct'] + report['radius_final']['correct'] == report['final']['correct']
     metadata = dict(scope='fixed-checkpoint target TRAIN snapshot; not historical training accuracy',
                     selected_weights=key, epoch_index=epoch, threshold=tau,
+                    metric_definitions=STAGE_DESCRIPTIONS,
+                    radius_failure_scope='agreement & ~confidence; empty when radius disabled',
                     threshold_mode='log-supplied' if args.threshold is not None else 'recomputed WITHOUT historical EMA',
                     two_view_mean=mean, radius_enabled=radius_enabled,
                     checkpoint_sha256=digest(args.checkpoint), seed=args.seed,
@@ -224,10 +269,17 @@ def main():
                     limitation='Cannot certify upstream checkpoint provenance or detect transformed near-duplicates; no historical masks or EMA threshold state saved.')
     out.mkdir(parents=True, exist_ok=False)
     (out / 'summary.json').write_text(json.dumps(dict(metadata=metadata, metrics=report), indent=2), encoding='utf-8')
+    import csv
+    with (out / 'stages.csv').open('w', newline='', encoding='utf-8-sig') as handle:
+        writer = csv.writer(handle)
+        writer.writerow(['stage', 'description', 'count', 'correct', 'accuracy', 'coverage'])
+        for name, values in report.items():
+            writer.writerow([name, values['description'], values['count'], values['correct'],
+                             values['accuracy'], values['coverage']])
     # Aggregate-only output: no images, paths, per-sample predictions or truth exported.
     for name, values in report.items():
         acc = 'N/A' if values['accuracy'] is None else format(values['accuracy'], '.2%')
-        print(f"{name}: {values['correct']}/{values['count']} accuracy={acc} coverage={values['coverage']:.2%}")
+        print(f"{name} [{values['description']}]: {values['correct']}/{values['count']} accuracy={acc} coverage={values['coverage']:.2%}")
     print('Snapshot audit saved:', out / 'summary.json')
 
 
