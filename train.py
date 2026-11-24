@@ -247,7 +247,7 @@ def initialize_source_prototypes(teacher, feature_hook, loader, prototype_bank):
 
 @torch.no_grad()
 def refresh_source_prototypes(teacher, feature_hook, loader, prototype_bank, reliability_bank):
-    """Refresh source prototypes and class medoids and balanced emotion-group Q90/Q95 radii."""
+    """Refresh source prototypes and class-balanced emotion-group Q85/Q90 radii."""
     teacher.eval()
     device = next(teacher.parameters()).device
     source_features, source_labels = [], []
@@ -278,12 +278,12 @@ def run_training():
     source_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_globaltau_fusedknn_l2_classmedoid_emotionr_source_best.pth'
+        + '_globaltau_fusedknn_l2_classproto_emotionr_q85q90_source_best.pth'
     )
     target_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_globaltau_fusedknn_l2_classmedoid_emotionr_target_best.pth'
+        + '_globaltau_fusedknn_l2_classproto_emotionr_q85q90_target_best.pth'
     )
 
     print('---------------------------------------------------------------------------------------')
@@ -296,7 +296,7 @@ def run_training():
     print('prototype weight:%s temp:%s momentum:%s source_anchor:%s warmup:%s ramp:%s' %
           (args.proto_weight, args.proto_temperature, args.proto_momentum,
            args.proto_source_anchor, args.proto_warmup_epochs, args.proto_ramp_epochs))
-    print('Fusion: source true-label distribution + target teacher soft probabilities; weights=0.5/0.5; L2; k=11 per domain; class medoids + class-balanced emotion-group Q90/Q95 R fallback')
+    print('Fusion: source true-label distribution + target teacher soft probabilities; weights=0.5/0.5; L2; k=11 per domain; source class prototypes + class-balanced emotion-group Q85/Q90 R fallback')
     print('KNN fusion support threshold: %s' % args.knn_support_threshold)
     print('---------------------------------------------------------------------------------------')
 
@@ -507,8 +507,7 @@ def run_training():
               (i, global_mean, current_lambda, raw_global_threshold,
                thresholds[0].item(), threshold_sample_count))
         enable_radius = i >= args.rescue_warmup_epochs
-        print('[Target Epoch %d] Radius_Enabled: %s Legacy_Global_Q90 (reference only): %.8f' %
-              (i, enable_radius, reliability_bank.global_radius.item()))
+        print('[Target Epoch %d] Radius_Enabled: %s' % (i, enable_radius))
         print('[Target Epoch %d] Positive_R: %.8f Negative_R: %.8f' %
               (i, reliability_bank.group_radii[0].item(), reliability_bank.group_radii[1].item()))
 

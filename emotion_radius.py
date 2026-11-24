@@ -28,8 +28,8 @@ def balanced_quantile(class_distances, classes, q):
     return rows[-1][0]
 
 
-def grouped_radii(class_distances, legacy_radius):
-    positive = balanced_quantile(class_distances, POSITIVE_CLASSES, .90)
-    negative = balanced_quantile(class_distances, NEGATIVE_CLASSES, .95)
-    # Missing groups stay unready; no target labels or target distances are used.
-    return positive, None if negative is None else max(float(legacy_radius), negative)
+def grouped_radii(class_distances):
+    return (
+        balanced_quantile(class_distances, POSITIVE_CLASSES, .85),
+        balanced_quantile(class_distances, NEGATIVE_CLASSES, .90),
+    )

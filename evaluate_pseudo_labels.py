@@ -1,4 +1,4 @@
-"""Read-only pseudo-label audit for experiment/emotion-group-radius.
+"""Read-only pseudo-label audit for experiment/emotion-prototype-radius-q85-q90.
 
 Run from repository root; see --help. No training/optimizer/checkpoint writes.
 Target labels are read ONLY after every prediction and selection is frozen.
@@ -204,7 +204,7 @@ def main():
             sy.append(labels)
         bank.set_source_memory(torch.cat(sf), torch.cat(sy))
         if not bank.class_center_ready.all():
-            raise ValueError('Each source class requires at least two valid features')
+            raise ValueError('Each source class requires at least two valid features and a valid prototype')
         if bank.source_labels.numel() < bank.k or len(paths) <= bank.k:
             raise ValueError('Insufficient neighbors for self-excluding kNN')
         logits_a, logits_b, features, all_ids = [], [], [], []
@@ -262,7 +262,8 @@ def main():
                     checkpoint_sha256=digest(args.checkpoint), seed=args.seed,
                     support_threshold=bank.support_threshold, k=bank.k,
                     radius_groups={'positive': [0, 3, 6], 'negative': [1, 2, 4, 5]},
-                    radius_rule='positive=balancedQ90; negative=max(globalQ90, balancedQ95)',
+                    radius_center='L2-normalized mean of L2-normalized source features by class',
+                    radius_rule='positive=balancedQ85; negative=balancedQ90',
                     group_radii=bank.group_radii.cpu().tolist(),
                     group_radius_ready=bank.group_radius_ready.cpu().tolist(),
                     rescue_rule='both source and target kNN argmax agree; shared support threshold',

@@ -15,15 +15,14 @@ class GroupQuantileTests(unittest.TestCase):
         distances[0] *= 10
         self.assertEqual(balanced_quantile(distances, POSITIVE_CLASSES, .9), q)
 
-    def test_negative_relaxation_and_floor(self):
+    def test_positive_q85_and_negative_q90(self):
         d = {0: list(range(100)), 1: list(range(100))}
-        positive, negative = grouped_radii(d, 92.)
-        self.assertEqual(positive, 89.)
-        self.assertEqual(negative, 94.)
-        self.assertEqual(grouped_radii(d, 98.)[1], 98.)
+        positive, negative = grouped_radii(d)
+        self.assertEqual(positive, 84.)
+        self.assertEqual(negative, 89.)
 
     def test_empty_groups_and_invalid_distances(self):
-        self.assertEqual(grouped_radii({}, 0.), (None, None))
+        self.assertEqual(grouped_radii({}), (None, None))
         with self.assertRaises(ValueError):
             balanced_quantile({1: [float('nan')]}, NEGATIVE_CLASSES, .95)
 
@@ -37,16 +36,16 @@ except ImportError:
 
 @unittest.skipIf(torch is None, 'PyTorch unavailable')
 class GroupRoutingTests(unittest.TestCase):
-    def test_each_label_routes_to_group_and_own_medoid(self):
+    def test_each_label_routes_to_group_and_own_prototype(self):
         bank = FusedKNNBank(2)
-        bank.class_medoids[:] = torch.tensor([1., 0.])
+        bank.class_prototypes[:] = torch.tensor([1., 0.])
         bank.class_center_ready.fill_(True)
         bank.group_radius_ready.fill_(True)
         bank.group_radii[:] = torch.tensor([.1, .5])
         queries = torch.tensor([[1., .25]]).repeat(7, 1)
         self.assertEqual(bank.radius_accepts(queries, torch.arange(7)).tolist(),
                          [False, True, True, False, True, True, False])
-        bank.class_medoids[1] = torch.tensor([-1., 0.])
+        bank.class_prototypes[1] = torch.tensor([-1., 0.])
         self.assertFalse(bank.radius_accepts(queries[:1], torch.tensor([1])).item())
 
     def test_empty_refresh_clears_group_readiness(self):

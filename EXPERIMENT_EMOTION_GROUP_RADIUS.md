@@ -1,33 +1,35 @@
-# Emotion-group radius rescue
+# Emotion-group radius rescue with source prototypes
 
-Base: experiment/class-medoids-strict-dual-domain-rescue.
+Base branch is `experiment/emotion-group-radius`.
 
-Seven-class prediction labels and per-class medoids remain unchanged.
 The user-defined positive group is surprise/happy/neutral (CAST IDs 0,3,6).
 The negative group is fear/disgust/sad/angry (1,2,4,5).
 
-Each source training sample contributes its normalized Euclidean distance to its OWN
-class medoid. Each ready class has equal total weight in its group (sample weight 1/n_c).
-Use weighted empirical inverse CDF without interpolation:
-- Positive radius: group Q90.
-- Negative radius: max(original all-class balanced Q90, negative group Q95).
+For each class, L2-normalize the source training features, take their mean,
+and L2-normalize that mean to obtain the class prototype. Each source sample
+contributes its Euclidean distance to the prototype of its own class.
+Every ready class has equal total weight within its group, with a weight of
+1/n_c per distance. Sort distances in ascending order and take the first
+distance whose cumulative weight reaches the requested percentile.
 
-The negative floor guarantees that negative rescue is no tighter than the old shared
-radius. It does not guarantee negative radius numerically exceeds positive radius.
-A class needs at least two valid source samples; missing classes cannot rescue.
+- Positive radius is the class-balanced Q85 of the positive group.
+- Negative radius is the class-balanced Q90 of the negative group.
+
+A class needs at least two valid source samples and a nonzero prototype.
+Target queries use the source prototype of their predicted class.
 Refresh clears all readiness flags. Radius acceptance uses strict distance < R.
 Only source training features and source labels determine radii.
 Target true labels are used only after selection in the offline audit.
 
-Keep confidence path unchanged. Low-confidence rescue requires two-view agreement,
+Low-confidence rescue requires two-view agreement,
 its class-specific distance gate, both kNN domains predicting the assigned label,
 and fused support >= knn_support_threshold (default 0.7).
 No separate rescue support threshold.
 
-Training output names now contain classmedoid_emotionr instead of classmedoid_sharedr.
+Training checkpoint names contain `classproto_emotionr_q85q90`.
 --checkpoint initializes model weights, not a full training resume.
 Existing model/EMA weights are compatible; audit rebuilds banks from source train.
-New bank state includes group_radii, group_radius_ready, class_radius_group.
+The radius bank stores `class_prototypes`, `group_radii`, and their readiness flags.
 
 Audit retains all per-stage metrics and stages.csv, records grouping and radii in
 metadata, accesses validation only for overlap diagnostics, never test.
