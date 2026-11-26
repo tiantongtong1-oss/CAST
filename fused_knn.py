@@ -53,41 +53,14 @@ class FusedKNNBank(nn.Module):
             prototype = F.normalize(feature_sum, dim=0)
             self.class_prototypes[c].copy_(prototype)
             self.class_center_ready[c] = True
-            class_distances_for_groups[c] = (z.double() - prototype.double()).norm(dim=1)
+            distances = (z.double() - prototype.double()).norm(dim=1)
+            class_distances_for_groups[c] = distances.cpu().tolist()
 
-        radii = grouped_radii({
-            c: distances.cpu().tolist() for c, distances in class_distances_for_groups.items()
-        })
+        radii = grouped_radii(class_distances_for_groups)
         for group, radius in enumerate(radii):
             if radius is not None:
                 self.group_radii[group] = radius
                 self.group_radius_ready[group] = True
-
-        for c in range(self.num_classes):
-            count = int(self.class_counts[c].item())
-            if c not in class_distances_for_groups:
-                print(f'[Source Class {c}] N={count} CenterReady=False Coverage_R=N/A')
-                continue
-
-            class_distances = class_distances_for_groups[c]
-            # These per-class quantiles are for diagnostics only.
-            quantiles = torch.quantile(
-                class_distances,
-                class_distances.new_tensor([0.50, 0.85, 0.90]),
-                interpolation='linear',
-            )
-            group_radius = self.group_radii[self.class_radius_group[c]]
-            inside = int((class_distances < group_radius).sum().item())
-            print(
-                f'【源域类别 Source Class {c}】'
-                f'有效样本数 N={count}，'
-                f'距离中位数 D50={quantiles[0].item():.6f}，'
-                f'距离85%分位数 D85={quantiles[1].item():.6f}，'
-                f'距离90%分位数 D90={quantiles[2].item():.6f}，'
-                f'分组半径 R={group_radius.item():.6f}，'
-                f'半径内样本数 Inside_R={inside}，'
-                f'半径覆盖率 Coverage_R={inside / count:.2%}'
-            )
 
     @torch.no_grad()
     def set_target_memory(self, features, probabilities, sample_ids):

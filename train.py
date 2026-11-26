@@ -13,6 +13,7 @@ from dataset import RafDataSet, FER
 from ema_utils import create_ema_teacher, select_dual_view_pseudo_labels, update_ema_teacher
 from prototype_utils import FeatureHook, PrototypeBank, prototype_weight_for_epoch
 from fused_knn import FusedKNNBank
+from training_pseudo_label_audit import TrainingPseudoLabelAudit
 from global_threshold import lambda_for_epoch, GlobalConfidenceMean, smooth_global_threshold
 import image_utils as util
 from randaugment import RandAugmentMC
@@ -278,12 +279,12 @@ def run_training():
     source_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_globaltau_fusedknn_l2_classproto_emotionr_q85q85_source_best.pth'
+        + '_globaltau_fusedknn_l2_classproto_emotionr_q85q85_trainaudit_source_best.pth'
     )
     target_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_globaltau_fusedknn_l2_classproto_emotionr_q85q85_target_best.pth'
+        + '_globaltau_fusedknn_l2_classproto_emotionr_q85q85_trainaudit_target_best.pth'
     )
 
     print('---------------------------------------------------------------------------------------')
@@ -296,7 +297,9 @@ def run_training():
     print('prototype weight:%s temp:%s momentum:%s source_anchor:%s warmup:%s ramp:%s' %
           (args.proto_weight, args.proto_temperature, args.proto_momentum,
            args.proto_source_anchor, args.proto_warmup_epochs, args.proto_ramp_epochs))
-    print('Fusion: source true-label distribution + target teacher soft probabilities; weights=0.5/0.5; L2; k=11 per domain; source class prototypes + class-balanced emotion-group Q85/Q85 R fallback')
+    print('半径补救：正负组均取 Q85，候选须通过严格双域 kNN。')
+    if args.epochs > 0:
+        print('伪标签正确率在实际训练中统计，训练结束后输出最佳目标域验证轮次的三张表。')
     print('KNN fusion support threshold: %s' % args.knn_support_threshold)
     print('---------------------------------------------------------------------------------------')
 
@@ -467,13 +470,12 @@ def run_training():
     initialize_source_prototypes(
         teacher, teacher_feature_hook, prototype_loader_source, prototype_bank
     )
-    print('source prototype counts: %s' %
-          np.array2string(prototype_bank.source_counts.cpu().numpy(), separator=', '))
 
     reliability_bank = FusedKNNBank(
         model.fc.in_features, class_num, args.knn_support_threshold,
     ).cuda()
     best_target_val_acc = -1.0
+    best_pseudo_label_audit = None
     global_step = 0
     previous_global_threshold = None
 
@@ -511,10 +513,6 @@ def run_training():
         print('[Target Epoch %d] Positive_R: %.8f Negative_R: %.8f' %
               (i, reliability_bank.group_radii[0].item(), reliability_bank.group_radii[1].item()))
 
-        print('[Target Epoch %d] Radius_Class_Counts: %s Center_Ready: %s' %
-              (i, reliability_bank.class_counts.cpu().tolist(),
-               reliability_bank.class_center_ready.cpu().tolist()))
-
         model.train()
         source_train_iter = iter(train_loader_source)
         train_loss1 = 0.0
@@ -522,37 +520,9 @@ def run_training():
         train_loss3 = 0.0
         train_proto_loss = 0.0
         batch_count = 0
-        fusion_checked = 0
-        fusion_support_sum = 0.0
-        fusion_source_sum = 0.0
-        fusion_target_sum = 0.0
-        fusion_disagreement = 0
-        agreement_num = 0
-        confidence_accept_num = 0
-        radius_rescue_num = 0
-        knn_pass_num = 0
-        knn_rescue_num = 0
-        final_accept_num = 0
-        knn_checked_num = 0
-        prototype_agree_num = 0
-        prototype_checked_num = 0
-        prototype_similarity_sum = 0.0
-        pseudo_distribution_confidence = np.zeros(class_num, dtype=np.int64)
-        pseudo_distribution_rescued = np.zeros(class_num, dtype=np.int64)
-        pseudo_distribution_final = np.zeros(class_num, dtype=np.int64)
-        # 每轮重新统计，按 Teacher 伪标签类别分组
-        class_stats = {
-            name: np.zeros(class_num, dtype=np.int64)
-            for name in [
-                'agree', 'confidence', 'low_conf',
-                'radius_pass', 'radius_final', 'final'
-            ]
-        }
+        pseudo_label_audit = TrainingPseudoLabelAudit()
 
-        class_names = [
-            '惊讶', '恐惧', '厌恶', '开心', '悲伤', '愤怒', '中性'
-        ]
-        for original, augmented, strong, _, sample_ids in train_loader_target:
+        for original, augmented, strong, target_truth, sample_ids in train_loader_target:
             try:
                 source_imgs, source_targets = next(source_train_iter)
             except StopIteration:
@@ -571,7 +541,7 @@ def run_training():
                 teacher_features1 = teacher_feature_hook.output.detach()
                 logits2, _ = teacher(augmented, None, None, 'test', 'target')
                 teacher_features2 = teacher_feature_hook.output.detach()
-                pseudo_targets, confidence_idx, agree_count = select_dual_view_pseudo_labels(
+                pseudo_targets, confidence_idx, _ = select_dual_view_pseudo_labels(
                     logits1, logits2, thresholds
                 )
                 # Original-view RAW features for target-only Euclidean kNN.
@@ -588,89 +558,29 @@ def run_training():
                 if enable_radius:
                     radius_candidates = (agreement_mask & ~confidence_mask
                                          & reliability_bank.radius_accepts(teacher_reference_features, pseudo_targets))
-                (final_mask, neighbor_checked, fusion_support,
-                 source_support, target_support, domain_disagreement) = (
-                    reliability_bank.select(
-                        teacher_reference_features, pseudo_targets, confidence_mask,
-                        agreement_mask, sample_ids,
-                        radius_candidates=radius_candidates,
-                    )
+                final_mask, *_ = reliability_bank.select(
+                    teacher_reference_features, pseudo_targets, confidence_mask,
+                    agreement_mask, sample_ids,
+                    radius_candidates=radius_candidates,
                 )
-                radius_rescue_mask = radius_candidates & final_mask
-                knn_pass_mask = final_mask
-                rescue_mask = radius_rescue_mask
                 # Networks.forward selects idx == 1: retain a binary mask here.
                 con_idx = final_mask.float()
 
-                # 评估函数，用来统计在“可靠样本”上，模型特征与原型之间的预测一致性和相似度，会只检查 con_idx=1 的最终可靠目标样本
-                proto_agree, proto_checked, proto_similarity = (
-                    prototype_bank.agreement_stats(
-                        teacher_reference_features, pseudo_targets, con_idx
-                    )
-                )
-
-            # 按伪标签类别统计各阶段的目标样本数量
-            stage_masks = {
-                'agree': agreement_mask,
-                'confidence': confidence_mask,
-                'low_conf': agreement_mask & ~confidence_mask,
-                'radius_pass': radius_candidates,
-                'radius_final': radius_rescue_mask,
-                'final': final_mask,
-            }
-
-            # 标签只转到 CPU 一次，避免反复传输
-            batch_labels = pseudo_targets.detach().cpu().numpy()
-
-            for name, mask in stage_masks.items():
-                selected_labels = batch_labels[
-                    mask.detach().cpu().numpy()
-                ]
-                class_stats[name] += np.bincount(
-                    selected_labels, minlength=class_num
-                )
-            # 统计当前epoch中不同阶段一共接纳了多少目标样本
-            fusion_checked += int(neighbor_checked.sum().item())
-            fusion_support_sum += fusion_support[neighbor_checked].sum().item()
-            fusion_source_sum += source_support[neighbor_checked].sum().item()
-            fusion_target_sum += target_support[neighbor_checked].sum().item()
-            fusion_disagreement += int(domain_disagreement.sum().item())
-            agreement_num += agree_count
-            confidence_accept_num += int(confidence_mask.sum().item())
-            radius_rescue_num += int(radius_rescue_mask.sum().item())
-            knn_pass_num += int(knn_pass_mask.sum().item())
-            knn_checked_num += int(neighbor_checked.sum().item())
-            knn_rescue_num += int(rescue_mask.sum().item())
-            final_accept_num += int(final_mask.sum().item())
-
-            # 累计prototype诊断指标
-            prototype_agree_num += proto_agree
-            prototype_checked_num += proto_checked
-            prototype_similarity_sum += proto_similarity * proto_checked
-
-            # 统计伪标签在不同掩码筛选下的类别分布
-            confidence_labels = pseudo_targets[confidence_mask].cpu().numpy()
-            rescued_labels = pseudo_targets[rescue_mask].cpu().numpy()
-            final_labels = pseudo_targets[final_mask].cpu().numpy()
-            if confidence_labels.size > 0:
-                pseudo_distribution_confidence += np.bincount(
-                    confidence_labels, minlength=class_num
-                ).astype(np.int64)
-            if rescued_labels.size > 0:
-                pseudo_distribution_rescued += np.bincount(
-                    rescued_labels, minlength=class_num
-                ).astype(np.int64)
-            if final_labels.size > 0:
-                pseudo_distribution_final += np.bincount(
-                    final_labels, minlength=class_num
-                ).astype(np.int64)
+            # Compare true labels only after the training masks are fixed.
+            batch_pseudo_targets = pseudo_targets.cpu()
+            audit_masks = torch.stack(
+                (agreement_mask, confidence_mask, radius_candidates, final_mask)
+            ).cpu().numpy()
+            pseudo_label_audit.update(
+                batch_pseudo_targets.numpy(), target_truth.numpy(), *audit_masks
+            )
 
             model.train()
             # 给所有源域样本一个权重1，默认全可信
             source_con_idx = torch.ones(source_imgs.shape[0])
             # 源域图像+目标域strong augmentation
             train_imgs = torch.cat((source_imgs, strong.cpu()), dim=0).cuda(non_blocking=True)
-            train_targets = torch.cat((source_targets, pseudo_targets.cpu()), dim=0).cuda(non_blocking=True)
+            train_targets = torch.cat((source_targets, batch_pseudo_targets), dim=0).cuda(non_blocking=True)
             train_con_idx = torch.cat((source_con_idx, con_idx.cpu()), dim=0).cuda(non_blocking=True)
 
             # 清空模型参数的梯度
@@ -719,70 +629,7 @@ def run_training():
             train_loss3 += weight_loss.item()
             train_proto_loss += proto_loss.item()
             batch_count += 1
-        # 本轮结束后输出，每个类别一行
-        for c in range(class_num):
-            low = int(class_stats['low_conf'][c])
-            radius_pass = int(class_stats['radius_pass'][c])
-            radius_final = int(class_stats['radius_final'][c])
-
-            if not enable_radius:
-                radius_rate = '未启用'
-                fusion_rate = '未启用'
-            else:
-                radius_rate = (
-                    f'{radius_pass / low:.2%}'
-                    if low > 0 else '无低置信度候选'
-                )
-                fusion_rate = (
-                    f'{radius_final / radius_pass:.2%}'
-                    if radius_pass > 0 else '无R放行样本'
-                )
-
-            print(
-                f'【目标域统计，第{i + 1}轮，'
-                f'伪标签类别：{class_names[c]}（{c}）】'
-                f'双视图一致数：{class_stats["agree"][c]}，'
-                f'高置信度候选数：{class_stats["confidence"][c]}，'
-                f'低置信度一致数：{low}，'
-                f'R放行数（融合前）：{radius_pass}，'
-                f'R最终救援数（融合后）：{radius_final}，'
-                f'最终接纳数：{class_stats["final"][c]}，'
-                f'低置信度候选的R放行率：{radius_rate}，'
-                f'R放行样本的融合通过率：{fusion_rate}'
-            )
-        # 更新学习率
         scheduler.step()
-        # 求均值
-        proto_agreement_rate = (
-            float(prototype_agree_num) / float(prototype_checked_num)
-            if prototype_checked_num > 0 else 0.0
-        )
-        proto_mean_similarity = (
-            prototype_similarity_sum / float(prototype_checked_num)
-            if prototype_checked_num > 0 else 0.0
-        )
-        print('[Target Epoch %d] Fusion_Checked: %d Domain_Disagreement: %d '
-              'Mean_Source_Support: %.4f Mean_Target_Support: %.4f Mean_Fused_Support: %.4f' %
-              (i, fusion_checked, fusion_disagreement,
-               fusion_source_sum / max(fusion_checked, 1),
-               fusion_target_sum / max(fusion_checked, 1),
-               fusion_support_sum / max(fusion_checked, 1)))
-        print('[Target Epoch %d] Agreement_Num: %d Confidence_Candidate_Num: %d '
-              'Radius_Rescue_Num: %d KNN_Pass_Num: %d Rescue_Num: %d '
-              'Neighbor_Checked_Num: %d Final_Accept_Num: %d' %
-              (i, agreement_num, confidence_accept_num, radius_rescue_num,
-               knn_pass_num, knn_rescue_num, knn_checked_num, final_accept_num))
-        print('[Target Epoch %d] Pseudo_Distribution_Confidence_Candidates: %s' %
-              (i, np.array2string(pseudo_distribution_confidence, separator=', ')))
-        print('[Target Epoch %d] Pseudo_Distribution_Rescued: %s' %
-              (i, np.array2string(pseudo_distribution_rescued, separator=', ')))
-        print('[Target Epoch %d] Pseudo_Distribution_Final: %s' %
-              (i, np.array2string(pseudo_distribution_final, separator=', ')))
-        print('[Target Epoch %d] Prototype_Agreement: %d/%d (%.4f) '
-              'Mean_Assigned_Cosine: %.4f Target_Prototype_Counts: %s' %
-              (i, prototype_agree_num, prototype_checked_num,
-               proto_agreement_rate, proto_mean_similarity,
-               np.array2string(prototype_bank.target_counts.cpu().numpy(), separator=', ')))
         print('[Target Epoch %d] Classification Loss: %.3f Affinity Loss: %.3f '
               'Weight Loss: %.3f Prototype Loss: %.3f ProtoWeight: %.4f LR: %.6f' %
               (i,
@@ -798,6 +645,7 @@ def run_training():
         )
         if val_acc > best_target_val_acc:
             best_target_val_acc = val_acc
+            best_pseudo_label_audit = pseudo_label_audit
             save_checkpoint(
                 target_best_path, model, optimizer, scheduler, i,
                 best_target_val_acc, args, teacher=teacher,
@@ -826,6 +674,9 @@ def run_training():
         print('best target-stage validation accuracy %.4f' % best_target_val_acc)
     print('selected validation accuracy %.4f' % selected_val_acc)
     print('final target test accuracy %.4f' % test_acc)
+    if best_pseudo_label_audit is not None:
+        print()
+        print(best_pseudo_label_audit.markdown(checkpoint['epoch']))
     return test_acc
 
 
