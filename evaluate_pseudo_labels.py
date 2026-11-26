@@ -1,4 +1,4 @@
-"""Read-only pseudo-label audit for experiment/emotion-prototype-radius-q85-q90.
+"""Read-only pseudo-label audit for experiment/emotion-prototype-radius-q85-q85.
 
 Run from repository root; see --help. No training/optimizer/checkpoint writes.
 Target labels are read ONLY after every prediction and selection is frozen.
@@ -263,7 +263,7 @@ def main():
                     support_threshold=bank.support_threshold, k=bank.k,
                     radius_groups={'positive': [0, 3, 6], 'negative': [1, 2, 4, 5]},
                     radius_center='L2-normalized mean of L2-normalized source features by class',
-                    radius_rule='positive=balancedQ85; negative=balancedQ90',
+                    radius_rule='positive=balancedQ85; negative=balancedQ85',
                     group_radii=bank.group_radii.cpu().tolist(),
                     group_radius_ready=bank.group_radius_ready.cpu().tolist(),
                     rescue_rule='both source and target kNN argmax agree; shared support threshold',

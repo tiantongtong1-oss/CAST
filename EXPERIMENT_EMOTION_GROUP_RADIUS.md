@@ -1,6 +1,6 @@
 # Emotion-group radius rescue with source prototypes
 
-Base branch is `experiment/emotion-group-radius`.
+Base branch is `experiment/emotion-prototype-radius-q85-q90`.
 
 The user-defined positive group is surprise/happy/neutral (CAST IDs 0,3,6).
 The negative group is fear/disgust/sad/angry (1,2,4,5).
@@ -13,7 +13,7 @@ Every ready class has equal total weight within its group, with a weight of
 distance whose cumulative weight reaches the requested percentile.
 
 - Positive radius is the class-balanced Q85 of the positive group.
-- Negative radius is the class-balanced Q90 of the negative group.
+- Negative radius is the class-balanced Q85 of the negative group.
 
 A class needs at least two valid source samples and a nonzero prototype.
 Target queries use the source prototype of their predicted class.
@@ -26,7 +26,7 @@ its class-specific distance gate, both kNN domains predicting the assigned label
 and fused support >= knn_support_threshold (default 0.7).
 No separate rescue support threshold.
 
-Training checkpoint names contain `classproto_emotionr_q85q90`.
+Training checkpoint names contain `classproto_emotionr_q85q85`.
 --checkpoint initializes model weights, not a full training resume.
 Existing model/EMA weights are compatible; audit rebuilds banks from source train.
 The radius bank stores `class_prototypes`, `group_radii`, and their readiness flags.

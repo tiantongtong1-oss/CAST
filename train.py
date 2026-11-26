@@ -247,7 +247,7 @@ def initialize_source_prototypes(teacher, feature_hook, loader, prototype_bank):
 
 @torch.no_grad()
 def refresh_source_prototypes(teacher, feature_hook, loader, prototype_bank, reliability_bank):
-    """Refresh source prototypes and class-balanced emotion-group Q85/Q90 radii."""
+    """Refresh source prototypes and class-balanced emotion-group Q85/Q85 radii."""
     teacher.eval()
     device = next(teacher.parameters()).device
     source_features, source_labels = [], []
@@ -278,16 +278,16 @@ def run_training():
     source_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_globaltau_fusedknn_l2_classproto_emotionr_q85q90_source_best.pth'
+        + '_globaltau_fusedknn_l2_classproto_emotionr_q85q85_source_best.pth'
     )
     target_best_path = os.path.join(
         model_path,
         args.backbone + '_' + args.data1 + '_' + args.data2
-        + '_globaltau_fusedknn_l2_classproto_emotionr_q85q90_target_best.pth'
+        + '_globaltau_fusedknn_l2_classproto_emotionr_q85q85_target_best.pth'
     )
 
     print('---------------------------------------------------------------------------------------')
-    print('EMA + Original/Augmented + Global Two-View Mean + Source/Target Soft Fusion KNN + Class Medoids / Emotion-group Q90/Q95 R: '
+    print('EMA + Original/Augmented + Global Two-View Mean + Source/Target Soft Fusion KNN + Class Prototypes / Emotion-group Q85/Q85 R: '
           '%s with source %s and target %s' %
           (args.backbone, args.data1, args.data2))
     print('alpha:%s beta:%s gamma:%s ema:%s fixed_lambda:%s dynamic_lambda:[%s -> %s] ramp_epochs:%s' %
@@ -296,7 +296,7 @@ def run_training():
     print('prototype weight:%s temp:%s momentum:%s source_anchor:%s warmup:%s ramp:%s' %
           (args.proto_weight, args.proto_temperature, args.proto_momentum,
            args.proto_source_anchor, args.proto_warmup_epochs, args.proto_ramp_epochs))
-    print('Fusion: source true-label distribution + target teacher soft probabilities; weights=0.5/0.5; L2; k=11 per domain; source class prototypes + class-balanced emotion-group Q85/Q90 R fallback')
+    print('Fusion: source true-label distribution + target teacher soft probabilities; weights=0.5/0.5; L2; k=11 per domain; source class prototypes + class-balanced emotion-group Q85/Q85 R fallback')
     print('KNN fusion support threshold: %s' % args.knn_support_threshold)
     print('---------------------------------------------------------------------------------------')
 

@@ -31,5 +31,5 @@ def balanced_quantile(class_distances, classes, q):
 def grouped_radii(class_distances):
     return (
         balanced_quantile(class_distances, POSITIVE_CLASSES, .85),
-        balanced_quantile(class_distances, NEGATIVE_CLASSES, .90),
+        balanced_quantile(class_distances, NEGATIVE_CLASSES, .85),
     )

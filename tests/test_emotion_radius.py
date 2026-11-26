@@ -15,11 +15,11 @@ class GroupQuantileTests(unittest.TestCase):
         distances[0] *= 10
         self.assertEqual(balanced_quantile(distances, POSITIVE_CLASSES, .9), q)
 
-    def test_positive_q85_and_negative_q90(self):
+    def test_both_groups_use_q85(self):
         d = {0: list(range(100)), 1: list(range(100))}
         positive, negative = grouped_radii(d)
         self.assertEqual(positive, 84.)
-        self.assertEqual(negative, 89.)
+        self.assertEqual(negative, 84.)
 
     def test_empty_groups_and_invalid_distances(self):
         self.assertEqual(grouped_radii({}), (None, None))
