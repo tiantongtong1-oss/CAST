@@ -2,6 +2,11 @@ from torch import nn
 import torch
 from torchvision import models
 
+from ir50 import IR50
+
+
+BACKBONES = ("ir50", "mobilenet_v2", "resnet18", "resnet50")
+
 
 def compute_kernel_matrix(source, target, kernel_mul=2.0, kernel_num=5):
     #得到一个source 和 target的相似度矩阵
@@ -63,7 +68,11 @@ class Model(nn.Module):
         self.density_bandwidth = density_bandwidth
         self.bn = nn.BatchNorm1d(num_classes)
 
-        if backbone == 'resnet18':
+        if backbone == 'ir50':
+            self.feature = IR50(drop_rate=drop_rate)
+            self.fc = nn.Linear(self.feature.embedding_dim, num_classes, bias=False)
+
+        elif backbone == 'resnet18':
             self.feature = nn.Sequential(
                 *list(models.resnet18(pretrained=pretrained).children())[:-1],
                 nn.Flatten(),

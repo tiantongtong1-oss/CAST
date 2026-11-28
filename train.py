@@ -44,8 +44,10 @@ def parse_args(argv=None):
     parser.add_argument('--target_path', type=str,
                         default='/workspace/ttt/code/data/fer2013')
     parser.add_argument('-c', '--checkpoint', type=str, default=None, help='load model')
-    parser.add_argument('--backbone', type=str, default='mobilenet_v2',
-                        help='mobilenet_v2, resnet18 or resnet50')
+    parser.add_argument('--backbone', choices=Networks.BACKBONES, default='ir50')
+    parser.add_argument('--ir50_weights', help='local face.evoLVe-compatible IR-50 backbone weights')
+    parser.add_argument('--train_batch_size', type=int, help='training batch size per domain')
+    parser.add_argument('--eval_batch_size', type=int, help='validation and feature extraction batch size')
     parser.add_argument('--lr', type=float, default=0.001)
     parser.add_argument('--workers', default=10, type=int)
     parser.add_argument('--pre_epochs', type=int, default=30,
@@ -101,23 +103,34 @@ def parse_args(argv=None):
         parser.error('rescue_warmup_epochs must be nonnegative')
     if args.pre_epochs < 0 or args.epochs < 0:
         parser.error('epoch counts must be nonnegative')
+    if args.train_batch_size is not None and args.train_batch_size < 2:
+        parser.error('--train_batch_size must be at least 2')
+    if args.eval_batch_size is not None and args.eval_batch_size < 1:
+        parser.error('--eval_batch_size must be positive')
+    if args.ir50_weights and (args.backbone != 'ir50' or args.checkpoint):
+        parser.error('--ir50_weights requires --backbone ir50 and is mutually exclusive with --checkpoint')
     if args.pre_epochs == 0 and not args.checkpoint:
         parser.error('--pre_epochs 0 requires --checkpoint with pretrained model weights')
     return args
 
 
 #图像预处理、数据增强生成 弱增强 weak、强增强 strong、测试预处理 test
-def build_transforms():
+def build_transforms(backbone='mobilenet_v2'):
     # 对图像的 RGB 三个通道做标准化
-    normalize = transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225]
-    )
+    if backbone == 'ir50':
+        resize_size, crop_size = 128, Networks.IR50.input_size
+        normalize = transforms.Normalize(mean=(0.5,) * 3, std=(0.5,) * 3)
+    else:
+        resize_size, crop_size = 256, 224
+        normalize = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+        )
     # 弱增强
     weak = transforms.Compose([
         transforms.ToPILImage(),
-        transforms.Resize((256, 256)),
-        transforms.RandomCrop(224),
+        transforms.Resize((resize_size, resize_size)),
+        transforms.RandomCrop(crop_size),
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomApply([transforms.RandomRotation(20)], p=0.5),
         transforms.ToTensor(),
@@ -126,8 +139,8 @@ def build_transforms():
 
     strong = transforms.Compose([
         transforms.ToPILImage(),
-        transforms.Resize((256, 256)),
-        transforms.RandomCrop(224),
+        transforms.Resize((resize_size, resize_size)),
+        transforms.RandomCrop(crop_size),
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomApply([transforms.RandomRotation(20)], p=0.5),
         #强数据增强（随机选两种增强方式，强度为10 ）
@@ -138,8 +151,8 @@ def build_transforms():
 
     test = transforms.Compose([
         transforms.ToPILImage(),
-        transforms.Resize((256, 256)),
-        transforms.CenterCrop(224),
+        transforms.Resize((resize_size, resize_size)),
+        transforms.CenterCrop(crop_size),
         transforms.ToTensor(),
         normalize,
     ])
@@ -303,16 +316,12 @@ def run_training():
     print('KNN fusion support threshold: %s' % args.knn_support_threshold)
     print('---------------------------------------------------------------------------------------')
 
-    if args.backbone == 'resnet18':
-        train_batch, test_batch = 128, 128
-    elif args.backbone == 'resnet50':
-        train_batch, test_batch = 128, 100
-    elif args.backbone == 'mobilenet_v2':
-        train_batch, test_batch = 128, 128
-    else:
-        raise ValueError('Backbone Error!')
+    default_train_batch = 32 if args.backbone == 'ir50' else 128
+    default_eval_batch = {'ir50': 32, 'resnet50': 100}.get(args.backbone, 128)
+    train_batch = args.train_batch_size or default_train_batch
+    test_batch = args.eval_batch_size or default_eval_batch
 
-    weak_transform, strong_transform, test_transform = build_transforms()
+    weak_transform, strong_transform, test_transform = build_transforms(args.backbone)
 
     if args.data1 != 'rafdb' or args.data2 != 'fer':
         raise ValueError('This branch implements RAF-DB -> FER2013.')
@@ -349,9 +358,12 @@ def run_training():
 
     class_num = 7
 
+    if len(source_train) < 2:
+        raise ValueError('Source training requires at least two images for batch normalization')
     train_loader_source = torch.utils.data.DataLoader(
         source_train, batch_size=train_batch, num_workers=args.workers,
         shuffle=True, pin_memory=True, worker_init_fn=_init_fn,
+        drop_last=len(source_train) % train_batch == 1,
     )
     prototype_loader_source = torch.utils.data.DataLoader(
         source_prototype, batch_size=test_batch, num_workers=args.workers,
@@ -374,7 +386,19 @@ def run_training():
         shuffle=False, pin_memory=True,
     )
     # 输出分类 logits 和 source affinity loss
-    model = Networks.Model(backbone=args.backbone, num_classes=class_num).cuda()
+    model = Networks.Model(
+        backbone=args.backbone, num_classes=class_num,
+        pretrained=args.backbone != 'ir50' and not args.checkpoint,
+    )
+    if args.ir50_weights:
+        print('Loading IR-50 backbone weights...', args.ir50_weights)
+        weights = torch.load(args.ir50_weights, map_location='cpu', weights_only=True)
+        weights = weights.get('state_dict', weights)
+        torch.nn.modules.utils.consume_prefix_in_state_dict_if_present(weights, 'module.')
+        model.feature.load_state_dict(weights, strict=True)
+    elif args.backbone == 'ir50' and not args.checkpoint:
+        print('Initializing IR-50 from scratch.')
+    model = model.cuda()
     # 训练组件初始化
     optimizer = torch.optim.Adam(model.parameters(), args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95)

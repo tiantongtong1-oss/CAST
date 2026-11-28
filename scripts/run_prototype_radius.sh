@@ -11,5 +11,5 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 mkdir -p logs
 python -u train.py --data1 rafdb --data2 fer \
   --source_path "$source_path" --target_path "$target_path" \
-  --backbone mobilenet_v2 --pre_epochs 30 --epochs 30 "$@"
+  --pre_epochs 30 --epochs 30 "$@"
 

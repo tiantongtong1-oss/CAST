@@ -102,6 +102,8 @@ def build_stage_masks(confidence, agree, radius, final, radius_enabled):
 
 
 def main():
+    import Networks
+
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--checkpoint', required=True, help='Trusted local checkpoint')
     p.add_argument('--source_path', required=True)
@@ -111,7 +113,7 @@ def main():
     p.add_argument('--batch_size', type=int, default=64)
     p.add_argument('--workers', type=int, default=0)
     p.add_argument('--seed', type=int, default=1314)
-    p.add_argument('--backbone', choices=['mobilenet_v2', 'resnet18', 'resnet50'])
+    p.add_argument('--backbone', choices=Networks.BACKBONES)
     p.add_argument('--weights', choices=['auto', 'model', 'ema_teacher'], default='auto')
     p.add_argument('--epoch_index', type=int, default=None, help='Zero-based radius/schedule epoch; defaults to checkpoint epoch')
     threshold = p.add_mutually_exclusive_group(required=True)
@@ -132,7 +134,6 @@ def main():
     import cv2
     import numpy as np
     import torch
-    import Networks
     from dataset import RafDataSet, FER
     from train import build_transforms
     from ema_utils import select_dual_view_pseudo_labels
@@ -157,7 +158,7 @@ def main():
         key = 'ema_teacher' if 'ema_teacher' in checkpoint else 'model'
     if key not in checkpoint:
         p.error('Checkpoint missing ' + key)
-    weak, _, test = build_transforms()
+    weak, _, test = build_transforms(backbone)
     source = RafDataSet(args.source_path, phase='train', transform=test, basic_aug=False)
     root = Path(args.target_path)
     paths = sorted(root.glob('train/*/*.jpg'))
